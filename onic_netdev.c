@@ -50,6 +50,15 @@ inline static bool onic_ring_full(struct onic_ring *ring)
 	return ((ring->next_to_use + 1) % real_count) == ring->next_to_clean;
 }
 
+inline static int onic_ring_free_count(struct onic_ring *ring)
+{
+	u16 real_count = onic_ring_get_real_count(ring);
+	int free = ring->next_to_clean - ring->next_to_use - 1;
+	if (free < 0)
+		free += real_count;
+	return free;
+}
+
 inline static void onic_ring_increment_head(struct onic_ring *ring)
 {
 	u16 real_count = onic_ring_get_real_count(ring);
@@ -85,29 +94,38 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 	if (work < 0)
 		work += onic_ring_get_real_count(ring);
 
+	/* Clamp to what was actually submitted: never clean past next_to_use.
+	 * A stale or spurious cidx from the QDMA writeback could otherwise
+	 * advance into uninitialised buffer slots (type == 0). */
+	{
+		int max_clean = ring->next_to_use - ring->next_to_clean;
+		if (max_clean < 0)
+			max_clean += onic_ring_get_real_count(ring);
+		if (work > max_clean)
+			work = max_clean;
+	}
+
 	for (i = 0; i < work; ++i) {
 		struct onic_tx_buffer *buf = &q->buffer[ring->next_to_clean];
 
-
 		if (buf->type == ONIC_TX_SKB) {
-			// The packet originated from the kernel network stack
 			dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len, DMA_TO_DEVICE);
 			dev_kfree_skb_any(buf->skb);
 			buf->skb = NULL;
-		}  else if (buf->type == ONIC_TX_XDPF) {
-			// The packet originated from a XDP_TX -> It comes from a page pool, no need to dma unmap
+		} else if (buf->type == ONIC_TX_XDPF) {
 			xdp_return_frame(buf->xdpf);
 			buf->xdpf = NULL;
 		} else if (buf->type == ONIC_TX_XDPF_XMIT) {
-			// The packet originated from the XDP program of another driver. 
-			// It was mapped to a DMA address and needs to be unmapped
 			dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len, DMA_TO_DEVICE);
 			xdp_return_frame(buf->xdpf);
 			buf->xdpf = NULL;
+		} else {
+			netdev_err(priv->netdev, "unknown buffer type %d at index %d (ntc=%d ntu=%d cidx=%d)\n",
+				   buf->type, ring->next_to_clean,
+				   ring->next_to_clean, ring->next_to_use, wb.cidx);
 		}
-		 else {
-			netdev_err(priv->netdev, "unknown buffer type %d\n", buf->type);
-		}
+		/* Reset type so double-clean of this slot is detectable */
+		buf->type = 0;
 
 		onic_ring_increment_tail(ring);
 	}
@@ -172,17 +190,15 @@ static int onic_xmit_xdp_ring(struct onic_private *priv,struct  onic_tx_queue  *
 	dma_addr_t dma_addr;
 	struct onic_ring *ring;
 	struct qdma_h2c_st_desc desc;
-	bool debug = 1;
 	struct rtnl_link_stats64 *pcpu_stats_pointer;
 	enum onic_tx_buf_type type;
 
 	ring = &tx_queue->ring;
-	
+
 	onic_tx_clean(tx_queue);
 
 	if (onic_ring_full(ring)) {
-		if (debug)
-			netdev_info(priv->netdev, "ring is full");
+		onic_netdev_dbg(ONIC_DBG_INFO, priv->netdev, "xdp tx ring full");
 		return NETDEV_TX_BUSY;
 	}
 
@@ -352,10 +368,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	u8 *cmpl_stat_ptr;
 	u32 color_stat;
 	int work = 0;
-	int i, rv;
-	bool napi_cmpl_rval = 0;
-	bool flipped = 0;
-	bool debug = 0;
+	int rv;
 	void *res;
 
 	struct xdp_buff xdp;
@@ -363,8 +376,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	struct rtnl_link_stats64 *pcpu_stats_pointer;
 	pcpu_stats_pointer = this_cpu_ptr(priv->netdev_stats);
 
-	for (i = 0; i < priv->num_tx_queues; i++)
-		onic_tx_clean(priv->tx_queue[i]);
+	if (qid < priv->num_tx_queues)
+		onic_tx_clean(priv->tx_queue[qid]);
 
 	cmpl_ptr =
 		cmpl_ring->desc + QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean;
@@ -375,17 +388,12 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	qdma_unpack_c2h_cmpl_stat(&cmpl_stat, cmpl_stat_ptr);
 
 	color_stat = cmpl_stat.color;
-	if (debug)
-		netdev_info(
-			q->netdev,
-			"\n rx_poll:  cmpl_stat_pidx %u, color_cmpl_stat %u, cmpl_ring next_to_clean %u, cmpl_stat_cidx %u, intr_state %u, cmpl_ring->count %u",
+	onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+			"rx_poll: stat_pidx %u color_stat %u ntc %u stat_cidx %u intr %u count %u",
 			cmpl_stat.pidx, color_stat, cmpl_ring->next_to_clean,
 			cmpl_stat.cidx, cmpl_stat.intr_state, cmpl_ring->count);
-
-	if (debug)
-		netdev_info(
-			q->netdev,
-			"c2h_cmpl pkt_id %u, pkt_len %u, error %u, color %u cmpl_ring->color:%u",
+	onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+			"c2h_cmpl pkt_id %u pkt_len %u err %u color %u ring_color %u",
 			cmpl.pkt_id, cmpl.pkt_len, cmpl.err, cmpl.color,
 			cmpl_ring->color);
 
@@ -398,16 +406,13 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	 * with a color 0, and completion ring has a color 0 as well.
 	 */
 	if (cmpl.color != cmpl_ring->color) {
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"color mismatch1: cmpl.color %u, cmpl_ring->color %u  cmpl_stat_color %u",
+		onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+				"color mismatch: cmpl %u ring %u stat %u",
 				cmpl.color, cmpl_ring->color, color_stat);
 	}
 
 	if (cmpl.err == 1) {
-		if (debug)
-			netdev_info(q->netdev, "completion error detected in cmpl entry!");
+		netdev_warn(q->netdev, "completion error detected in cmpl entry");
 		// todo: need to handle the error ...
 		onic_qdma_clear_error_interrupt(priv->hw.qdma);
 	}
@@ -420,7 +425,9 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		
 		int len = cmpl.pkt_len;
 
-		xdp_init_buff(&xdp, PAGE_SIZE, &q->xdp_rxq);
+		xdp_init_buff(&xdp,
+			      PAGE_SIZE << q->page_pool->p.order,
+			      &q->xdp_rxq);
 
 		dma_sync_single_for_cpu(&priv->pdev->dev,
 					page_pool_get_dma_addr(buf->pg) +
@@ -441,7 +448,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			if (xdp_res & ONIC_XDP_PASS) {
 				
 				// allocate a new skb structure around the data 
-				skb = napi_build_skb(xdp.data_hard_start, PAGE_SIZE);
+				skb = napi_build_skb(xdp.data_hard_start,
+						     PAGE_SIZE << q->page_pool->p.order);
 
 				if (!skb) {
 					rv = -ENOMEM;
@@ -456,7 +464,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 				skb_put(skb, xdp.data_end - xdp.data);
 
 				skb->protocol = eth_type_trans(skb, q->netdev);
-				skb->ip_summed = CHECKSUM_NONE;
 				skb_record_rx_queue(skb, qid);
 				rv = napi_gro_receive(napi, skb);
 				if (rv < 0) {
@@ -475,115 +482,61 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 
 		onic_ring_increment_tail(desc_ring);
 
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"desc_ring %u next_to_use:%u next_to_clean:%u",
-				onic_ring_get_real_count(desc_ring),
-				desc_ring->next_to_use,
-				desc_ring->next_to_clean);
-		if (onic_ring_full(desc_ring)) {
-			netdev_dbg(q->netdev, "desc_ring full");
-		}
+		if (onic_ring_full(desc_ring))
+			onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+					"desc_ring full");
 
 		if (onic_rx_high_watermark(q)) {
-			netdev_dbg(q->netdev, "High watermark: h = %d, t = %d",
-				   desc_ring->next_to_use,
-				   desc_ring->next_to_clean);
+			onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+					"high watermark: ntu=%d ntc=%d",
+					desc_ring->next_to_use,
+					desc_ring->next_to_clean);
 			onic_rx_refill(q);
 		}
 
 		onic_ring_increment_tail(cmpl_ring);
 
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"cmpl_ring %u next_to_use:%u next_to_clean:%u, flipped:%s",
-				onic_ring_get_real_count(cmpl_ring),
-				cmpl_ring->next_to_use,
-				cmpl_ring->next_to_clean,
-				flipped ? "true" : "false");
-		if (onic_ring_full(cmpl_ring)) {
-			netdev_dbg(q->netdev, "cmpl_ring full");
-		}
+		if (onic_ring_full(cmpl_ring))
+			onic_netdev_dbg(ONIC_DBG_DATA, q->netdev,
+					"cmpl_ring full");
+
 		if (cmpl.color != cmpl_ring->color) {
-			if (debug)
-				netdev_info(
-					q->netdev,
-					"part 1. cmpl_ring->next_to_clean=%u color *** old fliping *** color[%u]",
-					cmpl_ring->next_to_clean,
-					cmpl_ring->color);
 			cmpl_ring->color = (cmpl_ring->color == 0) ? 1 : 0;
-			flipped = 1;
 		}
 		cmpl_ptr = cmpl_ring->desc +
 			   (QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean);
 
 		if ((++work) >= budget) {
 			if (xdp_xmit & ONIC_XDP_REDIR)
-					xdp_do_flush();
-			if (debug)
-				netdev_info(q->netdev,
-					    "watchdog work %u, budget %u", work,
-					    budget);
-			napi_complete(napi);
-			napi_schedule(napi);
+				xdp_do_flush();
+			/* Returning budget without calling napi_complete signals
+			 * the NAPI subsystem to reschedule automatically.
+			 * Calling napi_complete + napi_schedule here is wrong:
+			 * it re-enables interrupts then immediately re-queues
+			 * via softirq, producing the "Budget exhausted after
+			 * napi rescheduled" warning and a busy-loop. */
 			goto out_of_budget;
 		}
 
 		qdma_unpack_c2h_cmpl(&cmpl, cmpl_ptr);
-
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"c2h_cmpl(b) pkt_id %u, pkt_len %u, error %u, color %u",
-				cmpl.pkt_id, cmpl.pkt_len, cmpl.err,
-				cmpl.color);
 	}
 
 	if (xdp_xmit & ONIC_XDP_REDIR)
 		xdp_do_flush();
 
-	if (cmpl_ring->next_to_clean == cmpl_stat.pidx) {
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"next_to_clean == cmpl_stat.pidx %u, napi_complete work %u, budget %u, rval %s",
-				cmpl_stat.pidx, work, budget,
-				napi_cmpl_rval ? "true" : "false");
-		napi_cmpl_rval = napi_complete_done(napi, work);
-		onic_set_completion_tail(priv->hw.qdma, qid,
-					 cmpl_ring->next_to_clean, 1);
-		if (debug)
-			netdev_info(q->netdev, "onic_set_completion_tail ");
-	} else if (cmpl_ring->next_to_clean == 0) {
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"next_to_clean == 0, napi_complete work %u, budget %u, rval %s",
-				work, budget,
-				napi_cmpl_rval ? "true" : "false");
-		if (debug)
-			netdev_info(q->netdev,
-				    "napi_complete work %u, budget %u, rval %s",
-				    work, budget,
-				    napi_cmpl_rval ? "true" : "false");
-		napi_cmpl_rval = napi_complete_done(napi, work);
-		onic_set_completion_tail(priv->hw.qdma, qid,
-					 cmpl_ring->next_to_clean, 1);
-		if (debug)
-			netdev_info(q->netdev, "onic_set_completion_tail ");
-	}
+	napi_complete_done(napi, work);
+	onic_set_completion_tail(priv->hw.qdma, qid,
+				 cmpl_ring->next_to_clean, 1);
+	/*
+	 * Re-read completion status after re-arming the interrupt.
+	 * A completion may have arrived between the loop exit and
+	 * the re-arm, in which case the interrupt was lost.
+	 */
+	qdma_unpack_c2h_cmpl_stat(&cmpl_stat, cmpl_stat_ptr);
+	if (cmpl_ring->next_to_clean != cmpl_stat.pidx)
+		napi_schedule(&q->napi);
 
 out_of_budget:
-	if (debug)
-		netdev_info(q->netdev, "rx_poll is done");
-	if (debug)
-		netdev_info(
-			q->netdev,
-			"rx_poll returning work %u, rx_packets %lld, rx_bytes %lld",
-			work, pcpu_stats_pointer->rx_packets,
-			pcpu_stats_pointer->rx_bytes);
 	return work;
 }
 
@@ -633,11 +586,10 @@ static int onic_init_tx_queue(struct onic_private *priv, u16 qid)
 	u16 vid;
 	u32 size, real_count;
 	int rv;
-	bool debug = 0;
 
 	if (priv->tx_queue[qid]) {
-		if (debug)
-			netdev_info(dev, "Re-initializing TX queue %d", qid);
+		onic_netdev_dbg(ONIC_DBG_INIT, dev,
+				"Re-initializing TX queue %d", qid);
 		onic_clear_tx_queue(priv, qid);
 	}
 
@@ -746,10 +698,12 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 }
 
 
-static int onic_create_page_pool(struct onic_private *priv, struct onic_rx_queue *q, int size) {
+static int onic_create_page_pool(struct onic_private *priv,
+				 struct onic_rx_queue *q, int size,
+				 int page_order) {
 	struct bpf_prog *xdp_prog = READ_ONCE(priv->xdp_prog);
 	struct page_pool_params pp_params = {
-		.order = 0,
+		.order = page_order,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
 		.nid = dev_to_node(&priv->pdev->dev),
@@ -788,11 +742,18 @@ err_free_pp:
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 {
-	// TODO: make these configurable via ethtool
-	const u8 bufsz_idx = 8;
-	const u8 desc_rngcnt_idx = 8;
-	//const u8 cmpl_rngcnt_idx = 15;
-	const u8 cmpl_rngcnt_idx = 8;
+	const u8 desc_rngcnt_idx = 0;
+	const u8 cmpl_rngcnt_idx = 0;
+	/*
+	 * Pick QDMA C2H buffer size and page order based on MTU.
+	 * c2h_bufsz_pool: {4096,256,512,1024,2048,3968,4096,4096,
+	 *                   4096,4096,4096,4096,4096,8192,9018,16384}
+	 * The DMA target starts at XDP_PACKET_HEADROOM inside the page,
+	 * so the page must be large enough for headroom + max frame.
+	 */
+	const u32 max_frame = priv->netdev->mtu + ETH_HLEN;
+	const u8 bufsz_idx = (max_frame > 4096) ? 14 : 0; /* 9018 or 4096 */
+	const int page_order = (max_frame + XDP_PACKET_HEADROOM > PAGE_SIZE) ? 2 : 0;
 	struct net_device *dev = priv->netdev;
 	struct onic_rx_queue *q;
 	struct onic_ring *ring;
@@ -800,11 +761,10 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	u16 vid;
 	u32 size, real_count;
 	int i, rv;
-	bool debug = 0;
 
 	if (priv->rx_queue[qid]) {
-		if (debug)
-			netdev_info(dev, "Re-initializing RX queue %d", qid);
+		onic_netdev_dbg(ONIC_DBG_INIT, dev,
+				"Re-initializing RX queue %d", qid);
 		onic_clear_rx_queue(priv, qid);
 	}
 
@@ -848,7 +808,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		goto clear_rx_queue;
 	}
 
-	rv = onic_create_page_pool(priv, q, real_count);
+	rv = onic_create_page_pool(priv, q, real_count, page_order);
 	if (rv < 0)
 		goto clear_rx_queue;
 	
@@ -911,12 +871,9 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	param.desc_dma_addr = q->desc_ring.dma_addr;
 	param.cmpl_dma_addr = q->cmpl_ring.dma_addr;
 	param.vid = vid;
-	if (debug)
-		netdev_info(
-			dev,
-			"bufsz_idx %u, desc_rngcnt_idx %u, cmpl_rngcnt_idx %u, desc_dma_addr 0x%llx, cmpl_dma_addr 0x%llx, vid %d",
-			bufsz_idx, desc_rngcnt_idx, cmpl_rngcnt_idx,
-			q->desc_ring.dma_addr, q->cmpl_ring.dma_addr, vid);
+	onic_netdev_dbg(ONIC_DBG_INIT, dev,
+			"RX queue %u: bufsz_idx %u desc_rng %u cmpl_rng %u vid %d",
+			qid, bufsz_idx, desc_rngcnt_idx, cmpl_rngcnt_idx, vid);
 
 	rv = onic_qdma_init_rx_queue(priv->hw.qdma, qid, &param);
 	if (rv < 0)
@@ -1028,25 +985,21 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	dma_addr_t dma_addr;
 	u8 *desc_ptr;
 	int rv;
-	bool debug = 0;
 	struct rtnl_link_stats64 *pcpu_stats_pointer;
 	pcpu_stats_pointer = this_cpu_ptr(priv->netdev_stats);
 	q = priv->tx_queue[qid];
 	ring = &q->ring;
-	
+
 	onic_tx_clean(q);
 
-	if (onic_ring_full(ring)) {
-		if (debug)
-			netdev_info(dev, "ring is full");
+	if (unlikely(onic_ring_full(ring)))
 		return NETDEV_TX_BUSY;
-	}
 
-	/* minimum Ethernet packet length is 60 */
 	rv = skb_put_padto(skb, ETH_ZLEN);
-
-	if (rv < 0)
+	if (rv < 0) {
 		netdev_err(dev, "skb_put_padto failed, err = %d", rv);
+		return NETDEV_TX_OK;
+	}
 
 	dma_addr = dma_map_single(&priv->pdev->dev, skb->data, skb->len,
 				  DMA_TO_DEVICE);
@@ -1111,8 +1064,22 @@ int onic_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 int onic_change_mtu(struct net_device *dev, int mtu)
 {
-	netdev_info(dev, "Requested MTU = %d", mtu);
-	return 0;
+	bool running = netif_running(dev);
+	int rv = 0;
+
+	netdev_info(dev, "Changing MTU from %d to %d", dev->mtu, mtu);
+
+	if (running)
+		onic_stop_netdev(dev);
+
+	dev->mtu = mtu;
+
+	if (running) {
+		rv = onic_open_netdev(dev);
+		if (rv)
+			netdev_err(dev, "Failed to reopen after MTU change: %d", rv);
+	}
+	return rv;
 }
 
 inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)

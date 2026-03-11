@@ -53,6 +53,10 @@ MODULE_VERSION(DRV_VER);
 static int RS_FEC_ENABLED=1;
 module_param(RS_FEC_ENABLED, int, 0644);
 
+int onic_debug_level = 0;
+module_param_named(debug_level, onic_debug_level, int, 0644);
+MODULE_PARM_DESC(debug_level, "Debug verbosity (0=off, 1=info, 2=init, 3=data-path)");
+
 #ifdef CMS_SUPPORT
 extern int xocl_init_xmc(void);
 extern void xocl_fini_xmc(void);
@@ -259,6 +263,13 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	netif_set_real_num_tx_queues(netdev, priv->num_tx_queues);
 	netif_set_real_num_rx_queues(netdev, priv->num_rx_queues);
+
+	/* Enable jumbo frame support - max_pkt_len from FPGA design is 9600 */
+	netdev->min_mtu = ETH_MIN_MTU;        /* 68 bytes */
+	netdev->max_mtu = 9600 - ETH_HLEN;    /* 9600 - 14 = 9586 */
+
+	netdev->features |= NETIF_F_HIGHDMA;
+	netdev->hw_features |= NETIF_F_HIGHDMA;
 
 	rv = register_netdev(netdev);
 	if (rv < 0) {

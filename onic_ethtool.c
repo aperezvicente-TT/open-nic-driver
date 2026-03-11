@@ -302,13 +302,98 @@ static u32 onic_get_link(struct net_device *netdev)
     val = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
 
     carrier_ok = netif_carrier_ok(netdev);
-    /* verify RX status reg bits are 0x3*/
     val = (val == 0x3);
-    
-    netdev_info(netdev, "ethtool: onic_get_link port: %d   carrier ok: %u -- "
-		    "rx status ok: %u\r\n", cmac_idx, carrier_ok, val);
+
+    onic_netdev_dbg(ONIC_DBG_INFO, netdev,
+		    "get_link port: %d carrier_ok: %u rx_status_ok: %u",
+		    cmac_idx, carrier_ok, val);
 
     return (carrier_ok && val);
+}
+
+static int onic_get_fecparam(struct net_device *netdev,
+			     struct ethtool_fecparam *fec)
+{
+    struct onic_private *priv = netdev_priv(netdev);
+    struct onic_hardware *hw = &priv->hw;
+    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    u32 rsfec_en;
+
+    fec->fec = ETHTOOL_FEC_RS | ETHTOOL_FEC_OFF;
+
+    rsfec_en = onic_read_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_idx));
+    fec->active_fec = (rsfec_en & 0x3) ? ETHTOOL_FEC_RS : ETHTOOL_FEC_OFF;
+
+    return 0;
+}
+
+static int onic_set_fecparam(struct net_device *netdev,
+			     struct ethtool_fecparam *fec)
+{
+    struct onic_private *priv = netdev_priv(netdev);
+    struct onic_hardware *hw = &priv->hw;
+    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+
+    if (fec->fec & ETHTOOL_FEC_RS) {
+	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_idx), 0x3);
+	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_IND_CORRECTION(cmac_idx), 0x7);
+	priv->RS_FEC = 1;
+	hw->RS_FEC = 1;
+    } else if (fec->fec & ETHTOOL_FEC_OFF) {
+	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_idx), 0x0);
+	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_IND_CORRECTION(cmac_idx), 0x0);
+	priv->RS_FEC = 0;
+	hw->RS_FEC = 0;
+    } else {
+	return -EINVAL;
+    }
+
+    return 0;
+}
+
+static int onic_get_link_ksettings(struct net_device *netdev,
+				   struct ethtool_link_ksettings *cmd)
+{
+    struct onic_private *priv = netdev_priv(netdev);
+    struct onic_hardware *hw = &priv->hw;
+    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    u32 rx_status;
+
+    ethtool_link_ksettings_zero_link_mode(cmd, supported);
+    ethtool_link_ksettings_zero_link_mode(cmd, advertising);
+
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 100000baseCR4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 100000baseSR4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 100000baseLR4_ER4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 100000baseKR4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, FEC_RS);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, FEC_NONE);
+
+    ethtool_link_ksettings_add_link_mode(cmd, advertising, 100000baseCR4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, advertising, 100000baseSR4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, advertising, 100000baseLR4_ER4_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, advertising, 100000baseKR4_Full);
+
+    if (hw->RS_FEC)
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, FEC_RS);
+    else
+	ethtool_link_ksettings_add_link_mode(cmd, advertising, FEC_NONE);
+
+    rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
+    rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
+
+    if (netif_carrier_ok(netdev) && (rx_status == 0x3)) {
+	cmd->base.speed = SPEED_100000;
+	cmd->base.duplex = DUPLEX_FULL;
+    } else {
+	cmd->base.speed = SPEED_UNKNOWN;
+	cmd->base.duplex = DUPLEX_UNKNOWN;
+    }
+
+    cmd->base.port = PORT_DA;
+    cmd->base.autoneg = AUTONEG_DISABLE;
+
+    return 0;
 }
 
 static void onic_get_ethtool_stats(struct net_device *netdev,
@@ -519,6 +604,9 @@ static int onic_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info, u3
 static const struct ethtool_ops onic_ethtool_ops = {
     .get_drvinfo         = onic_get_drvinfo,
     .get_link            = onic_get_link,
+    .get_link_ksettings  = onic_get_link_ksettings,
+    .get_fecparam        = onic_get_fecparam,
+    .set_fecparam        = onic_set_fecparam,
     .get_ethtool_stats   = onic_get_ethtool_stats,
     .get_strings         = onic_get_strings,
     .get_sset_count      = onic_get_sset_count,

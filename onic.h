@@ -25,6 +25,48 @@
 
 #include "onic_hardware.h"
 
+/* Debug levels controlled by module param debug_level at insmod time.
+ *   0 = silent  (no debug output)
+ *   1 = info    (link state, FEC changes, ring full, errors)
+ *   2 = init    (queue setup, re-init, configuration details)
+ *   3 = data    (per-packet: rx_poll, completions, ring pointers, QDMA regs)
+ */
+#define ONIC_DBG_INFO	1
+#define ONIC_DBG_INIT	2
+#define ONIC_DBG_DATA	3
+
+extern int onic_debug_level;
+
+#define onic_netdev_dbg(lvl, netdev, fmt, ...)				\
+	do {								\
+		if (onic_debug_level >= (lvl)) {				\
+			if ((lvl) >= ONIC_DBG_DATA) {			\
+				if (net_ratelimit())			\
+					netdev_info(netdev,		\
+						"[DBG%d] " fmt,		\
+						(lvl), ##__VA_ARGS__);	\
+			} else {					\
+				netdev_info(netdev, "[DBG%d] " fmt,	\
+					    (lvl), ##__VA_ARGS__);	\
+			}						\
+		}							\
+	} while (0)
+
+#define onic_dev_dbg(lvl, dev, fmt, ...)				\
+	do {								\
+		if (onic_debug_level >= (lvl)) {				\
+			if ((lvl) >= ONIC_DBG_DATA) {			\
+				if (net_ratelimit())			\
+					dev_info(dev,			\
+						"[DBG%d] " fmt,		\
+						(lvl), ##__VA_ARGS__);	\
+			} else {					\
+				dev_info(dev, "[DBG%d] " fmt,		\
+					 (lvl), ##__VA_ARGS__);		\
+			}						\
+		}							\
+	} while (0)
+
 #define ONIC_MAX_QUEUES			64
 
 /* state bits */

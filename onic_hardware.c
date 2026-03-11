@@ -58,8 +58,8 @@ static const u16 c2h_timer_pool[QDMA_NUM_C2H_TIMERS] = {
 };
 
 static const u16 c2h_thres_pool[QDMA_NUM_C2H_COUNTERS] = {
-	64, 2, 4, 8, 16, 24, 32, 48,
-	80, 96, 112, 128, 144, 160, 176, 192
+	1, 2, 4, 8, 16, 24, 32, 48,
+	64, 96, 112, 128, 144, 160, 176, 192
 };
 
 u16 onic_ring_count(u8 idx)
@@ -529,8 +529,10 @@ static void onic_qdma_set_q_pidx(unsigned long qdma, u16 qid,
 {
 	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
 	u32 offset, val;
-	bool debug = 0;
-	if (debug) dev_info(&qdev->pdev->dev, "onic_qdma_set_q_pidx(qid:%u, dir:%x, pidx:%u, irq_qrm:%u)", qid, dir, pidx, irq_arm);
+
+	onic_dev_dbg(ONIC_DBG_DATA, &qdev->pdev->dev,
+		     "set_q_pidx qid:%u dir:%x pidx:%u irq_arm:%u",
+		     qid, dir, pidx, irq_arm);
 
 	if (qid < 0)
 		return;
@@ -572,8 +574,10 @@ static void onic_qdma_set_cmpl_cidx(unsigned long qdma, u16 qid, u16 cidx,
 {
 	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
 	u32 offset, val;
-	bool debug = 0;
-	if (debug) dev_info(&qdev->pdev->dev, "onic_qdma_set_cmpl_cidx(qid:%u, cidx:%u, idx:%u, timser_idx:%u, trig_mode:%u irq_arm:%u)", qid, cidx, counter_idx, timer_idx, trig_mode, irq_arm);
+
+	onic_dev_dbg(ONIC_DBG_DATA, &qdev->pdev->dev,
+		     "set_cmpl_cidx qid:%u cidx:%u cnt_idx:%u tmr_idx:%u trig:%u irq_arm:%u",
+		     qid, cidx, counter_idx, timer_idx, trig_mode, irq_arm);
 
 	if (qid < 0)
 		return;
@@ -592,9 +596,17 @@ static void onic_qdma_set_cmpl_cidx(unsigned long qdma, u16 qid, u16 cidx,
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
 {
 	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
-	u8 trig_mode = 5; // trigger from: user, count, or timer
-	u8 stat_en = 1;  // enabled is necessary for getting proper completion_status, e.g. for knowing pidx
-	bool debug = 0;
-	if (debug) dev_info(&qdev->pdev->dev, "onic_set_completion_tail (qid:%u, tail:%u, irq_arm:%u)", qid, tail, irq_arm);
+	u8 trig_mode = 5;
+	u8 stat_en = 1;
+	u32 offset;
+
+	onic_dev_dbg(ONIC_DBG_DATA, &qdev->pdev->dev,
+		     "set_completion_tail qid:%u tail:%u irq_arm:%u",
+		     qid, tail, irq_arm);
 	onic_qdma_set_cmpl_cidx(qdma, qid, tail, 0, 0, trig_mode, stat_en, irq_arm);
+
+	if (irq_arm) {
+		offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + (qid * 16);
+		(void)qdma_read_reg(qdev, offset);
+	}
 }
