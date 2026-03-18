@@ -142,4 +142,16 @@ void onic_set_rx_head(unsigned long qdma, u16 qid, u16 head);
  **/
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm);
 
+int  onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset);
+
+/**
+ * onic_qdma_dump_error_regs - log all QDMA error status registers
+ * @qdma: handle to QDMA device
+ *
+ * Reads the global and all leaf error status registers and prints them via
+ * dev_err.  Call this BEFORE onic_qdma_init_error_interrupt() so the values
+ * are captured before the W1C clear happens.
+ **/
+void onic_qdma_dump_error_regs(unsigned long qdma);
+
 #endif

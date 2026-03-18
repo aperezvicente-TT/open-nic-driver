@@ -41,6 +41,7 @@
 
 #define RX_ALIGN_TIMEOUT_MS			1000
 #define CMAC_RESET_WAIT_MS			1
+#define SHELL_RST_TIMEOUT_MS			200
 
 static const u16 rngcnt_pool[QDMA_NUM_DESC_RNGCNT] = {
 	4096, 64, 128, 192, 256, 384, 512, 768,
@@ -176,19 +177,24 @@ static void onic_qdma_init_csr(struct qdma_dev *qdev)
 }
 
 
-static int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id)
+int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset)
 {
+	u32 mask;
+	int i;
+
 	if (cmac_id != 0 && cmac_id != 1)
 		return -EINVAL;
 
-	if (cmac_id == 0) {
-		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, 0x10);
-		while ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & 0x10) != 0x10)
+	if (reset) {
+		mask = (cmac_id == 0) ? 0x10 : 0x100;
+		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, mask);
+		for (i = 0; i < SHELL_RST_TIMEOUT_MS; i++) {
+			if ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & mask) == mask)
+				break;
 			mdelay(CMAC_RESET_WAIT_MS);
-	} else {
-		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, 0x100);
-		while ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & 0x100) != 0x100)
-			mdelay(CMAC_RESET_WAIT_MS);
+		}
+		if (i == SHELL_RST_TIMEOUT_MS)
+			pr_warn("onic: CMAC%d shell reset timed out, continuing\n", cmac_id);
 	}
 
     if (hw->RS_FEC) {
@@ -245,6 +251,10 @@ int onic_init_hardware(struct onic_private *priv)
 	if (!qdev)
 		return -ENOMEM;
 
+	/* Set hw->qdma immediately so onic_clear_hardware() is safe if any
+	 * subsequent step fails and jumps to the clear_hardware error path. */
+	hw->qdma = (unsigned long)qdev;
+
 	func_id = PCI_FUNC(pdev->devfn);
 	qbase = func_id * ONIC_MAX_QUEUES;
 	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
@@ -276,15 +286,13 @@ int onic_init_hardware(struct onic_private *priv)
 	if (master_pf)
 		onic_qdma_init_csr(qdev);
 
-    hw->qdma = (unsigned long)qdev;
-
 	/* get the number of CMAC instances */
 	for (i = 0; i < ONIC_MAX_CMACS; ++i) {
 		val = onic_read_reg(hw, CMAC_OFFSET_CORE_VERSION(i));
 		if (val != ONIC_CMAC_CORE_VERSION)
 			break;
 		if (master_pf)
-			onic_enable_cmac(hw, i);
+			onic_enable_cmac(hw, i, true);
 	}
 	hw->num_cmacs = i;
 	dev_info(&pdev->dev, "Number of CMAC instances = %d", hw->num_cmacs);
@@ -296,12 +304,60 @@ clear_hardware:
 	return rv;
 }
 
+static int onic_shell_qdma_reset(struct onic_hardware *hw)
+{
+	u32 status;
+	int i;
+
+	/* assert QDMA subsystem reset (bit 0 of shell reset register) */
+	onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, BIT(0));
+
+	/* poll shell status bit 0 for reset-done, ~1ms per iteration */
+	for (i = 0; i < SHELL_RST_TIMEOUT_MS; i++) {
+		status = onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS);
+		if (status & BIT(0))
+			return 0;
+		mdelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int __maybe_unused onic_shell_system_reset(struct onic_hardware *hw)
+{
+	int i;
+
+	onic_write_reg(hw, SYSCFG_OFFSET_SYSTEM_RESET, 1);
+
+	for (i = 0; i < SHELL_RST_TIMEOUT_MS; i++) {
+		if (onic_read_reg(hw, SYSCFG_OFFSET_SYSTEM_STATUS) & BIT(0))
+			return 0;
+		mdelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
 void onic_clear_hardware(struct onic_private *priv)
 {
 	struct onic_hardware *hw = &priv->hw;
 	struct pci_dev *pdev = priv->pdev;
 	struct qdma_dev *qdev = (struct qdma_dev *)hw->qdma;
 	u16 func_id = PCI_FUNC(pdev->devfn);
+	int rv;
+
+	/* Soft-reset the shared QDMA DMA engine to ensure a clean slate for
+	 * the subsequent fmap invalidation and for a following insmod.
+	 *
+	 * IMPORTANT: this register resets the QDMA subsystem for ALL PFs on
+	 * the same device.  PCI removes devices in reverse probe order, so the
+	 * slave PF (func 1) is torn down first while the master PF (func 0)
+	 * may still have active queues.  Only the master performs this reset —
+	 * it is always removed last, after all other PFs are gone. */
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
+		rv = onic_shell_qdma_reset(hw);
+		if (rv)
+			dev_warn(&pdev->dev,
+				 "QDMA shell reset timed out, continuing teardown\n");
+	}
 
 	/* clear the function map in shell */
 	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), 0);
@@ -338,6 +394,22 @@ void onic_qdma_init_error_interrupt(unsigned long qdma, u16 vid)
 		val |= FIELD_SET(qdma_error_info[err_idx].glbl_err_mask, 1);
 		qdma_write_reg(qdev, offset, val);
 	}
+
+	/* W1C-clear all leaf error status registers before re-arming.
+	 * Without this, any latched error bit (e.g. C2H MTY/QID mismatch
+	 * caused by an in-flight packet when the cable was pulled) remains
+	 * set and immediately re-fires the interrupt the moment ARM=1 is
+	 * written, producing an unrecoverable interrupt storm. */
+	for (i = 0; i < NUM_LEAF_ERROR_AGGREGATORS; i++) {
+		u32 err_idx = leaf_error_aggregators[i];
+
+		val = qdma_read_reg(qdev, qdma_error_info[err_idx].stat_reg_addr);
+		if (val)
+			qdma_write_reg(qdev, qdma_error_info[err_idx].stat_reg_addr, val);
+	}
+	val = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_ERR_STAT);
+	if (val)
+		qdma_write_reg(qdev, QDMA_OFFSET_GLBL_ERR_STAT, val);
 
 	offset = QDMA_OFFSET_GLBL_ERR_INT;
 	val = (FIELD_SET(QDMA_GLBL_ERR_FUNC_MASK, qdev->func_id) |
@@ -591,6 +663,27 @@ static void onic_qdma_set_cmpl_cidx(unsigned long qdma, u16 qid, u16 cidx,
 	       FIELD_SET(QDMA_DMAP_SEL_CMPL_STAT_EN_MASK, stat_en) |
 	       FIELD_SET(QDMA_DMAP_SEL_CMPL_IRQ_ARM_MASK, irq_arm));
 	qdma_write_reg(qdev, offset, val);
+}
+
+void onic_qdma_dump_error_regs(unsigned long qdma)
+{
+	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
+	u32 glbl, dsc, trq, c2h, c2h_fatal, h2c, sbe, dbe;
+
+	glbl      = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_ERR_STAT);
+	dsc       = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_DSC_ERR_STAT);
+	trq       = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_TRQ_ERR_STAT);
+	c2h       = qdma_read_reg(qdev, QDMA_OFFSET_C2H_ERR_STAT);
+	c2h_fatal = qdma_read_reg(qdev, QDMA_OFFSET_C2H_FATAL_ERR_STAT);
+	h2c       = qdma_read_reg(qdev, QDMA_OFFSET_H2C_ERR_STAT);
+	sbe       = qdma_read_reg(qdev, QDMA_OFFSET_RAM_SBE_STAT);
+	dbe       = qdma_read_reg(qdev, QDMA_OFFSET_RAM_DBE_STAT);
+
+	dev_err(&qdev->pdev->dev,
+		"QDMA err: GLBL=0x%08x DSC=0x%08x TRQ=0x%08x "
+		"C2H=0x%08x C2H_FATAL=0x%08x H2C=0x%08x "
+		"SBE=0x%08x DBE=0x%08x\n",
+		glbl, dsc, trq, c2h, c2h_fatal, h2c, sbe, dbe);
 }
 
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)

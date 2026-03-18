@@ -47,4 +47,16 @@ int onic_init_interrupt(struct onic_private *priv);
  **/
 void onic_clear_interrupt(struct onic_private *priv);
 
+/**
+ * onic_init_link_recovery - initialise the link-recovery work struct
+ * @priv: pointer to driver private data
+ **/
+void onic_init_link_recovery(struct onic_private *priv);
+
+/**
+ * onic_init_error_rearm - initialise the error-interrupt deferred re-arm work
+ * @priv: pointer to driver private data
+ **/
+void onic_init_error_rearm(struct onic_private *priv);
+
 #endif

@@ -18,6 +18,7 @@
 #include <linux/pci_regs.h>
 #include <linux/version.h>
 #include <linux/pci.h>
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
 #include <linux/bpf.h>
@@ -33,6 +34,7 @@
 
 #include "onic_netdev.h"
 #include "onic_hardware.h"
+#include "onic_register.h"
 #include "qdma_access/qdma_register.h"
 #include "onic.h"
 
@@ -412,9 +414,12 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	}
 
 	if (cmpl.err == 1) {
-		netdev_warn(q->netdev, "completion error detected in cmpl entry");
-		// todo: need to handle the error ...
-		onic_qdma_clear_error_interrupt(priv->hw.qdma);
+		netdev_warn(q->netdev, "completion error at ntc=%u pidx=%u — rescheduling",
+			    cmpl_ring->next_to_clean, cmpl_stat.pidx);
+		/* Do not disarm the global error IRQ here; onic_error_thread_fn
+		 * owns the error interrupt lifecycle and will re-arm it.
+		 * Reschedule so the poll function retries after the error clears. */
+		napi_schedule(napi);
 	}
 
 	// main processing loop for rx_poll
@@ -514,7 +519,15 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			 * Calling napi_complete + napi_schedule here is wrong:
 			 * it re-enables interrupts then immediately re-queues
 			 * via softirq, producing the "Budget exhausted after
-			 * napi rescheduled" warning and a busy-loop. */
+			 * napi rescheduled" warning and a busy-loop.
+			 *
+			 * Update CIDX here (irq_arm=0) so the hardware sees the
+			 * completions we just consumed and has room to write more.
+			 * Without this, the CIDX stays stale at line rate and the
+			 * completion ring fills up → CMPL_QFULL_ERR followed by
+			 * CMPL_INV_Q_ERR as QDMA marks the queue invalid. */
+			onic_set_completion_tail(priv->hw.qdma, qid,
+						 cmpl_ring->next_to_clean, 0);
 			goto out_of_budget;
 		}
 
@@ -560,12 +573,25 @@ static void onic_clear_tx_queue(struct onic_private *priv, u16 qid)
 	size = QDMA_H2C_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
 	size = ALIGN(size, PAGE_SIZE);
 
+	/* Drain any in-flight buffers not yet acknowledged by hardware.
+	 * onic_tx_clean() only processes up to wb.cidx; packets submitted
+	 * after that point are orphaned when the QDMA queue is torn down. */
 	for (i = 0; i < real_count; ++i) {
-		if ((q->buffer[i].type & ONIC_TX_SKB ) && q->buffer[i].skb) {
-			netdev_err(priv->netdev, "Weird, skb is not NULL\n");
-		} else if ((q->buffer[i].type & (ONIC_TX_XDPF || ONIC_TX_XDPF_XMIT)) && q->buffer[i].xdpf) {
-			netdev_err(priv->netdev, "Weird, skb is not NULL\n");
+		struct onic_tx_buffer *buf = &q->buffer[i];
+
+		if (buf->type == ONIC_TX_SKB && buf->skb) {
+			dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len, DMA_TO_DEVICE);
+			dev_kfree_skb_any(buf->skb);
+			buf->skb = NULL;
+		} else if (buf->type == ONIC_TX_XDPF && buf->xdpf) {
+			xdp_return_frame(buf->xdpf);
+			buf->xdpf = NULL;
+		} else if (buf->type == ONIC_TX_XDPF_XMIT && buf->xdpf) {
+			dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len, DMA_TO_DEVICE);
+			xdp_return_frame(buf->xdpf);
+			buf->xdpf = NULL;
 		}
+		buf->type = 0;
 	}
 
 	if (ring->desc)
@@ -660,10 +686,20 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	if (!q)
 		return;
 
-	onic_qdma_clear_rx_queue(priv->hw.qdma, qid);
-
+	/* Stop NAPI BEFORE tearing down the QDMA queue.  If a poll is
+	 * running on another CPU when we invalidate the QDMA contexts,
+	 * the poll reads undefined cmpl_stat.pidx and its while-loop
+	 * spins on garbage — napi_disable() then waits forever.
+	 *
+	 * napi_disable() won't spin here because:
+	 *   - onic_remove() already disabled CMAC RX (pipeline drained)
+	 *   - onic_clear_interrupt() freed all queue IRQs
+	 *   - any in-progress poll exhausts remaining completions and
+	 *     calls napi_complete_done(), clearing NAPI_STATE_SCHED */
 	napi_disable(&q->napi);
 	netif_napi_del(&q->napi);
+
+	onic_qdma_clear_rx_queue(priv->hw.qdma, qid);
 
 	ring = &q->desc_ring;
 	real_count = ring->count - 1;
@@ -950,7 +986,19 @@ int onic_open_netdev(struct net_device *dev)
 		goto stop_netdev;
 
 	netif_tx_start_all_queues(dev);
-	netif_carrier_on(dev);
+
+	/* Only assert carrier if the physical link is already up.
+	 * The user IRQ (link-change) will call carrier_on later if the
+	 * cable is plugged in after the interface is opened. */
+	{
+		struct onic_hardware *hw = &priv->hw;
+		u16 func_id = PCI_FUNC(priv->pdev->devfn);
+		u8 cmac_id = (func_id < hw->num_cmacs) ? func_id : 0;
+		u32 rx_status = onic_read_reg(hw,
+					      CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
+		if (rx_status & 0x1)
+			netif_carrier_on(dev);
+	}
 	return 0;
 
 stop_netdev:
@@ -961,7 +1009,30 @@ stop_netdev:
 int onic_stop_netdev(struct net_device *dev)
 {
 	struct onic_private *priv = netdev_priv(dev);
-	int qid;
+	struct onic_hardware *hw = &priv->hw;
+	int qid, i;
+
+	/* Disable CMAC RX so new frames stop entering the QDMA C2H pipeline.
+	 *
+	 * During rmmod, onic_remove() already disabled CMAC RX early (before
+	 * freeing IRQs) and set ONIC_FLAG_CMAC_RX_DISABLED.  Skip the
+	 * duplicate disable in that case.  For a normal "ip link set down"
+	 * (no rmmod), we still need to disable here. */
+	if (!test_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags)) {
+		if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
+			for (i = 0; i < hw->num_cmacs; i++)
+				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(i), 0x0);
+		} else {
+			u16 func_id = PCI_FUNC(priv->pdev->devfn);
+
+			if (func_id < hw->num_cmacs)
+				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(func_id), 0x0);
+		}
+
+		/* Let the RTL drain shim inject TLAST on any in-flight frame.
+		 * The shim needs ~50 ns + pipeline propagation; 10 us generous. */
+		udelay(10);
+	}
 
 	/* stop sending */
 	netif_carrier_off(dev);

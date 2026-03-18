@@ -43,6 +43,7 @@ static inline void onic_write_reg(struct onic_hardware *hw, u32 offset, u32 val)
 #define SYSCFG_OFFSET_SHELL_STATUS			(SYSCFG_OFFSET + 0x10)
 #define SYSCFG_OFFSET_USER_RESET			(SYSCFG_OFFSET + 0x14)
 #define SYSCFG_OFFSET_USER_STATUS			(SYSCFG_OFFSET + 0x18)
+#define SYSCFG_OFFSET_LINK_IRQ_STATUS			(SYSCFG_OFFSET + 0x1C)
 
 /***** QDMA subsystem registers *****/
 #define QDMA_SUBSYSTEM_OFFSET				0x1000

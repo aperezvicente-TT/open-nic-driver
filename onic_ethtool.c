@@ -37,6 +37,8 @@ enum {
 	ETHTOOL_XDP_TX_ERR,
 	ETHTOOL_XDP_XMIT,
 	ETHTOOL_XDP_XMIT_ERR,
+	ETHTOOL_TX_DROPPED,
+	ETHTOOL_TX_ERRORS,
 };
 
 
@@ -269,7 +271,9 @@ static const struct onic_stats onic_gstrings_stats[] = {
     _STAT_NETDEV("rx_xdp_tx",ETHTOOL_XDP_TX ),
     _STAT_NETDEV("rx_xdp_tx_errors", ETHTOOL_XDP_TX_ERR ),
     _STAT_NETDEV("tx_xdp_xmit", ETHTOOL_XDP_XMIT ),
-    _STAT_NETDEV("tx_xdp_xmit_errors", ETHTOOL_XDP_XMIT_ERR ),  
+    _STAT_NETDEV("tx_xdp_xmit_errors", ETHTOOL_XDP_XMIT_ERR ),
+    _STAT_NETDEV("tx_dropped", ETHTOOL_TX_DROPPED),
+    _STAT_NETDEV("tx_errors", ETHTOOL_TX_ERRORS),
 };
 
 #define ONIC_QUEUE_STATS_LEN 0
@@ -416,6 +420,9 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
             u64 xdp_xmit;
             u64 xdp_xmit_err;
       } global_xdp_stats = {0};
+    u64 tx_dropped = 0, tx_errors = 0;
+    struct rtnl_link_stats64 *pcpu_ptr;
+    unsigned int cpu;
 
 
       for (j =0; j < priv->num_rx_queues; j++) {
@@ -429,6 +436,11 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
       for (j =0; j < priv->num_tx_queues; j++) {
         global_xdp_stats.xdp_xmit += priv->tx_queue[j]->xdp_tx_stats.xdp_xmit;
         global_xdp_stats.xdp_xmit_err += priv->tx_queue[j]->xdp_tx_stats.xdp_xmit_err;
+      }
+      for_each_possible_cpu(cpu) {
+        pcpu_ptr = per_cpu_ptr(priv->netdev_stats, cpu);
+        tx_dropped += pcpu_ptr->tx_dropped;
+        tx_errors += pcpu_ptr->tx_errors;
       }
     
     func_id = PCI_FUNC(pdev->devfn);
@@ -471,6 +483,12 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
           break;
         case ETHTOOL_XDP_XMIT_ERR:
           data[i] = global_xdp_stats.xdp_xmit_err;
+          break;
+        case ETHTOOL_TX_DROPPED:
+          data[i] = tx_dropped;
+          break;
+        case ETHTOOL_TX_ERRORS:
+          data[i] = tx_errors;
           break;
         }
       }

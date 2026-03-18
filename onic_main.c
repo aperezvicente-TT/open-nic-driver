@@ -25,9 +25,12 @@
 #include <linux/moduleparam.h>
 #include <linux/bpf.h>
 
+#include <linux/delay.h>
+
 #include "onic.h"
 #include "onic_hardware.h"
 #include "onic_lib.h"
+#include "onic_register.h"
 #include "onic_common.h"
 #include "onic_netdev.h"
 
@@ -236,6 +239,8 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	priv->netdev = netdev;
 	spin_lock_init(&priv->tx_lock);
 	spin_lock_init(&priv->rx_lock);
+	onic_init_link_recovery(priv);
+	onic_init_error_rearm(priv);
 
 	priv->netdev_stats = alloc_percpu(struct rtnl_link_stats64);
 	if (!priv->netdev_stats) {
@@ -319,9 +324,55 @@ static void onic_remove(struct pci_dev *pdev)
         static int xmc_remove=0;
 #endif
 
+	dev_info(&pdev->dev, "removing device");
+
+	/* 1. STOP THE PACKET FLOW FIRST.
+	 *
+	 * Disable CMAC RX before touching IRQs or NAPI.  With a 93 Gbps
+	 * stream active, QDMA continuously writes completions and the
+	 * IRQ handler schedules NAPI.  If we free IRQs while the CMAC is
+	 * still active, the last-scheduled NAPI poll enters a busy-poll
+	 * loop: poll → process → refill descriptors → QDMA DMAs more →
+	 * more completions → poll returns budget → softirq re-polls.
+	 * Nothing can break this loop because no IRQ handler remains to
+	 * detect that the queue is being torn down, and napi_disable()
+	 * later spins forever waiting for NAPI_STATE_SCHED to clear.
+	 *
+	 * By disabling CMAC RX first, the pipeline drains while IRQs are
+	 * still live: the last completions generate interrupts, NAPI
+	 * processes them, the poll returns < budget, napi_complete_done
+	 * clears NAPI_STATE_SCHED, and the queue goes idle.  After that,
+	 * free_irq and napi_disable complete instantly. */
+	{
+		struct onic_hardware *hw = &priv->hw;
+		u16 func_id = PCI_FUNC(pdev->devfn);
+
+		if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
+			int i;
+			for (i = 0; i < hw->num_cmacs; i++)
+				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(i), 0x0);
+		} else if (func_id < hw->num_cmacs) {
+			onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(func_id), 0x0);
+		}
+		udelay(10);
+		set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
+	}
+
+	/* 2. Drain any work running before free_irq. */
+	cancel_work_sync(&priv->link_recovery_work);
+
+	/* 3. Free IRQs.  With CMAC RX already off, the NAPI polls have
+	 * drained and free_irq just removes idle handlers. */
+	onic_clear_interrupt(priv);
+
+	/* 4. Drain any work re-scheduled in the window between the first
+	 * cancel and free_irq; IRQ threads cannot enqueue new work now. */
+	cancel_work_sync(&priv->link_recovery_work);
+
+	/* 5. Unregister the netdev (calls onic_stop_netdev via ndo_stop).
+	 * onic_stop_netdev skips the CMAC disable since we already did it. */
 	unregister_netdev(priv->netdev);
 
-	onic_clear_interrupt(priv);
 	onic_clear_hardware(priv);
 	onic_clear_capacity(priv);
 
@@ -341,23 +392,48 @@ static void onic_remove(struct pci_dev *pdev)
 #endif
 }
 
-/* static const struct pci_error_handlers qdma_err_handler = { */
-/*     .error_detected		    = qdma_error_detected, */
-/*     .slot_reset		    = qdma_slot_reset, */
-/*     .resume			    = qdma_error_resume, */
-/* #if KERNEL_VERSION(4, 13, 0) <= LINUX_VERSION_CODE */
-/*     .reset_prepare		    = qdma_reset_prepare, */
-/*     .reset_done		    = qdma_reset_done, */
-/* #elif KERNEL_VERSION(3, 16, 0) <= LINUX_VERSION_CODE */
-/*     .reset_notify		    = qdma_reset_notify, */
-/* #endif */
-/* }; */
+static pci_ers_result_t onic_error_detected(struct pci_dev *pdev,
+					     pci_channel_state_t state)
+{
+	struct onic_private *priv = pci_get_drvdata(pdev);
+
+	netif_device_detach(priv->netdev);
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t onic_slot_reset(struct pci_dev *pdev)
+{
+	struct onic_private *priv = pci_get_drvdata(pdev);
+
+	if (pci_enable_device(pdev))
+		return PCI_ERS_RESULT_DISCONNECT;
+	pci_set_master(pdev);
+	/* shell auto-fired system reset when pcie_rstn deasserted;
+	 * wait for it to complete, then re-init hardware */
+	if (onic_init_hardware(priv))
+		return PCI_ERS_RESULT_DISCONNECT;
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void onic_error_resume(struct pci_dev *pdev)
+{
+	struct onic_private *priv = pci_get_drvdata(pdev);
+
+	netif_device_attach(priv->netdev);
+}
+
+static const struct pci_error_handlers onic_err_handler = {
+	.error_detected = onic_error_detected,
+	.slot_reset     = onic_slot_reset,
+	.resume         = onic_error_resume,
+};
 
 static struct pci_driver pci_driver = {
-	.name = onic_drv_name,
-	.id_table = onic_pci_tbl,
-	.probe = onic_probe,
-	.remove = onic_remove,
+	.name        = onic_drv_name,
+	.id_table    = onic_pci_tbl,
+	.probe       = onic_probe,
+	.remove      = onic_remove,
+	.err_handler = &onic_err_handler,
 };
 
 static int __init onic_init_module(void)
@@ -368,6 +444,7 @@ static int __init onic_init_module(void)
 
 static void __exit onic_exit_module(void)
 {
+	pr_info("%s %s unloaded", onic_drv_str, onic_drv_ver);
 	pci_unregister_driver(&pci_driver);
 }
 

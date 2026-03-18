@@ -22,6 +22,7 @@
 #include <linux/bpf.h>
 #include <net/xdp.h>
 #include <linux/bitops.h>
+#include <linux/workqueue.h>
 
 #include "onic_hardware.h"
 
@@ -75,6 +76,7 @@ extern int onic_debug_level;
 
 /* flag bits */
 #define ONIC_FLAG_MASTER_PF		0
+#define ONIC_FLAG_CMAC_RX_DISABLED	1
 
 /* XDP */
 #define ONIC_XDP_PASS    	BIT(0)	
@@ -193,6 +195,22 @@ struct onic_private {
 	struct onic_rx_queue *rx_queue[ONIC_MAX_QUEUES];
 
 	struct onic_hardware hw;
+
+	unsigned long cmac_last_enable_jiffies[ONIC_MAX_CMACS]; /* IRQ debounce */
+
+	/* Workqueue item for link-recovery (cable replug).  Scheduled from
+	 * onic_user_thread_fn so the IRQ thread returns immediately and
+	 * free_irq() doesn't block.  The work item does a full dev_close +
+	 * dev_open to reinitialise QDMA C2H contexts that may have stalled
+	 * on an in-flight AXI-S transfer when the CMAC was reset. */
+	struct work_struct link_recovery_work;
+	u32 link_recovery_cmac_mask; /* bitmask of CMAC indices to re-enable */
+
+	/* Deferred re-arm for the QDMA error interrupt.  Rather than
+	 * re-arming immediately after a fatal LEN_MISMATCH (which causes an
+	 * instant double-fire if another glitch packet is in-flight), we wait
+	 * ERROR_REARM_DELAY_MS before writing ARM=1 so QDMA's pipeline drains. */
+	struct delayed_work error_rearm_work;
 };
 
 #endif
