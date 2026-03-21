@@ -294,7 +294,7 @@ static void onic_get_drvinfo(struct net_device *netdev,
 
 static u32 onic_get_link(struct net_device *netdev)
 {
-    u32 val, carrier_ok;
+    u32 val;
     u8 cmac_idx;
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
@@ -305,14 +305,19 @@ static u32 onic_get_link(struct net_device *netdev)
     val = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
     val = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
 
-    carrier_ok = netif_carrier_ok(netdev);
     val = (val == 0x3);
 
-    onic_netdev_dbg(ONIC_DBG_INFO, netdev,
-		    "get_link port: %d carrier_ok: %u rx_status_ok: %u",
-		    cmac_idx, carrier_ok, val);
+    /* Sync carrier to hardware reality.  If the FPGA link was already up
+     * when the driver loaded, no link-change IRQ fires and carrier is
+     * never set by the IRQ path.  Update it here from ground truth.
+     * Only assert on — the IRQ path owns the carrier-off transition. */
+    if (val)
+        netif_carrier_on(netdev);
 
-    return (carrier_ok && val);
+    onic_netdev_dbg(ONIC_DBG_INFO, netdev,
+		    "get_link port: %d rx_status_ok: %u", cmac_idx, val);
+
+    return val;
 }
 
 static int onic_get_fecparam(struct net_device *netdev,
@@ -386,7 +391,7 @@ static int onic_get_link_ksettings(struct net_device *netdev,
     rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
     rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
 
-    if (netif_carrier_ok(netdev) && (rx_status == 0x3)) {
+    if (rx_status == 0x3) {
 	cmd->base.speed = SPEED_100000;
 	cmd->base.duplex = DUPLEX_FULL;
     } else {

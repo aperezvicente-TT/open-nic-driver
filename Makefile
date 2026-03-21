@@ -29,13 +29,13 @@ ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_access -I$(srcdir)/hwmon -I$(srcd
 KDIR ?= /lib/modules/$(KERNEL_VERS)/build
 
 all:
-	make -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 with-clang:
-	make CC=clang -C $(KDIR) M=$(PWD) modules
-	
+	$(MAKE) CC=clang -C $(KDIR) M=$(PWD) modules
+
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f *.o.ur-safe
 	rm -f ./qdma_access/*.o.ur-safe
 

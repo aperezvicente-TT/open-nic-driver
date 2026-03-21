@@ -49,6 +49,16 @@ void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats);
 
 int onic_poll(struct napi_struct *napi, int budget);
 
+/**
+ * onic_update_carrier - read hardware rx_status and sync kernel carrier state
+ * @dev: pointer to net device
+ *
+ * Double-reads CMAC STAT_RX_STATUS to flush latched values, then calls
+ * netif_carrier_on() if both stat_rx_aligned and stat_rx_status are set.
+ * Returns 1 if link is up, 0 otherwise.
+ **/
+int onic_update_carrier(struct net_device *dev);
+
 int onic_xdp(struct net_device *dev, struct netdev_bpf *xdp);
 
 int onic_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,

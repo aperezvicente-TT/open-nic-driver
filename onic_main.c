@@ -223,7 +223,9 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	memset(&saddr, 0, sizeof(struct sockaddr));
 	memcpy(saddr.sa_data, onic_default_dev_addr, 6);
-	get_random_bytes(saddr.sa_data + 3, 3);
+	saddr.sa_data[3] = pdev->bus->number;
+	saddr.sa_data[4] = PCI_SLOT(pdev->devfn);
+	saddr.sa_data[5] = PCI_FUNC(pdev->devfn);
 	onic_set_mac_address(netdev, (void *)&saddr);
 
 	priv = netdev_priv(netdev);

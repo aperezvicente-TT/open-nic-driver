@@ -972,10 +972,36 @@ clear_rx_resource:
 	return rv;
 }
 
+int onic_update_carrier(struct net_device *dev)
+{
+	struct onic_private *priv = netdev_priv(dev);
+	struct onic_hardware *hw = &priv->hw;
+	u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
+	u32 rx_status;
+
+	if (cmac_id >= hw->num_cmacs)
+		cmac_id = 0;
+
+	/* double-read to flush any previously latched value */
+	onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
+	rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
+
+	if (rx_status == 0x3) {
+		netif_carrier_on(dev);
+		return 1;
+	}
+	return 0;
+}
+
 int onic_open_netdev(struct net_device *dev)
 {
 	struct onic_private *priv = netdev_priv(dev);
 	int rv;
+
+	/* Clear the flag set by onic_remove() to suppress duplicate CMAC RX
+	 * disable during teardown.  Clearing it here ensures a subsequent
+	 * stop+start cycle (e.g. MTU change) re-disables correctly. */
+	clear_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
 
 	rv = onic_init_tx_resource(priv);
 	if (rv < 0)
@@ -987,17 +1013,36 @@ int onic_open_netdev(struct net_device *dev)
 
 	netif_tx_start_all_queues(dev);
 
-	/* Only assert carrier if the physical link is already up.
-	 * The user IRQ (link-change) will call carrier_on later if the
-	 * cable is plugged in after the interface is opened. */
+	/* Re-enable CMAC RX (and TX, RS-FEC, flow control) for this PF's CMAC.
+	 * onic_stop_netdev() silences CMAC RX, but onic_enable_cmac() is only
+	 * called at probe time and from the link-recovery IRQ path.  Without
+	 * this call, any stop+start cycle (e.g. MTU change, ip link down/up)
+	 * leaves CMAC RX disabled and all inbound frames are silently dropped
+	 * at the MAC even though the QDMA queues are ready.
+	 *
+	 * Each PF owns its own CMAC (PF0→CMAC0, PF1→CMAC1).  Use reset=false
+	 * to avoid disrupting the AXI-S bridge on a live link.
+	 *
+	 * Update cmac_last_enable_jiffies to prime the 5-second debounce in
+	 * onic_link_recovery_work so a link-change IRQ arriving immediately
+	 * after open does not re-run onic_enable_cmac redundantly.
+	 *
+	 * If the link is already up, assert carrier now.  If not, the
+	 * link-recovery IRQ path will call netif_carrier_on once aligned. */
 	{
 		struct onic_hardware *hw = &priv->hw;
-		u16 func_id = PCI_FUNC(priv->pdev->devfn);
-		u8 cmac_id = (func_id < hw->num_cmacs) ? func_id : 0;
-		u32 rx_status = onic_read_reg(hw,
-					      CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
-		if (rx_status & 0x1)
-			netif_carrier_on(dev);
+		u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
+
+		if (cmac_id >= hw->num_cmacs)
+			cmac_id = 0;
+
+		onic_enable_cmac(hw, cmac_id, false);
+		priv->cmac_last_enable_jiffies[cmac_id] = jiffies;
+
+		onic_netdev_dbg(ONIC_DBG_INIT, dev,
+				"CMAC%d re-enabled on open", cmac_id);
+
+		onic_update_carrier(dev);
 	}
 	return 0;
 
@@ -1010,7 +1055,7 @@ int onic_stop_netdev(struct net_device *dev)
 {
 	struct onic_private *priv = netdev_priv(dev);
 	struct onic_hardware *hw = &priv->hw;
-	int qid, i;
+	int qid;
 
 	/* Disable CMAC RX so new frames stop entering the QDMA C2H pipeline.
 	 *
@@ -1019,15 +1064,14 @@ int onic_stop_netdev(struct net_device *dev)
 	 * duplicate disable in that case.  For a normal "ip link set down"
 	 * (no rmmod), we still need to disable here. */
 	if (!test_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags)) {
-		if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
-			for (i = 0; i < hw->num_cmacs; i++)
-				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(i), 0x0);
-		} else {
-			u16 func_id = PCI_FUNC(priv->pdev->devfn);
+		/* Each PF owns its own CMAC: disable only this PF's CMAC RX.
+		 * Master PF (func_id=0) owns CMAC0; slave PF (func_id=1) owns
+		 * CMAC1.  Previously the master looped over all CMACs, which
+		 * would disable the slave's CMAC during a master MTU change. */
+		u16 func_id = PCI_FUNC(priv->pdev->devfn);
+		u8 cmac_id = (func_id < hw->num_cmacs) ? (u8)func_id : 0;
 
-			if (func_id < hw->num_cmacs)
-				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(func_id), 0x0);
-		}
+		onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(cmac_id), 0x0);
 
 		/* Let the RTL drain shim inject TLAST on any in-flight frame.
 		 * The shim needs ~50 ns + pipeline propagation; 10 us generous. */
