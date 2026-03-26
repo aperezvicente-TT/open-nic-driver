@@ -34,6 +34,7 @@
 
 #include "onic_netdev.h"
 #include "onic_hardware.h"
+#include "onic_lib.h"
 #include "onic_register.h"
 #include "qdma_access/qdma_register.h"
 #include "onic.h"
@@ -987,6 +988,8 @@ int onic_update_carrier(struct net_device *dev)
 	rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
 
 	if (rx_status == 0x3) {
+		if (!netif_carrier_ok(dev))
+			netif_info(priv, link, dev, "Link up\n");
 		netif_carrier_on(dev);
 		return 1;
 	}
@@ -1044,6 +1047,8 @@ int onic_open_netdev(struct net_device *dev)
 
 		onic_update_carrier(dev);
 	}
+
+	onic_start_link_watchdog(priv);
 	return 0;
 
 stop_netdev:
@@ -1056,6 +1061,8 @@ int onic_stop_netdev(struct net_device *dev)
 	struct onic_private *priv = netdev_priv(dev);
 	struct onic_hardware *hw = &priv->hw;
 	int qid;
+
+	onic_stop_link_watchdog(priv);
 
 	/* Disable CMAC RX so new frames stop entering the QDMA C2H pipeline.
 	 *

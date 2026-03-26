@@ -231,6 +231,7 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	priv = netdev_priv(netdev);
 
 	memset(priv, 0, sizeof(struct onic_private));
+	priv->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
 	priv->RS_FEC = RS_FEC_ENABLED;
 
 	if (PCI_FUNC(pdev->devfn) == 0) {

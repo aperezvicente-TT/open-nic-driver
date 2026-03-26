@@ -624,8 +624,22 @@ static int onic_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info, u3
 }
 
 
+static u32 onic_get_msglevel(struct net_device *netdev)
+{
+    struct onic_private *priv = netdev_priv(netdev);
+    return priv->msg_enable;
+}
+
+static void onic_set_msglevel(struct net_device *netdev, u32 val)
+{
+    struct onic_private *priv = netdev_priv(netdev);
+    priv->msg_enable = val;
+}
+
 static const struct ethtool_ops onic_ethtool_ops = {
     .get_drvinfo         = onic_get_drvinfo,
+    .get_msglevel        = onic_get_msglevel,
+    .set_msglevel        = onic_set_msglevel,
     .get_link            = onic_get_link,
     .get_link_ksettings  = onic_get_link_ksettings,
     .get_fecparam        = onic_get_fecparam,

@@ -180,6 +180,8 @@ struct onic_private {
 
         int RS_FEC;
 
+	u32 msg_enable;
+
 	u16 num_q_vectors;
 	u16 num_tx_queues;
 	u16 num_rx_queues;
@@ -205,6 +207,12 @@ struct onic_private {
 	 * on an in-flight AXI-S transfer when the CMAC was reset. */
 	struct work_struct link_recovery_work;
 	u32 link_recovery_cmac_mask; /* bitmask of CMAC indices to re-enable */
+
+	/* Periodic link watchdog — polls CMAC STAT_RX_STATUS every second to
+	 * detect carrier transitions.  The link-recovery IRQ path handles
+	 * cable-replug events, but the initial CMAC alignment after open does
+	 * not reliably generate an IRQ, so we need polling as well. */
+	struct delayed_work link_watchdog_work;
 
 	/* Deferred re-arm for the QDMA error interrupt.  Rather than
 	 * re-arming immediately after a fatal LEN_MISMATCH (which causes an

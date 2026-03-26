@@ -123,7 +123,11 @@ static void onic_link_recovery_work(struct work_struct *work)
 				onic_enable_cmac(hw, i, false);
 				priv->cmac_last_enable_jiffies[i] = jiffies;
 			}
-			netif_carrier_on(netdev);
+			if (!netif_carrier_ok(netdev)) {
+				netif_info(pf_priv, link, netdev,
+					   "Link up\n");
+				netif_carrier_on(netdev);
+			}
 			for (q = 0; q < pf_priv->num_rx_queues; q++) {
 				if (pf_priv->rx_queue[q])
 					napi_schedule(&pf_priv->rx_queue[q]->napi);
@@ -131,8 +135,8 @@ static void onic_link_recovery_work(struct work_struct *work)
 		} else {
 			/* Link is DOWN -- deassert carrier */
 			if (netif_carrier_ok(netdev)) {
-				dev_info(&pf_pdev->dev,
-					 "CMAC%d link down\n", i);
+				netif_info(pf_priv, link, netdev,
+					   "Link down\n");
 				netif_carrier_off(netdev);
 			}
 		}
@@ -224,6 +228,59 @@ static void onic_error_rearm_work_fn(struct work_struct *work)
 void onic_init_error_rearm(struct onic_private *priv)
 {
 	INIT_DELAYED_WORK(&priv->error_rearm_work, onic_error_rearm_work_fn);
+}
+
+/* ---- Link watchdog --------------------------------------------------- */
+
+#define LINK_WATCHDOG_INTERVAL_MS	1000
+
+static void onic_link_watchdog_work_fn(struct work_struct *work)
+{
+	struct onic_private *priv =
+		container_of(to_delayed_work(work), struct onic_private,
+			     link_watchdog_work);
+	struct onic_hardware *hw = &priv->hw;
+	struct net_device *netdev = priv->netdev;
+	u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
+	u32 rx_status;
+	bool link_up;
+
+	if (!netif_running(netdev))
+		return;
+
+	if (cmac_id >= hw->num_cmacs)
+		cmac_id = 0;
+
+	/* Double-read to flush any previously latched value */
+	onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
+	rx_status = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
+	link_up = (rx_status & 0x1) != 0;
+
+	if (link_up && !netif_carrier_ok(netdev)) {
+		netif_info(priv, link, netdev, "Link up\n");
+		netif_carrier_on(netdev);
+	} else if (!link_up && netif_carrier_ok(netdev)) {
+		netif_info(priv, link, netdev, "Link down\n");
+		netif_carrier_off(netdev);
+	}
+
+	/* Reschedule while the interface is up */
+	if (netif_running(netdev))
+		schedule_delayed_work(&priv->link_watchdog_work,
+				      msecs_to_jiffies(LINK_WATCHDOG_INTERVAL_MS));
+}
+
+void onic_start_link_watchdog(struct onic_private *priv)
+{
+	INIT_DELAYED_WORK(&priv->link_watchdog_work,
+			  onic_link_watchdog_work_fn);
+	schedule_delayed_work(&priv->link_watchdog_work,
+			      msecs_to_jiffies(LINK_WATCHDOG_INTERVAL_MS));
+}
+
+void onic_stop_link_watchdog(struct onic_private *priv)
+{
+	cancel_delayed_work_sync(&priv->link_watchdog_work);
 }
 
 static irqreturn_t onic_error_handler(int irq, void *dev_id)

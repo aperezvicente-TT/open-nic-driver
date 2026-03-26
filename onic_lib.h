@@ -59,4 +59,16 @@ void onic_init_link_recovery(struct onic_private *priv);
  **/
 void onic_init_error_rearm(struct onic_private *priv);
 
+/**
+ * onic_start_link_watchdog - start periodic link-status polling
+ * @priv: pointer to driver private data
+ **/
+void onic_start_link_watchdog(struct onic_private *priv);
+
+/**
+ * onic_stop_link_watchdog - cancel the periodic link-status poll
+ * @priv: pointer to driver private data
+ **/
+void onic_stop_link_watchdog(struct onic_private *priv);
+
 #endif
