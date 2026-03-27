@@ -19,6 +19,8 @@
 #include <linux/netdevice.h>
 #include <linux/ethtool.h>
 #include <linux/version.h>
+#include <linux/ptp_clock_kernel.h>
+#include <linux/net_tstamp.h>
 
 #include "onic.h"
 #include "onic_register.h"
@@ -636,6 +638,38 @@ static void onic_set_msglevel(struct net_device *netdev, u32 val)
     priv->msg_enable = val;
 }
 
+/*
+ * kernel_ethtool_ts_info was introduced in v6.10 (commit that renamed
+ * ethtool_ts_info -> kernel_ethtool_ts_info).  Before that the callback
+ * takes a plain struct ethtool_ts_info *.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+static int onic_get_ts_info(struct net_device *dev,
+			    struct kernel_ethtool_ts_info *info)
+#else
+static int onic_get_ts_info(struct net_device *dev,
+			    struct ethtool_ts_info *info)
+#endif
+{
+	struct onic_private *priv = netdev_priv(dev);
+
+	info->so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE |
+				SOF_TIMESTAMPING_RX_HARDWARE |
+				SOF_TIMESTAMPING_RAW_HARDWARE |
+				SOF_TIMESTAMPING_TX_SOFTWARE |
+				SOF_TIMESTAMPING_RX_SOFTWARE |
+				SOF_TIMESTAMPING_SOFTWARE;
+	info->tx_types = BIT(HWTSTAMP_TX_OFF) | BIT(HWTSTAMP_TX_ON);
+	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) | BIT(HWTSTAMP_FILTER_ALL);
+
+	if (priv->ptp_clock)
+		info->phc_index = ptp_clock_index(priv->ptp_clock);
+	else
+		info->phc_index = -1;
+
+	return 0;
+}
+
 static const struct ethtool_ops onic_ethtool_ops = {
     .get_drvinfo         = onic_get_drvinfo,
     .get_msglevel        = onic_get_msglevel,
@@ -657,6 +691,7 @@ static const struct ethtool_ops onic_ethtool_ops = {
     .set_rxfh            = onic_set_rxfh,
 #endif
     .get_rxnfc           = onic_get_rxnfc,
+    .get_ts_info         = onic_get_ts_info,
 };
 
 void onic_set_ethtool_ops(struct net_device *netdev)

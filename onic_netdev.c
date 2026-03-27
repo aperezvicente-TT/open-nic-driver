@@ -21,6 +21,7 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
+#include <linux/sockios.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <linux/bpf_trace.h>
@@ -38,6 +39,7 @@
 #include "onic_register.h"
 #include "qdma_access/qdma_register.h"
 #include "onic.h"
+#include "onic_ptp.h"
 
 #define ONIC_RX_DESC_STEP 256
 
@@ -1147,6 +1149,8 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	pcpu_stats_pointer->tx_packets++;
 	pcpu_stats_pointer->tx_bytes += skb->len;
 
+	skb_tx_timestamp(skb);
+
 	onic_ring_increment_head(ring);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
@@ -1181,7 +1185,14 @@ int onic_set_mac_address(struct net_device *dev, void *addr)
 
 int onic_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
-	return 0;
+	switch (cmd) {
+	case SIOCSHWTSTAMP:
+		return onic_ptp_hwtstamp_set(dev, ifr);
+	case SIOCGHWTSTAMP:
+		return onic_ptp_hwtstamp_get(dev, ifr);
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 int onic_change_mtu(struct net_device *dev, int mtu)

@@ -23,6 +23,8 @@
 #include <net/xdp.h>
 #include <linux/bitops.h>
 #include <linux/workqueue.h>
+#include <linux/ptp_clock_kernel.h>
+#include <linux/net_tstamp.h>
 
 #include "onic_hardware.h"
 
@@ -219,6 +221,12 @@ struct onic_private {
 	 * instant double-fire if another glitch packet is in-flight), we wait
 	 * ERROR_REARM_DELAY_MS before writing ARM=1 so QDMA's pipeline drains. */
 	struct delayed_work error_rearm_work;
+
+	/* PTP hardware timestamping support */
+	struct ptp_clock *ptp_clock;
+	struct ptp_clock_info ptp_info;
+	struct hwtstamp_config tstamp_config;
+	spinlock_t ptp_lock;
 };
 
 #endif

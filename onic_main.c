@@ -24,6 +24,7 @@
 #include <linux/netdevice.h>
 #include <linux/moduleparam.h>
 #include <linux/bpf.h>
+#include <linux/dmi.h>
 
 #include <linux/delay.h>
 
@@ -33,6 +34,7 @@
 #include "onic_register.h"
 #include "onic_common.h"
 #include "onic_netdev.h"
+#include "onic_ptp.h"
 
 #undef CMS_SUPPORT    /* Need CMS IP in the design @320000 offset */
 
@@ -59,6 +61,12 @@ module_param(RS_FEC_ENABLED, int, 0644);
 int onic_debug_level = 0;
 module_param_named(debug_level, onic_debug_level, int, 0644);
 MODULE_PARM_DESC(debug_level, "Debug verbosity (0=off, 1=info, 2=init, 3=data-path)");
+
+static int host_id = -1;
+module_param(host_id, int, 0444);
+MODULE_PARM_DESC(host_id,
+	"Host identifier (0-255) for MAC uniqueness across identical hosts. "
+	"Default -1: auto-derive from DMI system UUID.");
 
 #ifdef CMS_SUPPORT
 extern int xocl_init_xmc(void);
@@ -132,12 +140,53 @@ static const unsigned char onic_default_dev_addr[] = {
 	0x00, 0x0A, 0x35, 0x00, 0x00, 0x00
 };
 
+/**
+ * onic_resolve_host_id - Determine a per-host byte for MAC address uniqueness
+ *
+ * When host_id is set explicitly (0-255), use that value directly.
+ * Otherwise, hash the DMI system UUID (unique per motherboard) into a single
+ * byte.  This ensures identical FPGAs on different hosts get different MACs
+ * without any manual configuration.
+ *
+ * MAC layout: 00:0A:35:<host_id>:<bus>:<func>
+ */
+static u8 onic_resolve_host_id(struct pci_dev *pdev)
+{
+	const char *uuid;
+	u8 hash = 0;
+	int i;
+
+	if (host_id >= 0 && host_id <= 255)
+		return (u8)host_id;
+
+	uuid = dmi_get_system_info(DMI_PRODUCT_UUID);
+	if (uuid && uuid[0]) {
+		for (i = 0; uuid[i]; i++)
+			hash = (hash * 31) + uuid[i];
+		/* Avoid 0 so explicit host_id=0 remains distinguishable */
+		if (hash == 0)
+			hash = 1;
+		dev_info(&pdev->dev,
+			 "auto host_id=%u from DMI UUID (override with modparam host_id=N)\n",
+			 hash);
+		return hash;
+	}
+
+	dev_warn(&pdev->dev,
+		 "host_id not set and no DMI UUID — MAC may collide on identical hosts\n");
+	return 0;
+}
+
 static const struct net_device_ops onic_netdev_ops = {
 	.ndo_open = onic_open_netdev,
 	.ndo_stop = onic_stop_netdev,
 	.ndo_start_xmit = onic_xmit_frame,
 	.ndo_set_mac_address = onic_set_mac_address,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+	.ndo_eth_ioctl = onic_do_ioctl,
+#else
 	.ndo_do_ioctl = onic_do_ioctl,
+#endif
 	.ndo_change_mtu = onic_change_mtu,
 	.ndo_get_stats64 = onic_get_stats64,
 	.ndo_bpf = onic_xdp,
@@ -223,8 +272,8 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	memset(&saddr, 0, sizeof(struct sockaddr));
 	memcpy(saddr.sa_data, onic_default_dev_addr, 6);
-	saddr.sa_data[3] = pdev->bus->number;
-	saddr.sa_data[4] = PCI_SLOT(pdev->devfn);
+	saddr.sa_data[3] = onic_resolve_host_id(pdev);
+	saddr.sa_data[4] = pdev->bus->number;
 	saddr.sa_data[5] = PCI_FUNC(pdev->devfn);
 	onic_set_mac_address(netdev, (void *)&saddr);
 
@@ -287,6 +336,10 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_drvdata(pdev, priv);
 	netif_carrier_off(netdev);
+
+	rv = onic_ptp_init(priv);
+	if (rv < 0)
+		dev_warn(&pdev->dev, "PTP init failed (err=%d), continuing without PTP\n", rv);
 
 #ifdef CMS_SUPPORT
         /* Support CMS sensors (lm-sensors), refer: pg348 */
@@ -372,7 +425,10 @@ static void onic_remove(struct pci_dev *pdev)
 	 * cancel and free_irq; IRQ threads cannot enqueue new work now. */
 	cancel_work_sync(&priv->link_recovery_work);
 
-	/* 5. Unregister the netdev (calls onic_stop_netdev via ndo_stop).
+	/* 5. Clean up PTP before unregistering netdev */
+	onic_ptp_cleanup(priv);
+
+	/* 6. Unregister the netdev (calls onic_stop_netdev via ndo_stop).
 	 * onic_stop_netdev skips the CMAC disable since we already did it. */
 	unregister_netdev(priv->netdev);
 
