@@ -27,6 +27,7 @@
 #include <linux/net_tstamp.h>
 
 #include "onic_hardware.h"
+#include "onic_ptp.h"
 
 /* Debug levels controlled by module param debug_level at insmod time.
  *   0 = silent  (no debug output)
@@ -227,6 +228,12 @@ struct onic_private {
 	struct ptp_clock_info ptp_info;
 	struct hwtstamp_config tstamp_config;
 	spinlock_t ptp_lock;
+
+	/* TX PTP timestamp tag management */
+	struct onic_ptp_tx_pending ptp_tx_pending[ONIC_PTP_TX_PENDING_MAX];
+	u16 ptp_next_tag;
+	spinlock_t ptp_tx_lock;
+	struct delayed_work ptp_tx_work;
 };
 
 #endif

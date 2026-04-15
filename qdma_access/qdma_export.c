@@ -60,17 +60,25 @@ void qdma_unpack_wb_stat(struct qdma_wb_stat *stat, u8 *data)
 
 void qdma_unpack_c2h_cmpl(struct qdma_c2h_cmpl *cmpl, u8 *data)
 {
-	u64 *dw;
+	u64 *dw0, *dw1;
 
 	if (!cmpl || !data)
 		return;
 
-	dw = (u64 *)data;
+	dw0 = (u64 *)data;
+	dw1 = (u64 *)data + 1;
 
-	cmpl->color = BITFIELD_GET(QDMA_C2H_CMPL_DW_COLOR_MASK, *dw);
-	cmpl->err = BITFIELD_GET(QDMA_C2H_CMPL_DW_ERR_MASK, *dw);
-	cmpl->pkt_len = BITFIELD_GET(QDMA_C2H_CMPL_DW_PKT_LEN_MASK, *dw);
-	cmpl->pkt_id = BITFIELD_GET(QDMA_C2H_CMPL_DW_PKT_ID_MASK, *dw);
+	cmpl->color = BITFIELD_GET(QDMA_C2H_CMPL_DW_COLOR_MASK, *dw0);
+	cmpl->err = BITFIELD_GET(QDMA_C2H_CMPL_DW_ERR_MASK, *dw0);
+	cmpl->pkt_len = BITFIELD_GET(QDMA_C2H_CMPL_DW_PKT_LEN_MASK, *dw0);
+	cmpl->pkt_id = BITFIELD_GET(QDMA_C2H_CMPL_DW_PKT_ID_MASK, *dw0);
+
+	/* DW0[15:0]: upper 16 bits of seconds from 80-bit CMAC timestamp */
+	cmpl->ts_sec_hi = (u16)BITFIELD_GET(QDMA_C2H_CMPL_DW0_TS_SEC_HI_MASK, *dw0);
+
+	/* DW1: raw 80-bit CMAC timestamp bits [63:0] */
+	cmpl->ts_raw_lo = BITFIELD_GET(QDMA_C2H_CMPL_DW1_TS_RAW_LO_MASK, *dw1);
+	cmpl->ts_raw_hi = BITFIELD_GET(QDMA_C2H_CMPL_DW1_TS_RAW_HI_MASK, *dw1);
 }
 
 void qdma_unpack_c2h_cmpl_stat(struct qdma_c2h_cmpl_stat *stat, u8 *data)

@@ -85,17 +85,32 @@ struct qdma_wb_stat {
 	u16 cidx;
 };
 
-#define QDMA_C2H_CMPL_SIZE                      8
+#define QDMA_C2H_CMPL_SIZE                      16
 #define QDMA_C2H_CMPL_DW_COLOR_MASK             GENMASK_ULL(1, 1)
 #define QDMA_C2H_CMPL_DW_ERR_MASK               GENMASK_ULL(2, 2)
 #define QDMA_C2H_CMPL_DW_PKT_LEN_MASK           GENMASK_ULL(47, 32)
 #define QDMA_C2H_CMPL_DW_PKT_ID_MASK            GENMASK_ULL(63, 48)
+
+/* DW0 bits [15:0] — seconds[47:32] from 80-bit IEEE 1588 timestamp.
+ * NOTE: QDMA IP overwrites bits 1-2 with color/err flags; irrelevant
+ * since sec[47:32] is 0 for all practical UNIX time values. */
+#define QDMA_C2H_CMPL_DW0_TS_SEC_HI_MASK        GENMASK_ULL(15, 0)
+
+/* DW1 (bits 127:64) — lower 64 bits of 80-bit IEEE 1588 timestamp
+ *   [31:0]  = ts[31:0]  = {2'b00, ns[29:0]}   (nanoseconds)
+ *   [63:32] = ts[63:32] = seconds[31:0]
+ */
+#define QDMA_C2H_CMPL_DW1_TS_RAW_LO_MASK        GENMASK_ULL(31, 0)
+#define QDMA_C2H_CMPL_DW1_TS_RAW_HI_MASK        GENMASK_ULL(63, 32)
 
 struct qdma_c2h_cmpl {
 	u8 color;
 	u8 err;
 	u16 pkt_len;
 	u16 pkt_id;
+	u32 ts_raw_lo;	/* ts[31:0]:  {2'b00, ns[29:0]} */
+	u32 ts_raw_hi;	/* ts[63:32]: seconds[31:0] */
+	u16 ts_sec_hi;	/* ts[79:64]: seconds[47:32] (bits 1-2 corrupted) */
 };
 
 #define QDMA_C2H_CMPL_STAT_SIZE                 8

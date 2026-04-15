@@ -62,13 +62,23 @@
 /* Expected minimum PTP block version */
 #define ONIC_PTP_MIN_VERSION		0x0001
 
-/* Default clock period for 250 MHz: 4 ns + 0 fractional ns */
+/* Default clock period for axis_aclk (250 MHz): 4 ns + 0 fns */
 #define ONIC_PTP_NOMINAL_PERIOD_NS	4
 #define ONIC_PTP_NOMINAL_PERIOD_FNS	0
 
 /* TX timestamp FIFO polling timeout in microseconds */
-#define ONIC_PTP_TX_TS_POLL_TIMEOUT_US	10000
+#define ONIC_PTP_TX_TS_POLL_TIMEOUT_US	10000000  /* 10s — temporarily extended for TX latency debug */
 #define ONIC_PTP_TX_TS_POLL_DELAY_US	10
+
+/* Maximum number of in-flight TX PTP timestamp requests */
+#define ONIC_PTP_TX_PENDING_MAX		64
+
+struct onic_ptp_tx_pending {
+	struct sk_buff *skb;	/* ref-held original skb awaiting TX timestamp */
+	ktime_t start;		/* when the tag was allocated (for timeout) */
+	u16 tag;		/* the 16-bit PTP tag sent to FPGA */
+	bool active;		/* slot in use */
+};
 
 struct onic_private;
 
@@ -104,5 +114,22 @@ int onic_ptp_hwtstamp_set(struct net_device *dev, struct ifreq *ifr);
  * Return 0 on success, negative on failure.
  */
 int onic_ptp_hwtstamp_get(struct net_device *dev, struct ifreq *ifr);
+
+/**
+ * onic_ptp_alloc_tx_tag - Allocate a PTP tag for a TX timestamp request
+ * @priv: pointer to driver private data
+ * @skb: the original skb being transmitted
+ * @tag_out: pointer to store the allocated 16-bit tag
+ *
+ * Return 0 on success, -EBUSY if no free slot, -ENOMEM if clone fails.
+ */
+int onic_ptp_alloc_tx_tag(struct onic_private *priv, struct sk_buff *skb,
+			   u16 *tag_out);
+
+/**
+ * onic_ptp_tx_ts_poll - Poll the TX timestamp FIFO and deliver timestamps
+ * @priv: pointer to driver private data
+ */
+void onic_ptp_tx_ts_poll(struct onic_private *priv);
 
 #endif
