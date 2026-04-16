@@ -283,6 +283,10 @@ int onic_ptp_alloc_tx_tag(struct onic_private *priv, struct sk_buff *skb,
 	*tag_out = priv->ptp_next_tag;
 
 	spin_unlock_irqrestore(&priv->ptp_tx_lock, flags);
+
+	/* Kick the poll workqueue to collect the timestamp when it arrives */
+	schedule_delayed_work(&priv->ptp_tx_work, msecs_to_jiffies(1));
+
 	return 0;
 }
 
@@ -318,9 +322,17 @@ void onic_ptp_tx_ts_poll(struct onic_private *priv)
 		sec_lo = ts_hi;               /* seconds[31:0] */
 		nsec = ts_lo & 0x3FFFFFFF;    /* {2'b00, ns[29:0]} -> ns[29:0] */
 
-		dev_dbg(&priv->pdev->dev,
-			"PTP TX TS HIT: func=%u port=%d tag=%u sec=%u nsec=%u raw=[0x%08x 0x%08x 0x%08x]\n",
-			func_id, port, tag, sec_lo, nsec, ts_lo, ts_hi, ts_tag_reg);
+		/* Diagnostic: compare TX TS to current PTP clock */
+		{
+			u32 now_s = onic_read_reg(hw, 0x18010);
+			u32 now_ns = onic_read_reg(hw, 0x18018) & 0x3FFFFFFF;
+			s64 tx_ns = (s64)sec_lo * 1000000000LL + nsec;
+			s64 now_total = (s64)now_s * 1000000000LL + now_ns;
+			dev_info(&priv->pdev->dev,
+				"PTP TX DIAG: tag=%u tx_sec=%u tx_ns=%u now_sec=%u now_ns=%u delta_ms=%lld\n",
+				tag, sec_lo, nsec, now_s, now_ns,
+				(now_total - tx_ns) / 1000000);
+		}
 
 		{
 			struct sk_buff *deliver_skb = NULL;
@@ -340,7 +352,7 @@ void onic_ptp_tx_ts_poll(struct onic_private *priv)
 				}
 			}
 			if (i == ONIC_PTP_TX_PENDING_MAX)
-				dev_info(&priv->pdev->dev,
+				dev_dbg(&priv->pdev->dev,
 					"PTP TX TS NO MATCH: tag=%u (no active pending entry)\n",
 					tag);
 			spin_unlock_irqrestore(&priv->ptp_tx_lock, flags);
@@ -348,10 +360,10 @@ void onic_ptp_tx_ts_poll(struct onic_private *priv)
 			/* Deliver outside the spinlock to avoid calling
 			 * skb_tstamp_tx / kfree_skb with IRQs disabled. */
 			if (deliver_skb) {
-				dev_info(&priv->pdev->dev,
-				       "PTP TX TS DELIVER: tag=%u hwtstamp=%lld sk=%px\n",
-				       tag, ktime_to_ns(hwts.hwtstamp),
-				       deliver_skb->sk);
+				dev_dbg(&priv->pdev->dev,
+					"PTP TX TS DELIVER: tag=%u hwtstamp=%lld sk=%px\n",
+					tag, ktime_to_ns(hwts.hwtstamp),
+					deliver_skb->sk);
 				skb_tstamp_tx(deliver_skb, &hwts);
 				kfree_skb(deliver_skb);
 			}
@@ -384,34 +396,7 @@ static void onic_ptp_tx_ts_work(struct work_struct *work)
 	unsigned long flags;
 	s64 elapsed_ns;
 	int i;
-	static unsigned long poll_count;
-	static ktime_t last_log_time;
 	bool have_pending = false;
-
-	poll_count++;
-
-	/* Log poll heartbeat every 2 seconds when entries are pending */
-	spin_lock_irqsave(&priv->ptp_tx_lock, flags);
-	for (i = 0; i < ONIC_PTP_TX_PENDING_MAX; i++) {
-		if (priv->ptp_tx_pending[i].active) {
-			have_pending = true;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&priv->ptp_tx_lock, flags);
-
-	if (have_pending && ktime_to_ms(ktime_sub(ktime_get(), last_log_time)) > 2000) {
-		u32 valid = onic_read_reg(&priv->hw,
-			ONIC_PTP_TX_TS_VALID(
-				PCI_FUNC(priv->pdev->devfn) < priv->hw.num_cmacs ?
-				PCI_FUNC(priv->pdev->devfn) : 0));
-		dev_info(&priv->pdev->dev,
-			 "PTP poll heartbeat: count=%lu valid=%u pending_tag=%u elapsed_ms=%lld\n",
-			 poll_count, valid, priv->ptp_tx_pending[i].tag,
-			 ktime_to_ms(ktime_sub(ktime_get(),
-					       priv->ptp_tx_pending[i].start)));
-		last_log_time = ktime_get();
-	}
 
 	onic_ptp_tx_ts_poll(priv);
 
@@ -420,6 +405,7 @@ static void onic_ptp_tx_ts_work(struct work_struct *work)
 	for (i = 0; i < ONIC_PTP_TX_PENDING_MAX; i++) {
 		if (!priv->ptp_tx_pending[i].active)
 			continue;
+		have_pending = true;
 		elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(),
 					 priv->ptp_tx_pending[i].start));
 		if (elapsed_ns > (s64)ONIC_PTP_TX_TS_POLL_TIMEOUT_US * 1000) {
@@ -430,8 +416,9 @@ static void onic_ptp_tx_ts_work(struct work_struct *work)
 	}
 	spin_unlock_irqrestore(&priv->ptp_tx_lock, flags);
 
-	/* Reschedule if TX timestamping is still enabled */
-	if (priv->tstamp_config.tx_type == HWTSTAMP_TX_ON)
+	/* Only reschedule if there are still pending timestamps to collect.
+	 * New TX timestamps kick the workqueue via onic_ptp_alloc_tx_tag(). */
+	if (have_pending)
 		schedule_delayed_work(&priv->ptp_tx_work, msecs_to_jiffies(1));
 }
 
@@ -604,7 +591,6 @@ int onic_ptp_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
 
 	priv->tstamp_config = config;
 
-	/* Start or stop the TX timestamp polling work */
 	if (config.tx_type == HWTSTAMP_TX_ON) {
 		struct onic_hardware *hw = &priv->hw;
 
@@ -615,8 +601,7 @@ int onic_ptp_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
 		onic_write_reg(hw, ONIC_PTP_PERIOD_FNS,
 			       ONIC_PTP_NOMINAL_PERIOD_FNS);
 		onic_write_reg(hw, ONIC_PTP_PERIOD_VALID, 1);
-
-		schedule_delayed_work(&priv->ptp_tx_work, 0);
+		/* Workqueue starts on demand from onic_ptp_alloc_tx_tag() */
 	} else {
 		cancel_delayed_work(&priv->ptp_tx_work);
 	}

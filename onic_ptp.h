@@ -67,7 +67,7 @@
 #define ONIC_PTP_NOMINAL_PERIOD_FNS	0
 
 /* TX timestamp FIFO polling timeout in microseconds */
-#define ONIC_PTP_TX_TS_POLL_TIMEOUT_US	10000000  /* 10s — temporarily extended for TX latency debug */
+#define ONIC_PTP_TX_TS_POLL_TIMEOUT_US	100000  /* 100ms */
 #define ONIC_PTP_TX_TS_POLL_DELAY_US	10
 
 /* Maximum number of in-flight TX PTP timestamp requests */

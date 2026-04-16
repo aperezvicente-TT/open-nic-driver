@@ -492,15 +492,24 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 					memset(shhwtstamps, 0, sizeof(*shhwtstamps));
 					shhwtstamps->hwtstamp = ktime_set((s64)sec, ns);
 
+					/* Diagnostic: compare RX ts to current PTP clock + gap from previous */
 					{
-						static unsigned long rx_ts_count;
-						if ((rx_ts_count++ % 100) == 0)
+						static unsigned long rx_diag_count;
+						static s64 prev_rx_ns;
+						s64 rx_ns = ktime_to_ns(shhwtstamps->hwtstamp);
+						if ((rx_diag_count++ % 10) == 0) {
+							struct onic_hardware *hw = &priv->hw;
+							u32 now_s = onic_read_reg(hw, 0x18010);
+							u32 now_ns = onic_read_reg(hw, 0x18018);
+							s64 now_total = (s64)now_s * 1000000000LL + (now_ns & 0x3FFFFFFF);
 							netdev_info(q->netdev,
-								"PTP RX TS #%lu: sec=%u ns=%u hwtstamp=%lld raw_hi=0x%08x raw_lo=0x%08x pktlen=%u\n",
-								rx_ts_count, sec, ns,
-								ktime_to_ns(shhwtstamps->hwtstamp),
-								cmpl.ts_raw_hi, cmpl.ts_raw_lo,
-								cmpl.pkt_len);
+								"PTP RX DIAG #%lu: rx_sec=%u rx_ns=%u delta_ms=%lld gap_ms=%lld raw_hi=0x%08x raw_lo=0x%08x\n",
+								rx_diag_count, sec, ns,
+								(now_total - rx_ns) / 1000000,
+								(rx_ns - prev_rx_ns) / 1000000,
+								cmpl.ts_raw_hi, cmpl.ts_raw_lo);
+						}
+						prev_rx_ns = rx_ns;
 					}
 				}
 
@@ -1188,10 +1197,10 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 			desc.metadata = ((u32)ptp_tag << 16) |
 					(skb->len & 0xFFFF);
 			ptp_tagged = true;
-			netdev_info(dev, "PTP TX tag=%u qid=%u len=%u ntu=%u ntc=%u metadata=0x%08x\n",
-				    ptp_tag, qid, skb->len,
-				    ring->next_to_use, ring->next_to_clean,
-				    desc.metadata);
+			netdev_dbg(dev, "PTP TX tag=%u qid=%u len=%u ntu=%u ntc=%u metadata=0x%08x\n",
+				   ptp_tag, qid, skb->len,
+				   ring->next_to_use, ring->next_to_clean,
+				   desc.metadata);
 		} else {
 			/* HW timestamp not possible — fall back to SW */
 			skb_tx_timestamp(skb);
@@ -1224,40 +1233,9 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 		wmb();
 		onic_set_tx_head(priv->hw.qdma, qid, ring->next_to_use);
 		if (ptp_tagged) {
-			struct qdma_wb_stat wb_diag;
-			u16 expected_cidx = ring->next_to_use;
-			struct onic_hardware *hw = &priv->hw;
-			u16 func_id = PCI_FUNC(priv->pdev->devfn);
-			int cmac_id = (func_id < hw->num_cmacs) ? func_id : 0;
-			u32 tx_stat, rx_stat, tx_pkts, tx_good, tx_err, tick;
-
-			netdev_info(dev, "PTP TX doorbell: qid=%u pidx=%u\n",
-				    qid, ring->next_to_use);
-			udelay(50);
-			qdma_unpack_wb_stat(&wb_diag, ring->wb);
-			netdev_info(dev, "PTP TX diag 50us: cidx=%u (expect %u) ntu=%u ntc=%u\n",
-				    wb_diag.cidx, expected_cidx,
-				    ring->next_to_use, ring->next_to_clean);
-
-			/* Latch CMAC stats (write 1 to TICK register) and read */
-			tick = onic_read_reg(hw, CMAC_OFFSET_TICK(cmac_id));
-			onic_write_reg(hw, CMAC_OFFSET_TICK(cmac_id), 1);
-			udelay(10);
-			tx_stat  = onic_read_reg(hw, CMAC_OFFSET_STAT_TX_STATUS(cmac_id));
-			rx_stat  = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
-			tx_pkts  = onic_read_reg(hw, CMAC_OFFSET_STAT_TX_TOTAL_PKTS(cmac_id));
-			tx_good  = onic_read_reg(hw, CMAC_OFFSET_STAT_TX_TOTAL_GOOD_PKTS(cmac_id));
-			tx_err   = onic_read_reg(hw, CMAC_OFFSET_STAT_TX_FRAME_ERROR(cmac_id));
-			netdev_info(dev,
-				"PTP CMAC diag: TX_STATUS=0x%x RX_STATUS=0x%x TX_PKTS=%u TX_GOOD=%u TX_ERR=%u\n",
-				tx_stat, rx_stat, tx_pkts, tx_good, tx_err);
-
-			/* Deliver the TX timestamp inline rather than waiting
-			 * for the workqueue — the FPGA FIFO should already
-			 * have the entry after the udelay + CMAC diag reads.
-			 * A brief additional delay ensures the FIFO is ready
-			 * even under worst-case FPGA pipeline latency. */
-			udelay(50);
+			/* Brief delay for FPGA TX TS FIFO to be ready,
+			 * then deliver the timestamp inline. */
+			udelay(5);
 			onic_ptp_tx_ts_poll(priv);
 		}
 	}
