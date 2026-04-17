@@ -30,7 +30,11 @@ static inline void onic_write_reg(struct onic_hardware *hw, u32 offset, u32 val)
 }
 
 #define SHELL_START					0x0
-#define SHELL_END					0x400000 /* include CMS register space, 0x320000 to 0x330000 */
+/* ERNIC v4.2 Task A layout: 16 MB BAR2, ERNIC0@0x800000, ERNIC1@0xA00000.
+ * Previous 4 MB window only covered CMS (0x320000-0x330000) + BOX0/BOX1.
+ * Bumped to 16 MB to include the dual 2 MB ERNIC AXI-Lite slave windows.
+ */
+#define SHELL_END					0x1000000
 #define SHELL_MAXLEN					(SHELL_END - SHELL_START)
 
 /***** system config registers *****/
