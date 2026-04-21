@@ -410,7 +410,9 @@ static int onic_acquire_msix_vectors(struct onic_private *priv)
 	/* For dual-CMAC master PF, reserve half for secondary (vec_base split).
 	 * If hardware advertises enough (2*q_per_cmac + non_q) each CMAC gets
 	 * q_per_cmac; if not (e.g. MSIX_CAP=32), they share equally. */
-	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags) && priv->hw.num_cmacs >= 2) {
+	/* Master PF always splits half for secondary (hw.num_cmacs not yet set
+	 * here — onic_init_hardware runs after onic_init_capacity). */
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
 		int avail = vectors - non_q_vectors;
 		priv->num_q_vectors = min_t(u16, avail / 2, (u16)q_per_cmac);
 	} else {
