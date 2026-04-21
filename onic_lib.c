@@ -407,8 +407,15 @@ static int onic_acquire_msix_vectors(struct onic_private *priv)
 		return vectors;
 	}
 
-	/* Primary gets at most q_per_cmac queue vectors */
-	priv->num_q_vectors = min_t(u16, vectors - non_q_vectors, (u16)q_per_cmac);
+	/* For dual-CMAC master PF, reserve half for secondary (vec_base split).
+	 * If hardware advertises enough (2*q_per_cmac + non_q) each CMAC gets
+	 * q_per_cmac; if not (e.g. MSIX_CAP=32), they share equally. */
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags) && priv->hw.num_cmacs >= 2) {
+		int avail = vectors - non_q_vectors;
+		priv->num_q_vectors = min_t(u16, avail / 2, (u16)q_per_cmac);
+	} else {
+		priv->num_q_vectors = min_t(u16, vectors - non_q_vectors, (u16)q_per_cmac);
+	}
 
 	dev_info(&priv->pdev->dev, "Allocated %d MSI-X vectors, %d queue vectors\n",
 		 vectors, priv->num_q_vectors);
