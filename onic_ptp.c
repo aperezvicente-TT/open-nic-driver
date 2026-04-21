@@ -301,8 +301,7 @@ int onic_ptp_alloc_tx_tag(struct onic_private *priv, struct sk_buff *skb,
 void onic_ptp_tx_ts_poll(struct onic_private *priv)
 {
 	struct onic_hardware *hw = &priv->hw;
-	u16 func_id = PCI_FUNC(priv->pdev->devfn);
-	int port = (func_id < hw->num_cmacs) ? func_id : 0;
+	int port = priv->cmac_id;
 	u32 valid, ts_lo, ts_hi, ts_tag_reg;
 	u16 tag;
 	u32 sec_lo, nsec;

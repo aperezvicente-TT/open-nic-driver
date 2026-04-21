@@ -255,14 +255,17 @@ int onic_init_hardware(struct onic_private *priv)
 	 * subsequent step fails and jumps to the clear_hardware error path. */
 	hw->qdma = (unsigned long)qdev;
 
-	func_id = PCI_FUNC(pdev->devfn);
+	func_id = priv->cmac_id;
 	qbase = func_id * ONIC_MAX_QUEUES;
 	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
 
-	/* initialize QDMA function map context */
+	/* initialize QDMA function map context.
+	 * Cover both CMAC queue ranges from a single PF by doubling qmax so that
+	 * queues [0, ONIC_MAX_QUEUES) serve CMAC0 and [ONIC_MAX_QUEUES, 2*ONIC_MAX_QUEUES)
+	 * serve CMAC1 via the shell's per-function QCONF registers. */
 	memset(&fmap_ctxt, 0, sizeof(struct qdma_fmap_ctxt));
 	fmap_ctxt.qbase = qbase;
-	fmap_ctxt.qmax = qmax;
+	fmap_ctxt.qmax = 2 * qmax;
 	rv = qdma_clear_fmap_ctxt(qdev);
 	if (rv < 0)
 		goto clear_hardware;
@@ -270,12 +273,12 @@ int onic_init_hardware(struct onic_private *priv)
 	if (rv < 0)
 		goto clear_hardware;
 
-	/* inform shell about the function map */
+	/* inform shell about the function map for CMAC0 (function 0) */
 	val = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, qbase) |
 	       FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, qmax));
 	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), val);
 
-	/* initialize indirection table */
+	/* initialize indirection table for function 0 */
 	for (i = 0; i < 128; ++i) {
 		u32 val = (i % qmax) & 0x0000FFFF;
 		u32 offset = QDMA_FUNC_OFFSET_INDIR_TABLE(func_id, i);
@@ -341,17 +344,12 @@ void onic_clear_hardware(struct onic_private *priv)
 	struct onic_hardware *hw = &priv->hw;
 	struct pci_dev *pdev = priv->pdev;
 	struct qdma_dev *qdev = (struct qdma_dev *)hw->qdma;
-	u16 func_id = PCI_FUNC(pdev->devfn);
+	u16 func_id = priv->cmac_id;
 	int rv;
 
 	/* Soft-reset the shared QDMA DMA engine to ensure a clean slate for
 	 * the subsequent fmap invalidation and for a following insmod.
-	 *
-	 * IMPORTANT: this register resets the QDMA subsystem for ALL PFs on
-	 * the same device.  PCI removes devices in reverse probe order, so the
-	 * slave PF (func 1) is torn down first while the master PF (func 0)
-	 * may still have active queues.  Only the master performs this reset —
-	 * it is always removed last, after all other PFs are gone. */
+	 * Only the master performs this reset — it runs last, after secondary. */
 	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
 		rv = onic_shell_qdma_reset(hw);
 		if (rv)
@@ -359,13 +357,17 @@ void onic_clear_hardware(struct onic_private *priv)
 				 "QDMA shell reset timed out, continuing teardown\n");
 	}
 
-	/* clear the function map in shell */
+	/* clear this function's queue config in shell */
 	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), 0);
 
-	qdma_invalidate_fmap_ctxt(qdev);
-	qdma_destroy_dev(qdev);
+	if (func_id == 0) {
+		/* Primary owns the QDMA fmap and the BAR2 mapping */
+		qdma_invalidate_fmap_ctxt(qdev);
+		pci_iounmap(pdev, hw->addr);
+	}
+	/* Secondary: skip fmap invalidate and BAR2 unmap — owned by primary */
 
-	pci_iounmap(pdev, hw->addr);
+	qdma_destroy_dev(qdev); /* each net_device has its own qdma_dev object */
 
 	memset(hw, 0, sizeof(struct onic_hardware));
 }

@@ -35,6 +35,8 @@
 #include "onic_common.h"
 #include "onic_netdev.h"
 #include "onic_ptp.h"
+#include "qdma_access/qdma_device.h"
+#include "qdma_access/qdma_context.h"
 
 #undef CMS_SUPPORT    /* Need CMS IP in the design @320000 offset */
 
@@ -289,6 +291,8 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 	priv->pdev = pdev;
 	priv->netdev = netdev;
+	priv->cmac_id = 0;  /* primary always owns CMAC0 */
+	priv->vec_base = 0; /* primary starts at MSI-X vector 0 */
 	spin_lock_init(&priv->tx_lock);
 	spin_lock_init(&priv->rx_lock);
 	onic_init_link_recovery(priv);
@@ -341,6 +345,129 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (rv < 0)
 		dev_warn(&pdev->dev, "PTP init failed (err=%d), continuing without PTP\n", rv);
 
+	/* For single-PF dual-CMAC builds, create a second net_device for CMAC1.
+	 * The secondary shares hardware (BAR2, QDMA IP) with the primary but gets
+	 * its own QDMA queue range [ONIC_MAX_QUEUES, 2*ONIC_MAX_QUEUES) and its own
+	 * MSI-X vectors (vec_base = num_q_vectors + 2, after primary user+error). */
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags) && priv->hw.num_cmacs >= 2) {
+		struct net_device *netdev2;
+		struct onic_private *priv2;
+		struct sockaddr saddr2;
+		char dev_name2[IFNAMSIZ];
+		struct qdma_dev *sq_dev;
+
+		netdev2 = alloc_etherdev_mq(sizeof(struct onic_private), ONIC_MAX_QUEUES);
+		if (!netdev2) {
+			dev_warn(&pdev->dev, "failed to alloc secondary netdev, CMAC1 unavailable\n");
+			goto probe_done;
+		}
+
+		SET_NETDEV_DEV(netdev2, &pdev->dev);
+		netdev2->netdev_ops = &onic_netdev_ops;
+		onic_set_ethtool_ops(netdev2);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
+		xdp_set_features_flag(netdev2, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT);
+#endif
+		snprintf(dev_name2, IFNAMSIZ, "onic%ds%df%dc1",
+			 pdev->bus->number, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+		strscpy(netdev2->name, dev_name2, sizeof(netdev2->name));
+
+		memset(&saddr2, 0, sizeof(struct sockaddr));
+		memcpy(saddr2.sa_data, onic_default_dev_addr, 6);
+		saddr2.sa_data[3] = onic_resolve_host_id(pdev);
+		saddr2.sa_data[4] = pdev->bus->number;
+		saddr2.sa_data[5] = PCI_FUNC(pdev->devfn) + 0x10; /* distinct CMAC1 MAC */
+		onic_set_mac_address(netdev2, (void *)&saddr2);
+
+		priv2 = netdev_priv(netdev2);
+		memset(priv2, 0, sizeof(struct onic_private));
+		priv2->pdev = pdev;
+		priv2->netdev = netdev2;
+		priv2->cmac_id = 1;
+		/* vec_base: skip primary's num_q_vectors queue vectors + user + error */
+		priv2->vec_base = priv->num_q_vectors + 2;
+		priv2->num_q_vectors = priv->num_q_vectors;
+		priv2->num_tx_queues = priv->num_tx_queues;
+		priv2->num_rx_queues = priv->num_rx_queues;
+		priv2->RS_FEC = RS_FEC_ENABLED;
+		priv2->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
+		spin_lock_init(&priv2->tx_lock);
+		spin_lock_init(&priv2->rx_lock);
+		spin_lock_init(&priv2->ptp_lock);
+		spin_lock_init(&priv2->ptp_tx_lock);
+		onic_init_link_recovery(priv2);
+		onic_init_error_rearm(priv2);
+
+		priv2->netdev_stats = alloc_percpu(struct rtnl_link_stats64);
+		if (!priv2->netdev_stats) {
+			dev_warn(&pdev->dev, "failed to alloc secondary netdev_stats\n");
+			free_netdev(netdev2);
+			goto probe_done;
+		}
+
+		/* Secondary shares BAR2 addr and inherits num_cmacs from primary */
+		priv2->hw = priv->hw;
+
+		/* Create a separate qdma_dev for secondary with q_base=ONIC_MAX_QUEUES
+		 * so that QDMA queue operations automatically target the correct range. */
+		sq_dev = qdma_create_dev(pdev, 0);
+		if (!sq_dev) {
+			dev_warn(&pdev->dev, "failed to create secondary qdma_dev\n");
+			free_percpu(priv2->netdev_stats);
+			free_netdev(netdev2);
+			goto probe_done;
+		}
+		sq_dev->q_base = ONIC_MAX_QUEUES;
+		sq_dev->num_queues = priv2->num_q_vectors;
+		priv2->hw.qdma = (unsigned long)sq_dev;
+
+		/* Write shell QCONF for function 1 (CMAC1) */
+		{
+			u32 qconf = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, ONIC_MAX_QUEUES) |
+				     FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, priv2->num_q_vectors));
+			onic_write_reg(&priv2->hw, QDMA_FUNC_OFFSET_QCONF(1), qconf);
+		}
+		/* Write RSS indirection table for function 1 */
+		{
+			int j;
+			for (j = 0; j < 128; ++j) {
+				u32 v = (ONIC_MAX_QUEUES + (j % priv2->num_q_vectors)) & 0xFFFF;
+				onic_write_reg(&priv2->hw, QDMA_FUNC_OFFSET_INDIR_TABLE(1, j), v);
+			}
+		}
+
+		rv = onic_init_interrupt(priv2);
+		if (rv < 0) {
+			dev_warn(&pdev->dev, "secondary onic_init_interrupt err=%d, CMAC1 unavailable\n", rv);
+			qdma_destroy_dev(sq_dev);
+			free_percpu(priv2->netdev_stats);
+			free_netdev(netdev2);
+			goto probe_done;
+		}
+
+		netif_set_real_num_tx_queues(netdev2, priv2->num_tx_queues);
+		netif_set_real_num_rx_queues(netdev2, priv2->num_rx_queues);
+		netdev2->min_mtu = ETH_MIN_MTU;
+		netdev2->max_mtu = 9600 - ETH_HLEN;
+		netdev2->features |= NETIF_F_HIGHDMA;
+		netdev2->hw_features |= NETIF_F_HIGHDMA;
+
+		rv = register_netdev(netdev2);
+		if (rv < 0) {
+			dev_warn(&pdev->dev, "register secondary netdev err=%d, CMAC1 unavailable\n", rv);
+			onic_clear_interrupt(priv2);
+			qdma_destroy_dev(sq_dev);
+			free_percpu(priv2->netdev_stats);
+			free_netdev(netdev2);
+			goto probe_done;
+		}
+
+		priv->peer = priv2;
+		netif_carrier_off(netdev2);
+		dev_info(&pdev->dev, "secondary net_device %s registered for CMAC1\n", netdev2->name);
+	}
+
+probe_done:
 #ifdef CMS_SUPPORT
         /* Support CMS sensors (lm-sensors), refer: pg348 */
         if(xmc_init == 0)
@@ -382,7 +509,31 @@ static void onic_remove(struct pci_dev *pdev)
 
 	dev_info(&pdev->dev, "removing device");
 
-	/* 1. STOP THE PACKET FLOW FIRST.
+	/* 0. Tear down secondary net_device (CMAC1) before touching primary.
+	 * Must happen before CMAC RX disable so the secondary's NAPI drains
+	 * while IRQs are still live (same reasoning as the primary below). */
+	if (priv->peer) {
+		struct onic_private *priv2 = priv->peer;
+		struct onic_hardware *hw2 = &priv2->hw;
+
+		onic_write_reg(hw2, CMAC_OFFSET_CONF_RX_1(1), 0x0);
+		udelay(10);
+		set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv2->flags);
+
+		cancel_work_sync(&priv2->link_recovery_work);
+		onic_clear_interrupt(priv2);
+		cancel_work_sync(&priv2->link_recovery_work);
+
+		onic_ptp_cleanup(priv2);
+		unregister_netdev(priv2->netdev);
+
+		onic_clear_hardware(priv2);
+		free_percpu(priv2->netdev_stats);
+		priv->peer = NULL;
+		free_netdev(priv2->netdev);
+	}
+
+	/* 1. STOP THE PACKET FLOW FIRST (primary / CMAC0).
 	 *
 	 * Disable CMAC RX before touching IRQs or NAPI.  With a 93 Gbps
 	 * stream active, QDMA continuously writes completions and the
@@ -401,15 +552,7 @@ static void onic_remove(struct pci_dev *pdev)
 	 * free_irq and napi_disable complete instantly. */
 	{
 		struct onic_hardware *hw = &priv->hw;
-		u16 func_id = PCI_FUNC(pdev->devfn);
-
-		if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
-			int i;
-			for (i = 0; i < hw->num_cmacs; i++)
-				onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(i), 0x0);
-		} else if (func_id < hw->num_cmacs) {
-			onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(func_id), 0x0);
-		}
+		onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(0), 0x0);
 		udelay(10);
 		set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
 	}

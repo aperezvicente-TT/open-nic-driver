@@ -88,20 +88,27 @@ static void onic_link_recovery_work(struct work_struct *work)
 		if (!(cmac_mask & BIT(i)))
 			continue;
 
-		/* CMAC i is served by PF i in the 2-CMAC, 2-PF shell build.
-		 * Find the corresponding PF by looking up func_id == i on the
-		 * same bus/slot as the master PF. */
-		pf_pdev = pci_get_domain_bus_and_slot(
-			pci_domain_nr(priv->pdev->bus),
-			priv->pdev->bus->number,
-			PCI_DEVFN(PCI_SLOT(priv->pdev->devfn), i));
-		if (!pf_pdev)
-			continue;
-
-		pf_priv = pci_get_drvdata(pf_pdev);
-		if (!pf_priv) {
-			pci_dev_put(pf_pdev);
-			continue;
+		if (i == 0) {
+			/* CMAC0 is always on the master PF (func 0) */
+			pf_pdev = pci_get_domain_bus_and_slot(
+				pci_domain_nr(priv->pdev->bus),
+				priv->pdev->bus->number,
+				PCI_DEVFN(PCI_SLOT(priv->pdev->devfn), 0));
+			if (!pf_pdev)
+				continue;
+			pf_priv = pci_get_drvdata(pf_pdev);
+			if (!pf_priv) {
+				pci_dev_put(pf_pdev);
+				continue;
+			}
+		} else {
+			/* Single-PF dual-CMAC: CMAC1 served by secondary net_device.
+			 * Use the peer pointer instead of a PCIe slot lookup. */
+			if (!priv->peer)
+				continue;
+			pf_priv = priv->peer;
+			pf_pdev = pf_priv->pdev;
+			pci_dev_get(pf_pdev);
 		}
 		netdev = pf_priv->netdev;
 
@@ -241,15 +248,12 @@ static void onic_link_watchdog_work_fn(struct work_struct *work)
 			     link_watchdog_work);
 	struct onic_hardware *hw = &priv->hw;
 	struct net_device *netdev = priv->netdev;
-	u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
+	u8 cmac_id = priv->cmac_id;
 	u32 rx_status;
 	bool link_up;
 
 	if (!netif_running(netdev))
 		return;
-
-	if (cmac_id >= hw->num_cmacs)
-		cmac_id = 0;
 
 	/* Double-read to flush any previously latched value */
 	onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
@@ -321,7 +325,7 @@ static void onic_clear_q_vector(struct onic_private *priv, u16 vid)
 
 	if (!vec)
 		return;
-	free_irq(pci_irq_vector(priv->pdev, vid), vec);
+	free_irq(pci_irq_vector(priv->pdev, priv->vec_base + vid), vec);
 	kfree(vec);
 }
 
@@ -348,7 +352,7 @@ static int onic_init_q_vector(struct onic_private *priv, u16 vid)
 	vec->vid = vid;
 
 	snprintf(name, ONIC_MAX_IRQ_NAME, "%s-%d", priv->netdev->name, vid);
-	rv = request_irq(pci_irq_vector(pdev, vid), onic_q_handler,
+	rv = request_irq(pci_irq_vector(pdev, priv->vec_base + vid), onic_q_handler,
 			 0, name, vec);
 	if (rv < 0) {
 		dev_err(&pdev->dev, "Failed to setup queue vector %s", name);
@@ -380,13 +384,19 @@ static int onic_init_q_vector(struct onic_private *priv, u16 vid)
  **/
 static int onic_acquire_msix_vectors(struct onic_private *priv)
 {
-	int vectors, non_q_vectors;
+	int vectors, non_q_vectors, q_per_cmac;
 
-	vectors = ONIC_MAX_QUEUES;
-	non_q_vectors = 1;
+	non_q_vectors = 1; /* user interrupt */
 	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags))
-		non_q_vectors++;
-	vectors += non_q_vectors;
+		non_q_vectors++; /* + error interrupt */
+
+	/* For master PF with dual-CMAC hardware, request 2x queue vectors so
+	 * the secondary net_device can use the upper half (vec_base offset). */
+	q_per_cmac = ONIC_MAX_QUEUES;
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags))
+		vectors = 2 * q_per_cmac + non_q_vectors;
+	else
+		vectors = q_per_cmac + non_q_vectors;
 
 	vectors = pci_alloc_irq_vectors(priv->pdev, non_q_vectors + 1, vectors,
 					PCI_IRQ_MSIX);
@@ -397,11 +407,11 @@ static int onic_acquire_msix_vectors(struct onic_private *priv)
 		return vectors;
 	}
 
-	vectors -= non_q_vectors;
-	priv->num_q_vectors = vectors;
+	/* Primary gets at most q_per_cmac queue vectors */
+	priv->num_q_vectors = min_t(u16, vectors - non_q_vectors, (u16)q_per_cmac);
 
-	dev_info(&priv->pdev->dev, "Allocated %d queue vectors\n",
-		 priv->num_q_vectors);
+	dev_info(&priv->pdev->dev, "Allocated %d MSI-X vectors, %d queue vectors\n",
+		 vectors, priv->num_q_vectors);
 	return 0;
 }
 
@@ -438,7 +448,8 @@ void onic_clear_capacity(struct onic_private *priv)
 	priv->num_tx_queues = 0;
 	priv->num_rx_queues = 0;
 	priv->num_q_vectors = 0;
-	pci_free_irq_vectors(priv->pdev);
+	if (priv->cmac_id == 0) /* secondary shares MSI-X with primary */
+		pci_free_irq_vectors(priv->pdev);
 }
 
 int onic_init_interrupt(struct onic_private *priv)
@@ -452,7 +463,12 @@ int onic_init_interrupt(struct onic_private *priv)
 			goto clear_interrupt;
 	}
 
-	rv = request_threaded_irq(pci_irq_vector(pdev, vid),
+	/* User and error interrupts belong to the primary (CMAC0) net_device only.
+	 * The secondary (CMAC1) shares the primary's link recovery IRQ path. */
+	if (priv->cmac_id != 0)
+		return 0;
+
+	rv = request_threaded_irq(pci_irq_vector(pdev, priv->vec_base + vid),
 				  onic_user_handler, onic_user_thread_fn,
 				  0, "onic-user", priv);
 	if (rv < 0) {
@@ -465,14 +481,14 @@ int onic_init_interrupt(struct onic_private *priv)
 		return 0;
 
 	vid++;
-	rv = request_threaded_irq(pci_irq_vector(pdev, vid),
+	rv = request_threaded_irq(pci_irq_vector(pdev, priv->vec_base + vid),
 				  onic_error_handler, onic_error_thread_fn,
 				  0, "onic-error", priv);
 	if (rv < 0) {
 		dev_err(&pdev->dev, "Failed to setup error interrupt");
 		goto clear_interrupt;
 	}
-	onic_qdma_init_error_interrupt(priv->hw.qdma, vid);
+	onic_qdma_init_error_interrupt(priv->hw.qdma, priv->vec_base + vid);
 	set_bit(ONIC_ERROR_INTR, priv->state);
 
 	return 0;
@@ -485,28 +501,23 @@ clear_interrupt:
 void onic_clear_interrupt(struct onic_private *priv)
 {
 	u8 master_pf = test_bit(ONIC_FLAG_MASTER_PF, priv->flags);
-	int vid = (master_pf) ?
-		priv->num_q_vectors + 1 :
-		priv->num_q_vectors;
+	int vid;
 
-	if (master_pf) {
-		if (test_bit(ONIC_ERROR_INTR, priv->state)) {
-			/* free_irq first: ensures the threaded error handler
-			 * cannot schedule new delayed work after we cancel.
-			 * Reversing the order (cancel then free_irq) leaves a
-			 * window where the handler fires between cancel and
-			 * free_irq, re-schedules work, and the work runs after
-			 * priv is freed. */
+	/* User and error interrupts belong to the primary (CMAC0) net_device. */
+	if (priv->cmac_id == 0) {
+		if (master_pf && test_bit(ONIC_ERROR_INTR, priv->state)) {
+			vid = priv->vec_base + priv->num_q_vectors + 1;
+			/* free_irq first: prevents new delayed work after cancel */
 			free_irq(pci_irq_vector(priv->pdev, vid), priv);
 			cancel_delayed_work_sync(&priv->error_rearm_work);
 			onic_qdma_clear_error_interrupt(priv->hw.qdma);
 		}
-		vid--;
+		if (test_bit(ONIC_USER_INTR, priv->state)) {
+			vid = priv->vec_base + priv->num_q_vectors;
+			free_irq(pci_irq_vector(priv->pdev, vid), priv);
+		}
 	}
 
-	if (test_bit(ONIC_USER_INTR, priv->state))
-		free_irq(pci_irq_vector(priv->pdev, vid), priv);
-
-	while (vid--)
+	for (vid = priv->num_q_vectors - 1; vid >= 0; vid--)
 		onic_clear_q_vector(priv, vid);
 }

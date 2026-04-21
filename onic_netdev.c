@@ -706,7 +706,7 @@ static int onic_init_tx_queue(struct onic_private *priv, u16 qid)
 	/* initialize QDMA H2C queue */
 	param.rngcnt_idx = rngcnt_idx;
 	param.dma_addr = ring->dma_addr;
-	param.vid = vid;
+	param.vid = priv->vec_base + vid;
 	rv = onic_qdma_init_tx_queue(priv->hw.qdma, qid, &param);
 	if (rv < 0)
 		goto clear_tx_queue;
@@ -949,7 +949,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	param.cmpl_desc_sz = 1; /* 1 = 16B completion descriptors (PTP timestamps) */
 	param.desc_dma_addr = q->desc_ring.dma_addr;
 	param.cmpl_dma_addr = q->cmpl_ring.dma_addr;
-	param.vid = vid;
+	param.vid = priv->vec_base + vid;
 	onic_netdev_dbg(ONIC_DBG_INIT, dev,
 			"RX queue %u: bufsz_idx %u desc_rng %u cmpl_rng %u vid %d",
 			qid, bufsz_idx, desc_rngcnt_idx, cmpl_rngcnt_idx, vid);
@@ -1019,11 +1019,8 @@ int onic_update_carrier(struct net_device *dev)
 {
 	struct onic_private *priv = netdev_priv(dev);
 	struct onic_hardware *hw = &priv->hw;
-	u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
+	u8 cmac_id = priv->cmac_id;
 	u32 rx_status;
-
-	if (cmac_id >= hw->num_cmacs)
-		cmac_id = 0;
 
 	/* double-read to flush any previously latched value */
 	onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_id));
@@ -1076,10 +1073,7 @@ int onic_open_netdev(struct net_device *dev)
 	 * link-recovery IRQ path will call netif_carrier_on once aligned. */
 	{
 		struct onic_hardware *hw = &priv->hw;
-		u8 cmac_id = (u8)PCI_FUNC(priv->pdev->devfn);
-
-		if (cmac_id >= hw->num_cmacs)
-			cmac_id = 0;
+		u8 cmac_id = priv->cmac_id;
 
 		onic_enable_cmac(hw, cmac_id, false);
 		priv->cmac_last_enable_jiffies[cmac_id] = jiffies;
@@ -1113,12 +1107,7 @@ int onic_stop_netdev(struct net_device *dev)
 	 * duplicate disable in that case.  For a normal "ip link set down"
 	 * (no rmmod), we still need to disable here. */
 	if (!test_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags)) {
-		/* Each PF owns its own CMAC: disable only this PF's CMAC RX.
-		 * Master PF (func_id=0) owns CMAC0; slave PF (func_id=1) owns
-		 * CMAC1.  Previously the master looped over all CMACs, which
-		 * would disable the slave's CMAC during a master MTU change. */
-		u16 func_id = PCI_FUNC(priv->pdev->devfn);
-		u8 cmac_id = (func_id < hw->num_cmacs) ? (u8)func_id : 0;
+		u8 cmac_id = priv->cmac_id;
 
 		onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(cmac_id), 0x0);
 

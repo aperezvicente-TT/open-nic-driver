@@ -413,7 +413,6 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
 {
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
-    struct pci_dev *pdev = priv->pdev;
     int i,j;
     u16 func_id;
     u32 off;
@@ -450,15 +449,13 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
         tx_errors += pcpu_ptr->tx_errors;
       }
     
-    func_id = PCI_FUNC(pdev->devfn);
+    func_id = priv->cmac_id;
 
     // Note :
     //   write 1 into REG_TICK (offset 0x2B0).
     //   this is WriteOnce/SelfClear (WO/SC).
     //   with this, the cmac system updates all STAT_* registers.
-    if (func_id == 0)
-         onic_write_reg(hw, CMAC_OFFSET_TICK(0), 1);
-    else onic_write_reg(hw, CMAC_OFFSET_TICK(1), 1);
+    onic_write_reg(hw, CMAC_OFFSET_TICK(func_id), 1);
 
     for (i = 0; i < ONIC_GLOBAL_STATS_LEN; i++) {
       if (onic_gstrings_stats[i].type == ONIC_STATS) {
@@ -538,7 +535,7 @@ static int onic_get_rxfh(struct net_device *dev, u32 *ring_index, u8 *key,
 {
 	struct onic_private *priv = netdev_priv(dev);
 	u32 n = onic_get_rxfh_indir_size(dev);
-      u16 func_id = PCI_FUNC(priv->pdev->devfn);
+      u16 func_id = priv->cmac_id;
 	u32 i;
 
      	if (ring_index) {
@@ -570,7 +567,7 @@ static int onic_set_rxfh(struct net_device *dev, const u32 *ring_index,
 	
 	struct onic_private *priv = netdev_priv(dev);
 	int n = onic_get_rxfh_indir_size(dev);
-  u16 func_id = PCI_FUNC(priv->pdev->devfn);
+  u16 func_id = priv->cmac_id;
 	int i=0;
       
 	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)

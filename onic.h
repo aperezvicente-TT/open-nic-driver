@@ -234,6 +234,11 @@ struct onic_private {
 	u16 ptp_next_tag;
 	spinlock_t ptp_tx_lock;
 	struct delayed_work ptp_tx_work;
+
+	/* Dual-CMAC single-PF support */
+	u8 cmac_id;		/* 0=CMAC0, 1=CMAC1 */
+	u16 vec_base;		/* MSI-X vector base (0 for primary, shifted for secondary) */
+	struct onic_private *peer; /* primary: points to secondary net_device priv; NULL on secondary */
 };
 
 #endif
