@@ -259,13 +259,13 @@ int onic_init_hardware(struct onic_private *priv)
 	qbase = func_id * ONIC_MAX_QUEUES;
 	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
 
-	/* initialize QDMA function map context.
-	 * Cover both CMAC queue ranges from a single PF by doubling qmax so that
-	 * queues [0, ONIC_MAX_QUEUES) serve CMAC0 and [ONIC_MAX_QUEUES, 2*ONIC_MAX_QUEUES)
-	 * serve CMAC1 via the shell's per-function QCONF registers. */
+	/* Fmap must cover primary queues [0, qmax) AND secondary queues
+	 * [ONIC_MAX_QUEUES, ONIC_MAX_QUEUES+qmax).  With qmax=15 and
+	 * ONIC_MAX_QUEUES=64 this gives 0..78.  Using 2*qmax (=30) was wrong:
+	 * it left secondary queues outside the fmap, causing CMPT_INV_Q_ERR. */
 	memset(&fmap_ctxt, 0, sizeof(struct qdma_fmap_ctxt));
 	fmap_ctxt.qbase = qbase;
-	fmap_ctxt.qmax = 2 * qmax;
+	fmap_ctxt.qmax = ONIC_MAX_QUEUES + qmax;
 	rv = qdma_clear_fmap_ctxt(qdev);
 	if (rv < 0)
 		goto clear_hardware;

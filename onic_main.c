@@ -421,6 +421,25 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		sq_dev->num_queues = priv2->num_q_vectors;
 		priv2->hw.qdma = (unsigned long)sq_dev;
 
+		/* Explicitly invalidate all queue contexts for secondary queues
+		 * (ONIC_MAX_QUEUES + 0 .. ONIC_MAX_QUEUES + num_q_vectors-1).
+		 * Without this, zero-initialized contexts cause DMAR faults when
+		 * the QDMA engine encounters these queues after the fmap is written
+		 * to cover the full secondary range. */
+		{
+			int q;
+			for (q = 0; q < priv2->num_q_vectors; q++) {
+				qdma_invalidate_sw_ctxt(sq_dev, q, QDMA_C2H);
+				qdma_invalidate_hw_ctxt(sq_dev, q, QDMA_C2H);
+				qdma_invalidate_cr_ctxt(sq_dev, q, QDMA_C2H);
+				qdma_invalidate_pfch_ctxt(sq_dev, q);
+				qdma_invalidate_cmpl_ctxt(sq_dev, q);
+				qdma_invalidate_sw_ctxt(sq_dev, q, QDMA_H2C);
+				qdma_invalidate_hw_ctxt(sq_dev, q, QDMA_H2C);
+				qdma_invalidate_cr_ctxt(sq_dev, q, QDMA_H2C);
+			}
+		}
+
 		/* Write shell QCONF for function 1 (CMAC1) */
 		{
 			u32 qconf = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, ONIC_MAX_QUEUES) |
@@ -524,7 +543,8 @@ static void onic_remove(struct pci_dev *pdev)
 		onic_clear_interrupt(priv2);
 		cancel_work_sync(&priv2->link_recovery_work);
 
-		onic_ptp_cleanup(priv2);
+		/* secondary never calls onic_ptp_init so ptp_tx_ts_work is
+		 * uninitialized — calling onic_ptp_cleanup would WARN */
 		unregister_netdev(priv2->netdev);
 
 		onic_clear_hardware(priv2);
