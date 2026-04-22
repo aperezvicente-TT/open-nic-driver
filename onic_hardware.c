@@ -294,7 +294,7 @@ int onic_init_hardware(struct onic_private *priv)
 		val = onic_read_reg(hw, CMAC_OFFSET_CORE_VERSION(i));
 		if (val != ONIC_CMAC_CORE_VERSION)
 			break;
-		if (master_pf)
+		if (master_pf && i == priv->cmac_id)
 			onic_enable_cmac(hw, i, true);
 	}
 	hw->num_cmacs = i;

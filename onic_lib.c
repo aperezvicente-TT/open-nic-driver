@@ -365,7 +365,7 @@ static int onic_init_q_vector(struct onic_private *priv, u16 vid)
 	/* vec->numa_node = node; */
 
 	dev_info(&pdev->dev, "Setup IRQ vector %d with name %s",
-		 pci_irq_vector(pdev, vid), name);
+		 pci_irq_vector(pdev, priv->vec_base + vid), name);
 	priv->q_vector[vid] = vec;
 
 	return 0;
