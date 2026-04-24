@@ -53,6 +53,12 @@ ifneq ($(wildcard $(OFA_DIR)/Module.symvers),)
   override LINUXINCLUDE := -I$(OFA_DIR)/include -I$(OFA_DIR)/include/uapi $(LINUXINCLUDE)
   export LINUXINCLUDE
   $(info Building against MLNX_OFED at $(OFA_DIR))
+
+  # OFED 2601+ extended reg_user_mr and create_cq op signatures.  Feature-
+  # detect so the driver compiles on older OFED too.
+  ifneq ($(shell grep -c 'struct ib_dmah \*dmah' $(OFA_DIR)/include/rdma/ib_verbs.h 2>/dev/null),0)
+    ccflags-y += -DOFED_HAVE_IB_DMAH
+  endif
 endif
 
 KDIR ?= /lib/modules/$(KERNEL_VERS)/build
