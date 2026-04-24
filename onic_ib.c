@@ -462,7 +462,10 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	scq->ddr_off = cq_off;
 	scq->bound   = true;
 
-	qp->state        = ERNIC_QP_INIT;
+	/* B6: leave state at RESET — ibverbs sends an explicit RESET→INIT
+	 * modify_qp right after create_qp and that call is what advances
+	 * us into INIT.  Matches IB spec expectations. */
+	qp->state        = ERNIC_QP_RESET;
 	qp->ibqp.qp_num  = qp_idx;
 	return 0;
 }
@@ -499,10 +502,255 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 
 /* ---- remaining stubs (B6/B7/B8 land these) ----------------------------- */
 
-static int onic_stub_modify_qp(struct ib_qp *qp, struct ib_qp_attr *a, int mask,
-			       struct ib_udata *u)               { STUB_BODY("modify_qp"); }
-static int onic_stub_query_qp(struct ib_qp *qp, struct ib_qp_attr *a, int mask,
-			      struct ib_qp_init_attr *ia)        { STUB_BODY("query_qp"); }
+/* ---- B6: modify_qp real implementation --------------------------------- */
+
+static bool gid_is_ipv4(const union ib_gid *g)
+{
+	static const u8 pfx[12] = { 0,0,0,0, 0,0,0,0, 0,0,0xFF,0xFF };
+	return memcmp(g->raw, pfx, 12) == 0;
+}
+
+static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
+					struct ib_qp_attr *attr, int mask)
+{
+	const int required = IB_QP_STATE | IB_QP_PKEY_INDEX |
+			     IB_QP_PORT  | IB_QP_ACCESS_FLAGS;
+
+	if ((mask & required) != required) {
+		pr_info_ratelimited("onic_ib: R->I missing mask have=0x%x need=0x%x\n",
+				    mask, required);
+		return -EINVAL;
+	}
+	if (attr->port_num != 1) {
+		pr_info_ratelimited("onic_ib: R->I port_num=%u, only 1 supported\n",
+				    attr->port_num);
+		return -EOPNOTSUPP;
+	}
+	if (attr->pkey_index != 0)
+		return -EINVAL;
+
+	qp->state = ERNIC_QP_INIT;
+	qp->port_num = attr->port_num;
+	pr_info("onic_ib: qp[%u] RESET -> INIT (port=%u pkey_idx=%u)\n",
+		qp->qp_num, attr->port_num, attr->pkey_index);
+	return 0;
+}
+
+static int onic_modify_qp_init_to_rtr(struct onic_qp *qp,
+				      struct ib_qp_attr *attr, int mask)
+{
+	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
+	void __iomem       *mmio = dev->priv->hw.addr;
+	const int required = IB_QP_STATE | IB_QP_AV | IB_QP_PATH_MTU |
+			     IB_QP_DEST_QPN | IB_QP_RQ_PSN;
+	u32 q       = RN_RDMA_QCSR_REG(qp->qp_num, 0x00);
+	u32 destqp, mac_lsb, mac_msb;
+	u32 ip1 = 0, ip2 = 0, ip3 = 0, ip4 = 0;
+	u32 timeoutconf, qpconfi;
+	const u8 *dmac;
+	const union ib_gid *dgid;
+	bool is_v4;
+	u8  to_val, rt_val, rnr_rt, rnr_to;
+
+	if ((mask & required) != required) {
+		pr_info_ratelimited("onic_ib: I->R missing mask have=0x%x need=0x%x\n",
+				    mask, required);
+		return -EINVAL;
+	}
+	if (!(rdma_ah_get_ah_flags(&attr->ah_attr) & IB_AH_GRH)) {
+		pr_info_ratelimited("onic_ib: I->R no GRH in ah_attr\n");
+		return -EINVAL;
+	}
+	dgid = &rdma_ah_read_grh(&attr->ah_attr)->dgid;
+	dmac = rdma_ah_retrieve_dmac(&attr->ah_attr);
+	if (!dmac) {
+		pr_info_ratelimited("onic_ib: I->R dmac missing\n");
+		return -EINVAL;
+	}
+	if (attr->path_mtu != IB_MTU_4096) {
+		pr_info_ratelimited("onic_ib: I->R path_mtu=%d unsupported\n",
+				    attr->path_mtu);
+		return -EOPNOTSUPP;
+	}
+
+	destqp  = attr->dest_qp_num & 0x00FFFFFFu;
+	mac_lsb = ((u32)dmac[0]) | ((u32)dmac[1] << 8) |
+		  ((u32)dmac[2] << 16) | ((u32)dmac[3] << 24);
+	mac_msb = ((u32)dmac[4]) | ((u32)dmac[5] << 8);
+
+	is_v4 = gid_is_ipv4(dgid);
+	if (is_v4) {
+		ip1 = ((u32)dgid->raw[12]) |
+		      ((u32)dgid->raw[13] <<  8) |
+		      ((u32)dgid->raw[14] << 16) |
+		      ((u32)dgid->raw[15] << 24);
+		ip2 = ip3 = ip4 = 0;
+	} else {
+		memcpy(&ip1, &dgid->raw[0],  4);
+		memcpy(&ip2, &dgid->raw[4],  4);
+		memcpy(&ip3, &dgid->raw[8],  4);
+		memcpy(&ip4, &dgid->raw[12], 4);
+	}
+
+	to_val = (mask & IB_QP_TIMEOUT)       ? (attr->timeout       & 0x1F) : 14;
+	rt_val = (mask & IB_QP_RETRY_CNT)     ? (attr->retry_cnt     & 0x07) : 7;
+	rnr_rt = (mask & IB_QP_RNR_RETRY)     ? (attr->rnr_retry     & 0x07) : 7;
+	rnr_to = (mask & IB_QP_MIN_RNR_TIMER) ? (attr->min_rnr_timer & 0x1F) : 12;
+	timeoutconf = ((u32)to_val  <<  0) | ((u32)rt_val  <<  8) |
+		      ((u32)rnr_rt  << 11) | ((u32)rnr_to  << 16);
+
+	iowrite32(destqp,      mmio + q + 0x48);
+	iowrite32(timeoutconf, mmio + q + 0x4C);
+	iowrite32(mac_lsb,     mmio + q + 0x50);
+	iowrite32(mac_msb,     mmio + q + 0x54);
+	iowrite32(ip1,         mmio + q + 0x60);
+	iowrite32(ip2,         mmio + q + 0x64);
+	iowrite32(ip3,         mmio + q + 0x68);
+	iowrite32(ip4,         mmio + q + 0x6C);
+
+	/* QPCONFi[7]: IP version.  RMW, don't touch QPEN (still 0 here). */
+	qpconfi = ioread32(mmio + q);
+	qpconfi &= ~(1u << 7);
+	if (is_v4)
+		qpconfi |= (1u << 7);
+	iowrite32(qpconfi, mmio + q);
+	(void)ioread32(mmio + q);
+
+	qp->dest_qp_num   = attr->dest_qp_num;
+	qp->rq_psn        = attr->rq_psn;
+	qp->timeout       = to_val;
+	qp->retry_cnt     = rt_val;
+	qp->rnr_retry     = rnr_rt;
+	qp->min_rnr_timer = rnr_to;
+	qp->path_mtu_ib   = attr->path_mtu;
+	memcpy(qp->dmac,  dmac, 6);
+	memcpy(&qp->dgid, dgid, sizeof(qp->dgid));
+
+	qp->state = ERNIC_QP_RTR;
+	pr_info("onic_ib: qp[%u] INIT -> RTR dest_qpn=%u dmac=%pM dgid=%pI6c rq_psn=%u\n",
+		qp->qp_num, qp->dest_qp_num, qp->dmac, qp->dgid.raw, qp->rq_psn);
+	return 0;
+}
+
+static int onic_modify_qp_rtr_to_rts(struct onic_qp *qp,
+				     struct ib_qp_attr *attr, int mask)
+{
+	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
+	void __iomem       *mmio = dev->priv->hw.addr;
+	u32 q       = RN_RDMA_QCSR_REG(qp->qp_num, 0x00);
+	u32 qpen_ct, new_ct, qpconfi;
+	const int required = IB_QP_STATE | IB_QP_SQ_PSN;
+
+	if ((mask & required) != required) {
+		pr_info_ratelimited("onic_ib: R->S missing mask have=0x%x need=0x%x\n",
+				    mask, required);
+		return -EINVAL;
+	}
+
+	iowrite32(attr->sq_psn & 0x00FFFFFFu, mmio + q + 0x40);
+	qp->sq_psn = attr->sq_psn;
+
+	/* XRNIC_CONF_QP_EN is global GCSR.  VERIFY: count vs mask — using
+	 * COUNT semantics (F7 §5.4, F1 audit §6.2). */
+	qpen_ct = ioread32(mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
+				   RN_RDMA_BASE_ADDRESS)) & 0xFFFu;
+	new_ct  = qp->qp_num + 1;
+	if (new_ct > qpen_ct) {
+		iowrite32(new_ct, mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
+					  RN_RDMA_BASE_ADDRESS));
+		(void)ioread32(mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
+				       RN_RDMA_BASE_ADDRESS));
+	}
+
+	/* Set QPEN=1 without trashing other bits. */
+	qpconfi  = ioread32(mmio + q);
+	qpconfi |= 0x1u;
+	iowrite32(qpconfi, mmio + q);
+	(void)ioread32(mmio + q);
+
+	qp->state = ERNIC_QP_RTS;
+	pr_info("onic_ib: qp[%u] RTR -> RTS sq_psn=%u qp_en_ct %u -> %u\n",
+		qp->qp_num, qp->sq_psn, qpen_ct, max(qpen_ct, new_ct));
+	return 0;
+}
+
+static int onic_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+			  int attr_mask, struct ib_udata *udata)
+{
+	struct onic_qp *qp = to_onic_qp(ibqp);
+	enum ib_qp_state new_ib_state;
+	enum ernic_qp_state cur;
+	int rv = 0;
+	(void)udata;
+
+	if (!(attr_mask & IB_QP_STATE)) {
+		pr_info_ratelimited("onic_ib: modify_qp w/o IB_QP_STATE, mask=0x%x\n",
+				    attr_mask);
+		return -EINVAL;
+	}
+	new_ib_state = attr->qp_state;
+
+	spin_lock(&qp->state_lock);
+	cur = qp->state;
+
+	if (cur == ERNIC_QP_RESET && new_ib_state == IB_QPS_INIT)
+		rv = onic_modify_qp_reset_to_init(qp, attr, attr_mask);
+	else if (cur == ERNIC_QP_INIT && new_ib_state == IB_QPS_RTR)
+		rv = onic_modify_qp_init_to_rtr(qp, attr, attr_mask);
+	else if (cur == ERNIC_QP_RTR  && new_ib_state == IB_QPS_RTS)
+		rv = onic_modify_qp_rtr_to_rts(qp, attr, attr_mask);
+	else {
+		pr_info_ratelimited("onic_ib: modify_qp unsupported %d -> %d\n",
+				    (int)cur, (int)new_ib_state);
+		rv = -EOPNOTSUPP;
+	}
+
+	spin_unlock(&qp->state_lock);
+	return rv;
+}
+
+static int onic_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+			 int attr_mask, struct ib_qp_init_attr *init_attr)
+{
+	struct onic_qp *qp = to_onic_qp(ibqp);
+	(void)attr_mask;
+
+	memset(attr, 0, sizeof(*attr));
+	spin_lock(&qp->state_lock);
+	switch (qp->state) {
+	case ERNIC_QP_RESET:           attr->qp_state = IB_QPS_RESET; break;
+	case ERNIC_QP_INIT:            attr->qp_state = IB_QPS_INIT;  break;
+	case ERNIC_QP_RTR:             attr->qp_state = IB_QPS_RTR;   break;
+	case ERNIC_QP_RTS:             attr->qp_state = IB_QPS_RTS;   break;
+	case ERNIC_QP_ERR:
+	case ERNIC_QP_UNDER_RECOVERY:  attr->qp_state = IB_QPS_ERR;   break;
+	case ERNIC_QP_CLOSED: default: attr->qp_state = IB_QPS_RESET; break;
+	}
+	attr->cur_qp_state   = attr->qp_state;
+	attr->path_mtu       = qp->path_mtu_ib ? qp->path_mtu_ib : IB_MTU_4096;
+	attr->dest_qp_num    = qp->dest_qp_num;
+	attr->rq_psn         = qp->rq_psn;
+	attr->sq_psn         = qp->sq_psn;
+	attr->timeout        = qp->timeout;
+	attr->retry_cnt      = qp->retry_cnt;
+	attr->rnr_retry      = qp->rnr_retry;
+	attr->min_rnr_timer  = qp->min_rnr_timer;
+	attr->port_num       = qp->port_num ? qp->port_num : 1;
+	attr->pkey_index     = 0;
+	spin_unlock(&qp->state_lock);
+
+	if (init_attr) {
+		memset(init_attr, 0, sizeof(*init_attr));
+		init_attr->qp_type           = IB_QPT_RC;
+		init_attr->send_cq           = qp->send_cq ? &qp->send_cq->ibcq : NULL;
+		init_attr->recv_cq           = qp->recv_cq ? &qp->recv_cq->ibcq : NULL;
+		init_attr->cap.max_send_wr   = qp->sq_depth;
+		init_attr->cap.max_recv_wr   = qp->rq_depth;
+		init_attr->cap.max_send_sge  = 1;
+		init_attr->cap.max_recv_sge  = 1;
+	}
+	return 0;
+}
 static int onic_stub_post_send(struct ib_qp *qp, const struct ib_send_wr *w,
 			       const struct ib_send_wr **bad)    { STUB_BODY("post_send"); }
 static int onic_stub_post_recv(struct ib_qp *qp, const struct ib_recv_wr *w,
@@ -549,8 +797,8 @@ static const struct ib_device_ops onic_ib_ops = {
 	.reg_user_mr                 = onic_reg_user_mr,
 	.dereg_mr                    = onic_dereg_mr,
 
-	.modify_qp                   = onic_stub_modify_qp,
-	.query_qp                    = onic_stub_query_qp,
+	.modify_qp                   = onic_modify_qp,
+	.query_qp                    = onic_query_qp,
 	.post_send                   = onic_stub_post_send,
 	.post_recv                   = onic_stub_post_recv,
 	.poll_cq                     = onic_stub_poll_cq,

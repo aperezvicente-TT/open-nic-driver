@@ -86,6 +86,20 @@ struct onic_qp {
 	u32                     sq_depth, rq_depth, cq_depth;
 	u8                      path_mtu;  /* QPCONFi[10:8] code */
 
+	/* B6: driver-stored attrs from modify_qp, used by query_qp and
+	 * future B9 recovery. */
+	u32                     dest_qp_num;
+	u32                     rq_psn;
+	u32                     sq_psn;
+	u8                      timeout;
+	u8                      retry_cnt;
+	u8                      rnr_retry;
+	u8                      min_rnr_timer;
+	u8                      path_mtu_ib;  /* IB_MTU_* enum */
+	u8                      port_num;
+	u8                      dmac[6];
+	union ib_gid            dgid;
+
 	spinlock_t              state_lock;
 };
 
