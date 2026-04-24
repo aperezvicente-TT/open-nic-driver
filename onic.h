@@ -28,6 +28,8 @@
 
 #include "onic_hardware.h"
 #include "onic_ptp.h"
+#include "onic_ernic_irq.h"
+#include "onic_ib.h"
 
 /* Debug levels controlled by module param debug_level at insmod time.
  *   0 = silent  (no debug output)
@@ -72,6 +74,12 @@ extern int onic_debug_level;
 	} while (0)
 
 #define ONIC_MAX_QUEUES			64
+
+/* Per-CMAC absolute queue-ID stride in the shell's QDMA queue namespace.
+ * Secondary netdev's qid_base MUST equal this value so packets tagged by the
+ * plugin (plugin/rdma_onic/rdma_onic_250mhz.sv PER_CMAC_QUEUES) land in the
+ * queues the driver has initialised.  Keep in lock-step with the shell. */
+#define ONIC_PER_CMAC_QUEUES		64
 
 /* state bits */
 #define ONIC_ERROR_INTR			0
@@ -238,7 +246,20 @@ struct onic_private {
 	/* Dual-CMAC single-PF support */
 	u8 cmac_id;		/* 0=CMAC0, 1=CMAC1 */
 	u16 vec_base;		/* MSI-X vector base (0 for primary, shifted for secondary) */
-	struct onic_private *peer; /* primary: points to secondary net_device priv; NULL on secondary */
+	u16 qid_base;		/* QDMA queue offset (0 for primary, shifted for secondary).
+				 * Absolute qid = priv->hw.qdma's q_base + relative qid.
+				 * The child qdma_dev encodes this; qid_base mirrors it
+				 * for callers that need the offset pre-qdev-creation. */
+	struct onic_private *peer; /* bidirectional link: primary<->secondary on single-PF */
+
+	/* ERNIC MSI-X dispatch (master PF only — zero-initialised on
+	 * secondary and on non-master PFs, teardown is a no-op there).
+	 * [0] = ERNIC0 (BAR2 + 0x800000), [1] = ERNIC1 (BAR2 + 0xA00000). */
+	struct onic_ernic_irq_ctx ernic_irq[2];
+	struct dentry            *dfs_root;   /* /sys/kernel/debug/onic/<netdev>/ */
+
+	/* B3: ib_device for RoCEv2 (master PF only — NULL elsewhere). */
+	struct onic_ib_dev       *ib_dev;
 };
 
 #endif

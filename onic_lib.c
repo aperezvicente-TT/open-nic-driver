@@ -387,8 +387,10 @@ static int onic_acquire_msix_vectors(struct onic_private *priv)
 	int vectors, non_q_vectors, q_per_cmac;
 
 	non_q_vectors = 1; /* user interrupt */
-	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags))
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
 		non_q_vectors++; /* + error interrupt */
+		non_q_vectors += 2; /* + ERNIC0 + ERNIC1 IRQs (F5) */
+	}
 
 	/* For master PF with dual-CMAC hardware, request 2x queue vectors so
 	 * the secondary net_device can use the upper half (vec_base offset). */
@@ -450,6 +452,14 @@ int onic_init_capacity(struct onic_private *priv)
 		return rv;
 	onic_set_num_queues(priv);
 	return 0;
+}
+
+void onic_init_capacity_slave(struct onic_private *slave,
+			      struct onic_private *primary)
+{
+	slave->num_q_vectors = primary->num_q_vectors;
+	slave->num_tx_queues = primary->num_tx_queues;
+	slave->num_rx_queues = primary->num_rx_queues;
 }
 
 void onic_clear_capacity(struct onic_private *priv)

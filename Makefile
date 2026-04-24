@@ -26,6 +26,35 @@ BASE_OBJS := $(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/*.c $(srcdir)/*/*
 onic-objs = $(BASE_OBJS)
 ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_access -I$(srcdir)/hwmon -I$(srcdir)
 
+# MLNX_OFED integration: if OFED is installed, build against its rdma/*
+# headers and link CRCs against OFED's per-kernel ib_core Module.symvers.
+# Without this, ib_register_device / ib_alloc_device etc. fail at insmod
+# with "disagrees about version of symbol".
+#
+# IMPORTANT: do NOT trust /usr/src/ofa_kernel/default — the alternatives
+# symlink may point to a stale kernel (observed pointing to 6.8.0-40-generic
+# even when the running kernel is -110), with mismatched CRCs.  Prefer the
+# per-kernel tree at /usr/src/ofa_kernel/x86_64/<kernel>/.
+OFA_DIR ?= /usr/src/ofa_kernel/x86_64/$(KERNEL_VERS)
+ifeq ($(wildcard $(OFA_DIR)/Module.symvers),)
+  # Fallback: alternatives path (may be stale — warn the user)
+  OFA_DIR := /usr/src/ofa_kernel/default
+  ifneq ($(wildcard $(OFA_DIR)/Module.symvers),)
+    $(warning Using $(OFA_DIR) fallback; verify CRCs match running ib_core!)
+  endif
+endif
+
+ifneq ($(wildcard $(OFA_DIR)/Module.symvers),)
+  KBUILD_EXTRA_SYMBOLS := $(OFA_DIR)/Module.symvers
+  export KBUILD_EXTRA_SYMBOLS
+  # Prepend OFED includes to LINUXINCLUDE so <rdma/ib_verbs.h> resolves
+  # to OFED's larger struct layout BEFORE the kernel's stock header.
+  # ccflags-y alone isn't enough — its -I comes AFTER kernel's LINUXINCLUDE.
+  override LINUXINCLUDE := -I$(OFA_DIR)/include -I$(OFA_DIR)/include/uapi $(LINUXINCLUDE)
+  export LINUXINCLUDE
+  $(info Building against MLNX_OFED at $(OFA_DIR))
+endif
+
 KDIR ?= /lib/modules/$(KERNEL_VERS)/build
 
 all:

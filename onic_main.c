@@ -205,23 +205,287 @@ static const struct net_device_ops onic_netdev_ops = {
 extern void onic_set_ethtool_ops(struct net_device *netdev);
 
 /**
- * onic_probe - Probe and initialize PCI device
- * @pdev: pointer to PCI device
- * @ent: pointer to PCI device ID entries
+ * onic_alloc_netdev - allocate and initialize a net_device + onic_private
+ * @pdev: owning PCI device (shared between primary/secondary on single-PF)
+ * @cmac_id: CMAC index this netdev represents (0 or 1)
  *
- * Return 0 on success, negative on failure
- **/
-static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ * Performs the pure net_device creation and priv zero-init common to both
+ * primary and secondary.  Does NOT touch MSI-X, hardware, or interrupts —
+ * the caller wires those up based on primary vs slave role.  Returns the
+ * priv pointer on success (stats percpu allocated), NULL on failure.
+ */
+static struct onic_private *onic_alloc_netdev(struct pci_dev *pdev, u8 cmac_id)
 {
 	struct net_device *netdev;
 	struct onic_private *priv;
 	struct sockaddr saddr;
 	char dev_name[IFNAMSIZ];
+
+	netdev = alloc_etherdev_mq(sizeof(struct onic_private), ONIC_MAX_QUEUES);
+	if (!netdev) {
+		dev_err(&pdev->dev, "alloc_etherdev_mq failed for cmac%d", cmac_id);
+		return NULL;
+	}
+
+	SET_NETDEV_DEV(netdev, &pdev->dev);
+	netdev->netdev_ops = &onic_netdev_ops;
+	onic_set_ethtool_ops(netdev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
+	xdp_set_features_flag(netdev, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT);
+#endif
+	snprintf(dev_name, IFNAMSIZ, "onic%ds%df%dc%d",
+		 pdev->bus->number,
+		 PCI_SLOT(pdev->devfn),
+		 PCI_FUNC(pdev->devfn),
+		 cmac_id);
+	strscpy(netdev->name, dev_name, sizeof(netdev->name));
+	netdev->dev_port = cmac_id;
+
+	memset(&saddr, 0, sizeof(struct sockaddr));
+	memcpy(saddr.sa_data, onic_default_dev_addr, 6);
+	saddr.sa_data[3] = onic_resolve_host_id(pdev);
+	saddr.sa_data[4] = pdev->bus->number;
+	/* MAC last byte: PCI_FUNC in upper nibble, cmac_id in lower — keeps
+	 * primary's MAC identical to pre-dual-netdev behavior on single-PF
+	 * shells (PCI_FUNC=0, cmac_id=0) and gives CMAC1 a distinct address. */
+	saddr.sa_data[5] = (PCI_FUNC(pdev->devfn) << 4) | cmac_id;
+	onic_set_mac_address(netdev, (void *)&saddr);
+
+	priv = netdev_priv(netdev);
+	memset(priv, 0, sizeof(struct onic_private));
+	priv->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
+	priv->RS_FEC = RS_FEC_ENABLED;
+	priv->pdev = pdev;
+	priv->netdev = netdev;
+	priv->cmac_id = cmac_id;
+	spin_lock_init(&priv->tx_lock);
+	spin_lock_init(&priv->rx_lock);
+	onic_init_link_recovery(priv);
+	onic_init_error_rearm(priv);
+
+	priv->netdev_stats = alloc_percpu(struct rtnl_link_stats64);
+	if (!priv->netdev_stats) {
+		dev_err(&pdev->dev, "alloc_percpu netdev_stats failed");
+		free_netdev(netdev);
+		return NULL;
+	}
+
+	return priv;
+}
+
+static void onic_apply_netdev_features(struct net_device *netdev)
+{
+	netdev->min_mtu = ETH_MIN_MTU;        /* 68 bytes */
+	netdev->max_mtu = 9600 - ETH_HLEN;    /* jumbo, max_pkt_len=9600 from shell */
+	netdev->features |= NETIF_F_HIGHDMA;
+	netdev->hw_features |= NETIF_F_HIGHDMA;
+}
+
+/**
+ * onic_setup_primary - bring up the CMAC0 netdev (master PF)
+ *
+ * Owns BAR2 iomap, QDMA device, MSI-X allocation, and user/error IRQs.
+ */
+static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
+{
+	struct onic_private *priv;
+	int rv;
+
+	priv = onic_alloc_netdev(pdev, 0);
+	if (!priv)
+		return -ENOMEM;
+
+	dev_info(&pdev->dev, "device is a master PF");
+	set_bit(ONIC_FLAG_MASTER_PF, priv->flags);
+	priv->vec_base = 0;
+	priv->qid_base = 0;
+
+	rv = onic_init_capacity(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_capacity (primary), err = %d", rv);
+		goto free_netdev;
+	}
+
+	rv = onic_init_hardware(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_hardware (primary), err = %d", rv);
+		goto clear_capacity;
+	}
+
+	rv = onic_init_interrupt(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_interrupt (primary), err = %d", rv);
+		goto clear_hardware;
+	}
+
+	rv = onic_ernic_irq_setup(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_ernic_irq_setup, err = %d", rv);
+		goto clear_interrupt;
+	}
+
+	netif_set_real_num_tx_queues(priv->netdev, priv->num_tx_queues);
+	netif_set_real_num_rx_queues(priv->netdev, priv->num_rx_queues);
+	onic_apply_netdev_features(priv->netdev);
+
+	rv = register_netdev(priv->netdev);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "register_netdev (primary), err = %d", rv);
+		goto clear_interrupt;
+	}
+
+	rv = onic_ib_register(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_ib_register, err = %d", rv);
+		unregister_netdev(priv->netdev);
+		goto clear_interrupt;
+	}
+
+	netif_carrier_off(priv->netdev);
+	*out = priv;
+	return 0;
+
+clear_interrupt:
+	onic_clear_interrupt(priv);
+clear_hardware:
+	onic_clear_hardware(priv);
+clear_capacity:
+	onic_clear_capacity(priv);
+free_netdev:
+	free_netdev(priv->netdev);
+	return rv;
+}
+
+/**
+ * onic_setup_secondary - bring up the CMAC1 netdev on the same PF
+ *
+ * Shares the primary's BAR2 iomap, QDMA device (via a child with q_base),
+ * and upper-half of the primary's MSI-X pool (via vec_base).  Does not take
+ * user/error IRQs — those belong to the primary only.
+ */
+static int onic_setup_secondary(struct onic_private *primary,
+				struct onic_private **out)
+{
+	struct pci_dev *pdev = primary->pdev;
+	struct onic_private *priv;
+	int rv;
+
+	priv = onic_alloc_netdev(pdev, 1);
+	if (!priv)
+		return -ENOMEM;
+
+	/* Primary reserves the MSI-X slots just past its own queue vectors
+	 * for user IRQ (always) and error IRQ (MASTER_PF only).  Secondary's
+	 * queues must start after those — onic_init_q_vector builds its IRQ
+	 * number as pci_irq_vector(pdev, vec_base + relative_vid). */
+	{
+		u16 non_q = 1; /* user IRQ */
+		if (test_bit(ONIC_FLAG_MASTER_PF, primary->flags)) {
+			non_q++;     /* + error IRQ */
+			non_q += 2;  /* + ERNIC0 + ERNIC1 IRQs (F5) */
+		}
+		priv->vec_base = primary->num_q_vectors + non_q;
+	}
+	/* qid_base is dictated by the shell plugin's PER_CMAC_QUEUES constant —
+	 * NOT by primary->num_tx_queues.  Primary uses queues [0, N) within the
+	 * CMAC0 range; secondary must sit at the CMAC1 range start. */
+	priv->qid_base = ONIC_PER_CMAC_QUEUES;
+	priv->peer = primary;
+	primary->peer = priv;
+
+	onic_init_capacity_slave(priv, primary);
+
+	rv = onic_init_hardware(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_hardware (secondary), err = %d", rv);
+		goto free_netdev;
+	}
+
+	rv = onic_init_interrupt(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_interrupt (secondary), err = %d", rv);
+		goto clear_hardware;
+	}
+
+	netif_set_real_num_tx_queues(priv->netdev, priv->num_tx_queues);
+	netif_set_real_num_rx_queues(priv->netdev, priv->num_rx_queues);
+	onic_apply_netdev_features(priv->netdev);
+
+	rv = register_netdev(priv->netdev);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "register_netdev (secondary), err = %d", rv);
+		goto clear_interrupt;
+	}
+
+	netif_carrier_off(priv->netdev);
+	*out = priv;
+	return 0;
+
+clear_interrupt:
+	onic_clear_interrupt(priv);
+clear_hardware:
+	onic_clear_hardware(priv);
+	onic_clear_capacity(priv);
+free_netdev:
+	primary->peer = NULL;
+	free_netdev(priv->netdev);
+	return rv;
+}
+
+/**
+ * onic_teardown_netdev - reverse the setup of one netdev
+ *
+ * Matches the teardown sequence previously inline in onic_remove: disable
+ * CMAC RX first to drain NAPI, drain the recovery workqueue, free IRQs,
+ * then unregister + clear_hardware + clear_capacity + free.  Safe to call
+ * on either primary or secondary; onic_clear_hardware branches on
+ * MASTER_PF to decide whether to do the full QDMA teardown (primary) or
+ * just destroy the child qdma_dev wrapper (secondary).
+ */
+static void onic_teardown_netdev(struct onic_private *priv)
+{
+	struct onic_hardware *hw = &priv->hw;
+	u8 cmac_id = priv->cmac_id;
+
+	/* STOP PACKET FLOW FIRST — see long comment in onic_remove below.
+	 * Disabling CMAC RX drains the NAPI loop before we touch IRQs. */
+	onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(cmac_id), 0x0);
+	udelay(10);
+	set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
+
+	cancel_work_sync(&priv->link_recovery_work);
+	onic_ib_unregister(priv);
+	onic_ernic_irq_teardown(priv);
+	onic_clear_interrupt(priv);
+	cancel_work_sync(&priv->link_recovery_work);
+
+	onic_ptp_cleanup(priv);
+	unregister_netdev(priv->netdev);
+
+	onic_clear_hardware(priv);
+	onic_clear_capacity(priv);
+
+	free_netdev(priv->netdev);
+}
+
+/**
+ * onic_probe - Probe and initialize PCI device
+ * @pdev: pointer to PCI device
+ * @ent: pointer to PCI device ID entries
+ *
+ * On single-PF dual-CMAC shells, allocates two netdevs from a single probe:
+ * the primary (CMAC0) owns MSI-X/QDMA, the secondary (CMAC1) shares them.
+ *
+ * Return 0 on success, negative on failure
+ **/
+static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+	struct onic_private *primary = NULL;
+	struct onic_private *secondary = NULL;
 	int rv;
 #ifdef CMS_SUPPORT
         static int xmc_init=0;
 #endif
-	/* int pci_using_dac; */
 
 	rv = pci_enable_device_mem(pdev);
 	if (rv < 0) {
@@ -244,254 +508,49 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto disable_device;
 	}
 
-	/* enable relaxed ordering */
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
-	/* enable extended tag */
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_EXT_TAG);
 	pci_set_master(pdev);
 	pci_save_state(pdev);
 	pcie_set_readrq(pdev, 512);
 
-	netdev = alloc_etherdev_mq(sizeof(struct onic_private),
-				   ONIC_MAX_QUEUES);
-	if (!netdev) {
-		dev_err(&pdev->dev, "alloc_etherdev_mq failed");
-		rv = -ENOMEM;
-		goto release_pci_mem;
-	}
-
-	SET_NETDEV_DEV(netdev, &pdev->dev);
-	netdev->netdev_ops = &onic_netdev_ops;
-	onic_set_ethtool_ops(netdev);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
-	xdp_set_features_flag(netdev, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT);
-#endif
-	snprintf(dev_name, IFNAMSIZ, "onic%ds%df%d",
-		 pdev->bus->number,
-		 PCI_SLOT(pdev->devfn),
-		 PCI_FUNC(pdev->devfn));
-	strscpy(netdev->name, dev_name, sizeof(netdev->name));
-
-	memset(&saddr, 0, sizeof(struct sockaddr));
-	memcpy(saddr.sa_data, onic_default_dev_addr, 6);
-	saddr.sa_data[3] = onic_resolve_host_id(pdev);
-	saddr.sa_data[4] = pdev->bus->number;
-	saddr.sa_data[5] = PCI_FUNC(pdev->devfn);
-	onic_set_mac_address(netdev, (void *)&saddr);
-
-	priv = netdev_priv(netdev);
-
-	memset(priv, 0, sizeof(struct onic_private));
-	priv->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
-	priv->RS_FEC = RS_FEC_ENABLED;
-
-	if (PCI_FUNC(pdev->devfn) == 0) {
-		dev_info(&pdev->dev, "device is a master PF");
-		set_bit(ONIC_FLAG_MASTER_PF, priv->flags);
-	}
-	priv->pdev = pdev;
-	priv->netdev = netdev;
-	priv->cmac_id = 0;  /* primary always owns CMAC0 */
-	priv->vec_base = 0; /* primary starts at MSI-X vector 0 */
-	spin_lock_init(&priv->tx_lock);
-	spin_lock_init(&priv->rx_lock);
-	onic_init_link_recovery(priv);
-	onic_init_error_rearm(priv);
-
-	priv->netdev_stats = alloc_percpu(struct rtnl_link_stats64);
-	if (!priv->netdev_stats) {
-		dev_err(&pdev->dev, "error in allocating netdev_stats");
-		goto free_netdev;
-	}
-
-	rv = onic_init_capacity(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_init_capacity, err = %d", rv);
-		goto free_netdev;
-	}
-
-	rv = onic_init_hardware(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_init_hardware, err = %d", rv);
-		goto clear_capacity;
-	}
-
-	rv = onic_init_interrupt(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_init_interrupt, err = %d", rv);
-		goto clear_hardware;
-	}
-
-	netif_set_real_num_tx_queues(netdev, priv->num_tx_queues);
-	netif_set_real_num_rx_queues(netdev, priv->num_rx_queues);
-
-	/* Enable jumbo frame support - max_pkt_len from FPGA design is 9600 */
-	netdev->min_mtu = ETH_MIN_MTU;        /* 68 bytes */
-	netdev->max_mtu = 9600 - ETH_HLEN;    /* 9600 - 14 = 9586 */
-
-	netdev->features |= NETIF_F_HIGHDMA;
-	netdev->hw_features |= NETIF_F_HIGHDMA;
-
-	rv = register_netdev(netdev);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "register_netdev, err = %d", rv);
-		goto clear_interrupt;
-	}
-
-	pci_set_drvdata(pdev, priv);
-	netif_carrier_off(netdev);
-
-	rv = onic_ptp_init(priv);
+	rv = onic_setup_primary(pdev, &primary);
 	if (rv < 0)
-		dev_warn(&pdev->dev, "PTP init failed (err=%d), continuing without PTP\n", rv);
+		goto release_pci_mem;
 
-	/* For single-PF dual-CMAC builds, create a second net_device for CMAC1.
-	 * The secondary shares hardware (BAR2, QDMA IP) with the primary but gets
-	 * its own QDMA queue range [ONIC_MAX_QUEUES, 2*ONIC_MAX_QUEUES) and its own
-	 * MSI-X vectors (vec_base = num_q_vectors + 2, after primary user+error). */
-	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags) && priv->hw.num_cmacs >= 2) {
-		struct net_device *netdev2;
-		struct onic_private *priv2;
-		struct sockaddr saddr2;
-		char dev_name2[IFNAMSIZ];
-		struct qdma_dev *sq_dev;
+	pci_set_drvdata(pdev, primary);
 
-		netdev2 = alloc_etherdev_mq(sizeof(struct onic_private), ONIC_MAX_QUEUES);
-		if (!netdev2) {
-			dev_warn(&pdev->dev, "failed to alloc secondary netdev, CMAC1 unavailable\n");
-			goto probe_done;
-		}
-
-		SET_NETDEV_DEV(netdev2, &pdev->dev);
-		netdev2->netdev_ops = &onic_netdev_ops;
-		onic_set_ethtool_ops(netdev2);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
-		xdp_set_features_flag(netdev2, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT);
-#endif
-		snprintf(dev_name2, IFNAMSIZ, "onic%ds%df%dc1",
-			 pdev->bus->number, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
-		strscpy(netdev2->name, dev_name2, sizeof(netdev2->name));
-
-		memset(&saddr2, 0, sizeof(struct sockaddr));
-		memcpy(saddr2.sa_data, onic_default_dev_addr, 6);
-		saddr2.sa_data[3] = onic_resolve_host_id(pdev);
-		saddr2.sa_data[4] = pdev->bus->number;
-		saddr2.sa_data[5] = PCI_FUNC(pdev->devfn) + 0x10; /* distinct CMAC1 MAC */
-		onic_set_mac_address(netdev2, (void *)&saddr2);
-
-		priv2 = netdev_priv(netdev2);
-		memset(priv2, 0, sizeof(struct onic_private));
-		priv2->pdev = pdev;
-		priv2->netdev = netdev2;
-		priv2->cmac_id = 1;
-		/* vec_base: skip primary's num_q_vectors queue vectors + user + error */
-		priv2->vec_base = priv->num_q_vectors + 2;
-		priv2->num_q_vectors = priv->num_q_vectors;
-		priv2->num_tx_queues = priv->num_tx_queues;
-		priv2->num_rx_queues = priv->num_rx_queues;
-		priv2->RS_FEC = RS_FEC_ENABLED;
-		priv2->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
-		spin_lock_init(&priv2->tx_lock);
-		spin_lock_init(&priv2->rx_lock);
-		spin_lock_init(&priv2->ptp_lock);
-		spin_lock_init(&priv2->ptp_tx_lock);
-		onic_init_link_recovery(priv2);
-		onic_init_error_rearm(priv2);
-
-		priv2->netdev_stats = alloc_percpu(struct rtnl_link_stats64);
-		if (!priv2->netdev_stats) {
-			dev_warn(&pdev->dev, "failed to alloc secondary netdev_stats\n");
-			free_netdev(netdev2);
-			goto probe_done;
-		}
-
-		/* Secondary shares BAR2 addr and inherits num_cmacs from primary */
-		priv2->hw = priv->hw;
-
-		/* Create a separate qdma_dev for secondary with q_base=ONIC_MAX_QUEUES
-		 * so that QDMA queue operations automatically target the correct range. */
-		sq_dev = qdma_create_dev(pdev, 0);
-		if (!sq_dev) {
-			dev_warn(&pdev->dev, "failed to create secondary qdma_dev\n");
-			free_percpu(priv2->netdev_stats);
-			free_netdev(netdev2);
-			goto probe_done;
-		}
-		sq_dev->q_base = ONIC_MAX_QUEUES;
-		sq_dev->num_queues = priv2->num_q_vectors;
-		priv2->hw.qdma = (unsigned long)sq_dev;
-
-		/* Explicitly invalidate all queue contexts for secondary queues
-		 * (ONIC_MAX_QUEUES + 0 .. ONIC_MAX_QUEUES + num_q_vectors-1).
-		 * Without this, zero-initialized contexts cause DMAR faults when
-		 * the QDMA engine encounters these queues after the fmap is written
-		 * to cover the full secondary range. */
-		{
-			int q;
-			for (q = 0; q < priv2->num_q_vectors; q++) {
-				qdma_invalidate_sw_ctxt(sq_dev, q, QDMA_C2H);
-				qdma_invalidate_hw_ctxt(sq_dev, q, QDMA_C2H);
-				qdma_invalidate_cr_ctxt(sq_dev, q, QDMA_C2H);
-				qdma_invalidate_pfch_ctxt(sq_dev, q);
-				qdma_invalidate_cmpl_ctxt(sq_dev, q);
-				qdma_invalidate_sw_ctxt(sq_dev, q, QDMA_H2C);
-				qdma_invalidate_hw_ctxt(sq_dev, q, QDMA_H2C);
-				qdma_invalidate_cr_ctxt(sq_dev, q, QDMA_H2C);
-			}
-		}
-
-		/* Write shell QCONF for function 1 (CMAC1) */
-		{
-			u32 qconf = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, ONIC_MAX_QUEUES) |
-				     FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, priv2->num_q_vectors));
-			onic_write_reg(&priv2->hw, QDMA_FUNC_OFFSET_QCONF(1), qconf);
-		}
-		/* Write RSS indirection table for function 1 */
-		{
-			int j;
-			for (j = 0; j < 128; ++j) {
-				u32 v = (ONIC_MAX_QUEUES + (j % priv2->num_q_vectors)) & 0xFFFF;
-				onic_write_reg(&priv2->hw, QDMA_FUNC_OFFSET_INDIR_TABLE(1, j), v);
-			}
-		}
-
-		rv = onic_init_interrupt(priv2);
+	/* Spawn secondary netdev for CMAC1 if the shell exposes two CMACs.
+	 * num_cmacs is discovered during primary's hardware init. */
+	if (primary->hw.num_cmacs >= 2) {
+		rv = onic_setup_secondary(primary, &secondary);
 		if (rv < 0) {
-			dev_warn(&pdev->dev, "secondary onic_init_interrupt err=%d, CMAC1 unavailable\n", rv);
-			qdma_destroy_dev(sq_dev);
-			free_percpu(priv2->netdev_stats);
-			free_netdev(netdev2);
-			goto probe_done;
+			dev_err(&pdev->dev,
+				"secondary (CMAC1) setup failed (err=%d); primary still usable\n",
+				rv);
+			/* Non-fatal: leave primary up.  CMAC1 will be unused. */
+			rv = 0;
+		} else {
+			/* Bind port 2 of the ib_device to the secondary's netdev
+			 * now that register_netdev() has assigned its name. */
+			(void)onic_ib_set_port2_netdev(primary, secondary);
 		}
-
-		netif_set_real_num_tx_queues(netdev2, priv2->num_tx_queues);
-		netif_set_real_num_rx_queues(netdev2, priv2->num_rx_queues);
-		netdev2->min_mtu = ETH_MIN_MTU;
-		netdev2->max_mtu = 9600 - ETH_HLEN;
-		netdev2->features |= NETIF_F_HIGHDMA;
-		netdev2->hw_features |= NETIF_F_HIGHDMA;
-
-		rv = register_netdev(netdev2);
-		if (rv < 0) {
-			dev_warn(&pdev->dev, "register secondary netdev err=%d, CMAC1 unavailable\n", rv);
-			onic_clear_interrupt(priv2);
-			qdma_destroy_dev(sq_dev);
-			free_percpu(priv2->netdev_stats);
-			free_netdev(netdev2);
-			goto probe_done;
-		}
-
-		priv->peer = priv2;
-		netif_carrier_off(netdev2);
-		dev_info(&pdev->dev, "secondary net_device %s registered for CMAC1\n", netdev2->name);
 	}
 
-probe_done:
+	rv = onic_ptp_init(primary);
+	if (rv < 0)
+		dev_warn(&pdev->dev, "PTP init (primary) failed (err=%d), continuing\n", rv);
+	if (secondary) {
+		rv = onic_ptp_init(secondary);
+		if (rv < 0)
+			dev_warn(&pdev->dev, "PTP init (secondary) failed (err=%d), continuing\n", rv);
+	}
+	rv = 0;
+
 #ifdef CMS_SUPPORT
-        /* Support CMS sensors (lm-sensors), refer: pg348 */
         if(xmc_init == 0)
         {
-            onic_priv = priv;
+            onic_priv = primary;
             xocl_init_xmc();
             xmc_init=1;
         }
@@ -499,113 +558,70 @@ probe_done:
 
 	return 0;
 
-clear_interrupt:
-	onic_clear_interrupt(priv);
-clear_hardware:
-	onic_clear_hardware(priv);
-clear_capacity:
-	onic_clear_capacity(priv);
-free_netdev:
-	free_netdev(priv->netdev);
 release_pci_mem:
 	pci_release_mem_regions(pdev);
 disable_device:
 	pci_disable_device(pdev);
-
 	return rv;
 }
 
 /**
  * onic_remove - remove PCI device
  * @pdev: pointer to PCI device
+ *
+ * Teardown order: secondary first (drops CMAC1 and its child qdma_dev), then
+ * primary (runs the full QDMA shell reset, fmap invalidation, and BAR2
+ * iounmap that children shared).
+ *
+ * STOP THE PACKET FLOW FIRST: disabling CMAC RX before touching IRQs or NAPI
+ * is what keeps free_irq/napi_disable from spinning.  With a live stream,
+ * QDMA continuously writes completions and schedules NAPI; freeing IRQs
+ * while the CMAC is still active creates a busy-poll loop with no IRQ
+ * handler left to notice the queue is being torn down, and napi_disable
+ * spins forever waiting for NAPI_STATE_SCHED to clear.  Disabling CMAC RX
+ * first drains the pipeline while IRQs are still live, so the final NAPI
+ * poll returns < budget and the queue goes idle.  onic_teardown_netdev
+ * does this per-netdev.
  **/
 static void onic_remove(struct pci_dev *pdev)
 {
-	struct onic_private *priv = pci_get_drvdata(pdev);
+	struct onic_private *primary = pci_get_drvdata(pdev);
+	struct onic_private *secondary;
 #ifdef CMS_SUPPORT
         static int xmc_remove=0;
 #endif
 
 	dev_info(&pdev->dev, "removing device");
 
-	/* 0. Tear down secondary net_device (CMAC1) before touching primary.
-	 * Must happen before CMAC RX disable so the secondary's NAPI drains
-	 * while IRQs are still live (same reasoning as the primary below). */
-	if (priv->peer) {
-		struct onic_private *priv2 = priv->peer;
-		struct onic_hardware *hw2 = &priv2->hw;
+	if (!primary)
+		return;
 
-		onic_write_reg(hw2, CMAC_OFFSET_CONF_RX_1(1), 0x0);
-		udelay(10);
-		set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv2->flags);
+	secondary = primary->peer;
 
-		cancel_work_sync(&priv2->link_recovery_work);
-		onic_clear_interrupt(priv2);
-		cancel_work_sync(&priv2->link_recovery_work);
+	/* B3/B3.5: Unregister the ib_device FIRST, before any netdev teardown.
+	 * ib_device_set_netdev() took refcounts on both primary->netdev (port 1)
+	 * and secondary->netdev (port 2); those refcounts must be released
+	 * before unregister_netdev() will complete.  Otherwise the kernel loops
+	 * on "unregister_netdevice: waiting for enp1s0d1 to become free".
+	 * onic_ib_unregister() is a no-op on non-master-PF / VFs. */
+	onic_ib_unregister(primary);
 
-		/* secondary never calls onic_ptp_init so ptp_tx_ts_work is
-		 * uninitialized — calling onic_ptp_cleanup would WARN */
-		unregister_netdev(priv2->netdev);
-
-		onic_clear_hardware(priv2);
-		free_percpu(priv2->netdev_stats);
-		priv->peer = NULL;
-		free_netdev(priv2->netdev);
+	if (secondary) {
+		/* Break the bidirectional peer link before teardown so the
+		 * link-recovery path (which dereferences priv->peer) doesn't
+		 * touch the secondary while it's being freed. */
+		primary->peer = NULL;
+		secondary->peer = NULL;
+		onic_teardown_netdev(secondary);
 	}
 
-	/* 1. STOP THE PACKET FLOW FIRST (primary / CMAC0).
-	 *
-	 * Disable CMAC RX before touching IRQs or NAPI.  With a 93 Gbps
-	 * stream active, QDMA continuously writes completions and the
-	 * IRQ handler schedules NAPI.  If we free IRQs while the CMAC is
-	 * still active, the last-scheduled NAPI poll enters a busy-poll
-	 * loop: poll → process → refill descriptors → QDMA DMAs more →
-	 * more completions → poll returns budget → softirq re-polls.
-	 * Nothing can break this loop because no IRQ handler remains to
-	 * detect that the queue is being torn down, and napi_disable()
-	 * later spins forever waiting for NAPI_STATE_SCHED to clear.
-	 *
-	 * By disabling CMAC RX first, the pipeline drains while IRQs are
-	 * still live: the last completions generate interrupts, NAPI
-	 * processes them, the poll returns < budget, napi_complete_done
-	 * clears NAPI_STATE_SCHED, and the queue goes idle.  After that,
-	 * free_irq and napi_disable complete instantly. */
-	{
-		struct onic_hardware *hw = &priv->hw;
-		onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(0), 0x0);
-		udelay(10);
-		set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
-	}
-
-	/* 2. Drain any work running before free_irq. */
-	cancel_work_sync(&priv->link_recovery_work);
-
-	/* 3. Free IRQs.  With CMAC RX already off, the NAPI polls have
-	 * drained and free_irq just removes idle handlers. */
-	onic_clear_interrupt(priv);
-
-	/* 4. Drain any work re-scheduled in the window between the first
-	 * cancel and free_irq; IRQ threads cannot enqueue new work now. */
-	cancel_work_sync(&priv->link_recovery_work);
-
-	/* 5. Clean up PTP before unregistering netdev */
-	onic_ptp_cleanup(priv);
-
-	/* 6. Unregister the netdev (calls onic_stop_netdev via ndo_stop).
-	 * onic_stop_netdev skips the CMAC disable since we already did it. */
-	unregister_netdev(priv->netdev);
-
-	onic_clear_hardware(priv);
-	onic_clear_capacity(priv);
-
-	free_netdev(priv->netdev);
+	onic_teardown_netdev(primary);
 
 	pci_set_drvdata(pdev, NULL);
 	pci_release_mem_regions(pdev);
 	pci_disable_device(pdev);
 
 #ifdef CMS_SUPPORT
-        /* Support XMC sensors (lm-sensors) */
         if(xmc_remove == 0)
         {
             xocl_fini_xmc();
@@ -660,6 +676,11 @@ static struct pci_driver pci_driver = {
 
 static int __init onic_init_module(void)
 {
+	/* Build-time contract: per-CMAC queue stride must fit within the
+	 * per-netdev queue array.  If these diverge the plugin's tagged qid
+	 * won't have a matching sw_ctxt in the driver and packets drop. */
+	BUILD_BUG_ON(ONIC_PER_CMAC_QUEUES > ONIC_MAX_QUEUES);
+
 	pr_info("%s %s", onic_drv_str, onic_drv_ver);
 	return pci_register_driver(&pci_driver);
 }
