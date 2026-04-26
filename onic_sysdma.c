@@ -214,6 +214,25 @@ static int onic_sysdma_program_qctx(struct onic_private *priv,
 		return rv;
 	}
 
+	/* Enable the QDMA H2C MM engine globally (and C2H MM for the
+	 * future read path).  Without this, the engine is idle regardless
+	 * of any per-queue context — programmed queues are visible but no
+	 * descriptors are consumed.
+	 *
+	 * Bits per PG302 §3.7: [0] RUN=1 (engine active), [8] STEP=1
+	 * (single-step disabled = continuous mode).  Use the W1S
+	 * (write-1-set) variant so we don't clobber other bits.
+	 *
+	 * Only the master PF should do this — secondary PFs share the
+	 * same QDMA engine.  We're already in master-only path. */
+	{
+		const u32 mm_run = 0x1;        /* RUN bit */
+		qdma_write_reg(qdev, QDMA_OFFSET_H2C_MM_CONTROL_W1S, mm_run);
+		qdma_write_reg(qdev, QDMA_OFFSET_C2H_MM_CONTROL_W1S, mm_run);
+		dev_info(&priv->pdev->dev,
+			 "onic_sysdma: enabled H2C/C2H MM engines (control reg RUN bit set)\n");
+	}
+
 	dev_info(&priv->pdev->dev,
 		 "onic_sysdma: queue programmed qid=%u (MM mode, ring=256, desc_sz=32B)\n",
 		 s->qid);
