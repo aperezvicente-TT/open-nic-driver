@@ -26,30 +26,48 @@
 
 /* ------------------------------------------------------------------------ *
  *  MM descriptor — 32 bytes per PG302 v5.1 §5.1.
+ *
+ *  Field order matches libqdma's struct qdma_mm_desc (qdma_regs.h:50):
+ *    [0..7]    src_addr   (BIG-ENDIAN)
+ *    [8..11]   flag_len   (BIG-ENDIAN)
+ *    [12..15]  reserved
+ *    [16..23]  dst_addr   (BIG-ENDIAN)
+ *    [24..31]  reserved
+ *
+ *  flag_len bit layout:
+ *    [27:0]    length (28 bits, max 256 MiB per descriptor)
+ *    [28]      DV  (descriptor valid) — MUST be 1, else QDMA skips the
+ *                                       descriptor without advancing cidx.
+ *    [29]      SOP (start of packet, 1 for single-desc transfer)
+ *    [30]      EOP (end of packet,   1 for single-desc transfer)
+ *
  *  H2C: src = host PCIe dma_addr_t, dst = card AXI offset, len = bytes.
  *  C2H: src = card AXI offset,      dst = host PCIe dma_addr_t, len = bytes.
  * ------------------------------------------------------------------------ */
 
 struct onic_qdma_mm_desc {
-	__le64 src;
-	__le64 dst;
-	__le32 len_flags;       /* [27:0] length, [28] sop, [29] eop */
-	__le32 reserved[3];
+	__be64 src;
+	__be32 flag_len;
+	__be32 rsvd0;
+	__be64 dst;
+	__be64 rsvd1;
 } __packed;
 
-#define ONIC_QDMA_MM_FLAG_SOP   BIT(28)
-#define ONIC_QDMA_MM_FLAG_EOP   BIT(29)
+#define ONIC_QDMA_MM_FLAG_DV    BIT(28)
+#define ONIC_QDMA_MM_FLAG_SOP   BIT(29)
+#define ONIC_QDMA_MM_FLAG_EOP   BIT(30)
 #define ONIC_QDMA_MM_LEN_MASK   GENMASK(27, 0)
 
 static inline void onic_qdma_pack_mm_desc(struct onic_qdma_mm_desc *d,
 					  u64 src, u64 dst, u32 len)
 {
 	memset(d, 0, sizeof(*d));
-	d->src       = cpu_to_le64(src);
-	d->dst       = cpu_to_le64(dst);
-	d->len_flags = cpu_to_le32((len & ONIC_QDMA_MM_LEN_MASK) |
-				   ONIC_QDMA_MM_FLAG_SOP |
-				   ONIC_QDMA_MM_FLAG_EOP);
+	d->src      = cpu_to_be64(src);
+	d->dst      = cpu_to_be64(dst);
+	d->flag_len = cpu_to_be32((len & ONIC_QDMA_MM_LEN_MASK) |
+				  ONIC_QDMA_MM_FLAG_DV |
+				  ONIC_QDMA_MM_FLAG_SOP |
+				  ONIC_QDMA_MM_FLAG_EOP);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -68,9 +86,9 @@ static inline void onic_qdma_pack_mm_desc(struct onic_qdma_mm_desc *d,
  * ------------------------------------------------------------------------ */
 
 struct onic_qdma_wb_status {
-	__le16 pidx;
-	__le16 cidx;
-	__le32 reserved;
+	__be16 pidx;
+	__be16 cidx;
+	__be32 reserved;
 } __packed;
 
 #endif /* __ONIC_QDMA_MM_H__ */

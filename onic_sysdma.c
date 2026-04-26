@@ -404,7 +404,7 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 	deadline = jiffies + msecs_to_jiffies(ONIC_SYSDMA_TIMEOUT_MS);
 	for (;;) {
 		rmb(); /* re-read wb_status fresh from coherent memory */
-		cidx = le16_to_cpu(s->wb_status->cidx);
+		cidx = be16_to_cpu(s->wb_status->cidx);
 		if (cidx == expected_cidx) {
 			break;
 		}
