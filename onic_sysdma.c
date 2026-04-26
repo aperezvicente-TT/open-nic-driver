@@ -51,25 +51,31 @@
 /* ------------------------------------------------------------------------- *
  *  Per-queue state — embedded in onic_private as priv->sysdma (TODO: add
  *  the field to onic.h).  Kept opaque to other files for now.
+ *
+ *  Memory layout of desc_ring buffer:
+ *
+ *      offset 0:                 onic_qdma_mm_desc[0]
+ *      offset 32:                onic_qdma_mm_desc[1]
+ *      ...
+ *      offset (N-1)*32:          onic_qdma_mm_desc[N-1]
+ *      offset N*32:              onic_qdma_wb_status (8 bytes)
+ *
+ *  QDMA writes wb_status here when wbi_chk=1; we poll cidx for completion.
  * ------------------------------------------------------------------------- */
 struct onic_sysdma_state {
 	struct mutex            lock;       /* serialises ddr4_write/read */
 	bool                    initialised;
 
 	/* QDMA queue identity */
-	u16                     qid;        /* absolute qid (qid_base + offset) */
+	u16                     qid;        /* relative qid within this qdev */
 	u16                     pidx;       /* next descriptor index to push */
-	u16                     cidx;       /* completed index, polled from CMPT */
 
-	/* Descriptor ring (MM format, 32B/desc) */
+	/* Descriptor ring (MM format, 32 B/desc) + wb_status sentinel.
+	 * Allocated size = (ring_depth + 1) * 32. */
 	void                   *desc_ring;
 	dma_addr_t              desc_ring_dma;
 	size_t                  desc_ring_size;
-
-	/* Completion ring */
-	void                   *cmpt_ring;
-	dma_addr_t              cmpt_ring_dma;
-	size_t                  cmpt_ring_size;
+	struct onic_qdma_wb_status *wb_status; /* points into desc_ring */
 
 	/* Staging buffer for write payloads.  Reused across calls. */
 	void                   *staging;
@@ -262,11 +268,12 @@ int onic_sysdma_init(struct onic_private *priv)
 	 * relative offset. */
 	s->qid  = ONIC_SYSDMA_REL_QID;
 	s->pidx = 0;
-	s->cidx = 0;
 
-	/* Descriptor ring — coherent so QDMA can read without explicit
-	 * cache flushes.  256 entries * 32 B = 8 KiB. */
-	s->desc_ring_size = ONIC_SYSDMA_RING_DEPTH * ONIC_SYSDMA_DESC_SIZE;
+	/* Descriptor ring + wb_status sentinel in one coherent buffer.
+	 * Size = (ring_depth + 1) * 32 B = 8 KiB + 32 B (sentinel takes
+	 * a full descriptor slot to keep alignment).  QDMA writes the
+	 * wb_status word at offset ring_depth*32 when wbi_chk=1. */
+	s->desc_ring_size = (ONIC_SYSDMA_RING_DEPTH + 1) * ONIC_SYSDMA_DESC_SIZE;
 	s->desc_ring = dma_alloc_coherent(dev, s->desc_ring_size,
 					  &s->desc_ring_dma, GFP_KERNEL);
 	if (!s->desc_ring) {
@@ -274,17 +281,8 @@ int onic_sysdma_init(struct onic_private *priv)
 		goto err_free_state;
 	}
 	memset(s->desc_ring, 0, s->desc_ring_size);
-
-	/* Completion ring — 8 B per entry (status + 16-bit cidx).
-	 * Same depth as desc ring. */
-	s->cmpt_ring_size = ONIC_SYSDMA_RING_DEPTH * 8;
-	s->cmpt_ring = dma_alloc_coherent(dev, s->cmpt_ring_size,
-					  &s->cmpt_ring_dma, GFP_KERNEL);
-	if (!s->cmpt_ring) {
-		ret = -ENOMEM;
-		goto err_free_desc;
-	}
-	memset(s->cmpt_ring, 0, s->cmpt_ring_size);
+	s->wb_status = (struct onic_qdma_wb_status *)
+		((u8 *)s->desc_ring + (ONIC_SYSDMA_RING_DEPTH * ONIC_SYSDMA_DESC_SIZE));
 
 	/* Staging buffer — reused across writes, sized to ONIC_SYSDMA_MAX_XFER. */
 	s->staging_size = ONIC_SYSDMA_MAX_XFER;
@@ -292,7 +290,7 @@ int onic_sysdma_init(struct onic_private *priv)
 					&s->staging_dma, GFP_KERNEL);
 	if (!s->staging) {
 		ret = -ENOMEM;
-		goto err_free_cmpt;
+		goto err_free_desc;
 	}
 
 	/* Program QDMA queue context — this is the load-bearing TODO. */
@@ -312,8 +310,6 @@ int onic_sysdma_init(struct onic_private *priv)
 
 err_free_staging:
 	dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
-err_free_cmpt:
-	dma_free_coherent(dev, s->cmpt_ring_size, s->cmpt_ring, s->cmpt_ring_dma);
 err_free_desc:
 	dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
 err_free_state:
@@ -339,7 +335,6 @@ void onic_sysdma_fini(struct onic_private *priv)
 	onic_sysdma_clear_qctx(priv, s);
 
 	dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
-	dma_free_coherent(dev, s->cmpt_ring_size, s->cmpt_ring, s->cmpt_ring_dma);
 	dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
 
 	mutex_destroy(&s->lock);
@@ -356,8 +351,9 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 {
 	struct onic_qdma_mm_desc *ring = s->desc_ring;
 	struct onic_qdma_mm_desc *d;
-	u16 slot;
+	u16 slot, expected_cidx;
 	unsigned long deadline;
+	u16 cidx;
 
 	if (len == 0 || len > ONIC_SYSDMA_MAX_XFER) {
 		return -EINVAL;
@@ -370,21 +366,32 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 	wmb(); /* descriptor visible to QDMA before doorbell */
 
 	s->pidx = (s->pidx + 1) & (ONIC_SYSDMA_RING_DEPTH - 1);
+	expected_cidx = s->pidx;  /* QDMA bumps cidx to match pidx on completion */
 
-	/* TODO: ring the H2C PIDX doorbell.  Per PG302 §3.7, write
-	 * priv->hw.addr + qdma_doorbell_offset(s->qid) with the new PIDX.
-	 * The exact offset depends on the QDMA register map — see
-	 * QDMA_OFFSET_DMAP_SEL_H2C_DBELL_BASE in qdma_register.h.  Worth
-	 * factoring into a small helper. */
+	/* Ring the H2C PIDX doorbell via the existing helper.  This writes
+	 * QDMA_OFFSET_DMAP_SEL_H2C_DESC_PIDX + abs_qid*16 with the new
+	 * pidx.  irq_arm=0 since we poll. */
+	onic_set_tx_head(priv->hw.qdma, s->qid, s->pidx);
 
-	/* TODO: poll the CMPT ring for slot completion or timeout. */
+	/* Poll the wb_status sentinel.  QDMA writes pidx/cidx into this
+	 * 8-byte word at the end of the descriptor ring after each
+	 * completed batch (wbi_chk=1, wbi_intvl_en=0 → write per descriptor).
+	 *
+	 * Reference: libqdma qdma_descq.c:descq_mm_n_h2c_cmpl_status. */
 	deadline = jiffies + msecs_to_jiffies(ONIC_SYSDMA_TIMEOUT_MS);
-	while (time_before(jiffies, deadline)) {
-		/* Read CMPT entry at s->cidx, check if engine consumed our slot.
-		 * For now, just busy-loop a stub. */
+	for (;;) {
+		rmb(); /* re-read wb_status fresh from coherent memory */
+		cidx = le16_to_cpu(s->wb_status->cidx);
+		if (cidx == expected_cidx) {
+			break;
+		}
+		if (time_after(jiffies, deadline)) {
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: timeout waiting for cidx=%u (got %u, pidx=%u)\n",
+				expected_cidx, cidx, s->pidx);
+			return -ETIMEDOUT;
+		}
 		cpu_relax();
-		break; /* TODO: real completion check; for now succeed once for
-			* compile-test only.  Remove this break. */
 	}
 
 	return 0;
