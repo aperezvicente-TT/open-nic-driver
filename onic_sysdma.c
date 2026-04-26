@@ -32,7 +32,21 @@
 
 #include "onic.h"
 #include "onic_sysdma.h"
+#include "onic_qdma_mm.h"
 #include "qdma_access/qdma_register.h"
+#include "qdma_access/qdma_context.h"
+#include "qdma_access/qdma_device.h"
+#include "qdma_access/qdma_export.h"
+
+/* QDMA ring-size pool index for 256 entries (matches rngcnt_pool[4]
+ * in onic_hardware.c). */
+#define ONIC_SYSDMA_RNGSZ_IDX  4
+
+/* Reserved qid (relative to function's qid_base).  Netdev uses 0..N-1
+ * for its TX/RX queues; we use a value past the netdev range.  Queue
+ * 31 is well past 14-queue netdev allocations and within typical
+ * num_q=2048 caps. */
+#define ONIC_SYSDMA_REL_QID    31
 
 /* ------------------------------------------------------------------------- *
  *  Per-queue state — embedded in onic_private as priv->sysdma (TODO: add
@@ -63,30 +77,7 @@ struct onic_sysdma_state {
 	size_t                  staging_size;
 };
 
-/* ------------------------------------------------------------------------- *
- *  MM descriptor packing.  QDMA's docs use little-endian 32-byte structs.
- *  The first 16 bytes carry src/dst addresses; len + flags pack into the
- *  next 4 bytes; the rest is reserved-zero.
- * ------------------------------------------------------------------------- */
-struct qdma_mm_desc {
-	__le64 src;
-	__le64 dst;
-	__le32 len_flags;       /* [27:0] length, [28] sop, [29] eop, rest rsvd */
-	__le32 reserved[3];
-} __packed;
-
-#define QDMA_MM_FLAG_SOP   (1u << 28)
-#define QDMA_MM_FLAG_EOP   (1u << 29)
-
-static void onic_sysdma_pack_desc(struct qdma_mm_desc *d,
-				  dma_addr_t src, u64 dst, u32 len)
-{
-	memset(d, 0, sizeof(*d));
-	d->src       = cpu_to_le64((u64)src);
-	d->dst       = cpu_to_le64(dst);
-	d->len_flags = cpu_to_le32((len & 0x0FFFFFFFu) |
-				   QDMA_MM_FLAG_SOP | QDMA_MM_FLAG_EOP);
-}
+/* MM descriptor + WB-status structs: see onic_qdma_mm.h. */
 
 /* ------------------------------------------------------------------------- *
  *  QDMA queue context programming for MM mode.
@@ -151,47 +142,95 @@ static void onic_sysdma_pack_desc(struct qdma_mm_desc *d,
 static int onic_sysdma_program_qctx(struct onic_private *priv,
 				    struct onic_sysdma_state *s)
 {
-	/* TODO: implement QDMA H2C MM context write.  Roughly:
-	 *
-	 *   struct qdma_h2c_sw_ctxt ctxt = {0};
-	 *   ctxt.qen      = 1;
-	 *   ctxt.fcrd_en  = 0;       // we use direct doorbell PIDX, not credit
-	 *   ctxt.wbi_chk  = 1;
-	 *   ctxt.wbi_intvl_en = 0;   // poll completions, no MSI-X for now
-	 *   ctxt.fnc_id   = priv->cmac_id;
-	 *   ctxt.rngsz_idx = ONIC_SYSDMA_RING_DEPTH log2 index;
-	 *   ctxt.dsc_base = s->desc_ring_dma;
-	 *   ctxt.is_mm    = 1;       // <-- the MM-mode bit
-	 *   ctxt.mrkr_dis = 0;
-	 *   ctxt.irq_en   = 0;
-	 *
-	 *   qdma_program_ctxt(qdev, QDMA_CTXT_H2C_SW, s->qid, &ctxt);
-	 *
-	 * Plus the corresponding HW context (QDMA_CTXT_H2C_HW) and CMPT
-	 * context if we want CMPT-based completion notification.
-	 *
-	 * The existing onic_qdma_init_tx_queue at onic_hardware.c:520 does
-	 * the equivalent for ST mode — model after that.  Or factor common
-	 * code out and parameterise on is_mm.
+	struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
+	struct qdma_sw_ctxt sw_ctxt;
+	int rv;
+
+	if (!qdev) {
+		dev_err(&priv->pdev->dev, "onic_sysdma: priv->hw.qdma is NULL\n");
+		return -ENODEV;
+	}
+
+	/* Build H2C SW context for MM mode.  Modeled after
+	 * onic_qdma_init_tx_queue() in onic_hardware.c, but with:
+	 *   is_mm    = 1     (vs 0 for ST netdev)
+	 *   desc_sz  = 2     (32-byte MM desc, vs 1=16B for ST H2C)
+	 *   wbi_chk  = 1     (writeback status enabled)
+	 *   wbi_intvl_en = 0 (write status after every descriptor, no batching)
+	 *   irq_en   = 0     (poll mode — no MSI-X for sysdma)
+	 *   fcrd_en  = 0     (direct PIDX doorbell, not credit-based)
 	 */
-	dev_warn(&priv->pdev->dev,
-		 "onic_sysdma: program_qctx is a stub; MM mode not yet active. qid=%u\n",
+	memset(&sw_ctxt, 0, sizeof(sw_ctxt));
+	sw_ctxt.func_id      = qdev->func_id;
+	sw_ctxt.qen          = 1;
+	sw_ctxt.is_mm        = 1;
+	sw_ctxt.wbk_en       = 1;
+	sw_ctxt.wbi_chk      = 1;
+	sw_ctxt.wbi_intvl_en = 0;
+	sw_ctxt.irq_arm      = 0;
+	sw_ctxt.irq_en       = 0;
+	sw_ctxt.desc_sz      = 2;       /* 32B MM descriptor */
+	sw_ctxt.fcrd_en      = 0;
+	sw_ctxt.at           = 0;
+	sw_ctxt.rngsz_idx    = ONIC_SYSDMA_RNGSZ_IDX;
+	sw_ctxt.desc_base    = s->desc_ring_dma;
+	sw_ctxt.vec          = 0;
+	sw_ctxt.intr_aggr    = 0;
+
+	/* Clear any stale state, then write our context. */
+	rv = qdma_clear_sw_ctxt(qdev, s->qid, QDMA_H2C);
+	if (rv < 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: clear_sw_ctxt qid=%u failed: %d\n",
+			s->qid, rv);
+		return rv;
+	}
+	rv = qdma_clear_hw_ctxt(qdev, s->qid, QDMA_H2C);
+	if (rv < 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: clear_hw_ctxt qid=%u failed: %d\n",
+			s->qid, rv);
+		return rv;
+	}
+	rv = qdma_clear_cr_ctxt(qdev, s->qid, QDMA_H2C);
+	if (rv < 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: clear_cr_ctxt qid=%u failed: %d\n",
+			s->qid, rv);
+		return rv;
+	}
+
+	rv = qdma_write_sw_ctxt(qdev, s->qid, QDMA_H2C, &sw_ctxt);
+	if (rv < 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: write_sw_ctxt qid=%u failed: %d\n",
+			s->qid, rv);
+		return rv;
+	}
+
+	dev_info(&priv->pdev->dev,
+		 "onic_sysdma: queue programmed qid=%u (MM mode, ring=256, desc_sz=32B)\n",
 		 s->qid);
-	return -EOPNOTSUPP;
+	return 0;
 }
 
 static void onic_sysdma_clear_qctx(struct onic_private *priv,
 				   struct onic_sysdma_state *s)
 {
-	/* TODO: invalidate the H2C SW + HW contexts before freeing the
-	 * descriptor ring.  Use qdma_program_ctxt with all-zero ctxt and
-	 * qen=0, then issue an invalidate via QDMA_OFFSET_CTXT_DATA_*
-	 * registers.  Failing to do this leaves the QDMA engine with a
-	 * stale DMA address pointing into freed kernel memory — usual
-	 * IOMMU fault if SR-IOV is enabled, silent corruption otherwise.
-	 */
-	(void)priv;
-	(void)s;
+	struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
+
+	if (!qdev || !s) {
+		return;
+	}
+
+	/* Invalidate first (engine stops fetching), then clear (slot
+	 * marked free for reuse).  Order matters: clearing without
+	 * invalidating can race with in-flight descriptor fetches. */
+	qdma_invalidate_sw_ctxt(qdev, s->qid, QDMA_H2C);
+	qdma_invalidate_hw_ctxt(qdev, s->qid, QDMA_H2C);
+	qdma_clear_sw_ctxt(qdev, s->qid, QDMA_H2C);
+	qdma_clear_hw_ctxt(qdev, s->qid, QDMA_H2C);
+	qdma_clear_cr_ctxt(qdev, s->qid, QDMA_H2C);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -221,7 +260,7 @@ int onic_sysdma_init(struct onic_private *priv)
 	/* TODO: derive absolute qid from priv->qid_base + offset, once the
 	 * qdma_dev exposes the queue-base accessor.  For now, hard-code the
 	 * relative offset. */
-	s->qid  = ONIC_SYSDMA_QID_OFFSET;
+	s->qid  = ONIC_SYSDMA_REL_QID;
 	s->pidx = 0;
 	s->cidx = 0;
 
@@ -315,8 +354,8 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 				  struct onic_sysdma_state *s,
 				  dma_addr_t src, u64 dst, u32 len)
 {
-	struct qdma_mm_desc *ring = s->desc_ring;
-	struct qdma_mm_desc *d;
+	struct onic_qdma_mm_desc *ring = s->desc_ring;
+	struct onic_qdma_mm_desc *d;
 	u16 slot;
 	unsigned long deadline;
 
@@ -327,7 +366,7 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 	slot = s->pidx & (ONIC_SYSDMA_RING_DEPTH - 1);
 	d    = &ring[slot];
 
-	onic_sysdma_pack_desc(d, src, dst, len);
+	onic_qdma_pack_mm_desc(d, (u64)src, dst, len);
 	wmb(); /* descriptor visible to QDMA before doorbell */
 
 	s->pidx = (s->pidx + 1) & (ONIC_SYSDMA_RING_DEPTH - 1);
