@@ -252,11 +252,12 @@ int onic_sysdma_init(struct onic_private *priv)
 	if (!priv) {
 		return -EINVAL;
 	}
+	if (priv->sysdma) {
+		dev_warn(&priv->pdev->dev,
+			 "onic_sysdma: already initialised\n");
+		return -EBUSY;
+	}
 
-	/* TODO(onic.h): add `struct onic_sysdma_state *sysdma;` to
-	 * struct onic_private and replace this kmalloc with kzalloc into
-	 * priv->sysdma.  For now, allocate locally and return via priv
-	 * by some other means (caller stashes it). */
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s) {
 		return -ENOMEM;
@@ -300,12 +301,9 @@ int onic_sysdma_init(struct onic_private *priv)
 	}
 
 	s->initialised = true;
+	priv->sysdma = s;
 	dev_info(dev, "onic_sysdma: ready (qid=%u, ring_depth=%u, max_xfer=%u)\n",
 		 s->qid, ONIC_SYSDMA_RING_DEPTH, ONIC_SYSDMA_MAX_XFER);
-
-	/* TODO: stash s in priv->sysdma.  For now, leak the pointer to
-	 * avoid driver build issues until onic.h is amended. */
-	(void)s; /* silence unused warning */
 	return 0;
 
 err_free_staging:
@@ -325,17 +323,23 @@ void onic_sysdma_fini(struct onic_private *priv)
 	if (!priv) {
 		return;
 	}
-	dev = &priv->pdev->dev;
-	/* TODO: retrieve s from priv->sysdma once the field is added. */
-	s = NULL;
-	if (!s || !s->initialised) {
+	s = priv->sysdma;
+	if (!s) {
 		return;
 	}
+	dev = &priv->pdev->dev;
+	priv->sysdma = NULL;  /* prevent re-entry from racing callers */
 
-	onic_sysdma_clear_qctx(priv, s);
+	if (s->initialised) {
+		onic_sysdma_clear_qctx(priv, s);
+	}
 
-	dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
-	dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
+	if (s->staging) {
+		dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
+	}
+	if (s->desc_ring) {
+		dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
+	}
 
 	mutex_destroy(&s->lock);
 	kfree(s);
@@ -406,8 +410,7 @@ int onic_ddr4_write(struct onic_private *priv, u64 dst_axi,
 	if (!priv || !src || len == 0 || len > ONIC_SYSDMA_MAX_XFER) {
 		return -EINVAL;
 	}
-	/* TODO: s = priv->sysdma; */
-	s = NULL;
+	s = priv->sysdma;
 	if (!s || !s->initialised) {
 		return -ENODEV;
 	}

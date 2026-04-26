@@ -35,6 +35,7 @@
 #include "onic_common.h"
 #include "onic_netdev.h"
 #include "onic_ptp.h"
+#include "onic_sysdma.h"
 #include "qdma_access/qdma_device.h"
 #include "qdma_access/qdma_context.h"
 
@@ -341,6 +342,19 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		goto clear_interrupt;
 	}
 
+	/* B7: bring up the QDMA AXI-MM system DMA queue (master PF only).
+	 * Used by the RDMA verb path to write WQEs into ERNIC's DDR4
+	 * rings.  Failure is non-fatal — netdev + ib_device still work,
+	 * RDMA verbs requiring DDR4 access will fail at post_send/recv. */
+	rv = onic_sysdma_init(priv);
+	if (rv < 0) {
+		dev_warn(&pdev->dev,
+			 "onic_sysdma_init failed (%d) — RDMA WQE path unavailable\n",
+			 rv);
+		/* deliberately not goto-out: probe continues. */
+		rv = 0;
+	}
+
 	netif_carrier_off(priv->netdev);
 	*out = priv;
 	return 0;
@@ -454,6 +468,7 @@ static void onic_teardown_netdev(struct onic_private *priv)
 	set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
 
 	cancel_work_sync(&priv->link_recovery_work);
+	onic_sysdma_fini(priv);  /* B7: tear down MM queue before ib_dev unregister */
 	onic_ib_unregister(priv);
 	onic_ernic_irq_teardown(priv);
 	onic_clear_interrupt(priv);

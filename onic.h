@@ -260,6 +260,12 @@ struct onic_private {
 
 	/* B3: ib_device for RoCEv2 (master PF only — NULL elsewhere). */
 	struct onic_ib_dev       *ib_dev;
+
+	/* B7: QDMA AXI-MM system DMA queue for host<->DDR4 transfers
+	 * (master PF only — NULL on secondary).  Used by the RDMA verb
+	 * path to stage WQEs and MR payloads into ERNIC's DDR4-resident
+	 * rings.  See onic_sysdma.{h,c}. */
+	struct onic_sysdma_state *sysdma;
 };
 
 #endif
