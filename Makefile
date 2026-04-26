@@ -22,9 +22,20 @@ endif
 
 srcdir = $(PWD)
 obj-m += onic.o
-BASE_OBJS := $(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/*.c $(srcdir)/*/*.c $(srcdir)/*/*/*.c))
-onic-objs = $(BASE_OBJS)
-ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_legacy -I$(srcdir)/hwmon -I$(srcdir)
+
+SRC_FOLDERS = . qdma_legacy hwmon \
+              libqdma libqdma/qdma_access \
+              libqdma/qdma_access/eqdma_soft_access \
+              libqdma/qdma_access/eqdma_cpm5_access \
+              libqdma/qdma_access/qdma_soft_access \
+              libqdma/qdma_access/qdma_cpm4_access \
+              libqdma/qdma_access/qdma_s80_hard_access
+
+onic-objs := $(foreach D,$(SRC_FOLDERS),$(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/$(D)/*.c)))
+
+ccflags-y = -O3 -Wall -I$(srcdir)/qdma_legacy -I$(srcdir)/hwmon -I$(srcdir) \
+            $(foreach D,$(SRC_FOLDERS),-I$(srcdir)/$(D))
+ccflags-y += -DMBOX_INTERRUPT_DISABLE
 
 # MLNX_OFED integration: if OFED is installed, build against its rdma/*
 # headers and link CRCs against OFED's per-kernel ib_core Module.symvers.
@@ -72,7 +83,7 @@ with-clang:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f *.o.ur-safe
-	rm -f ./qdma_legacy/*.o.ur-safe
+	$(foreach D,$(SRC_FOLDERS),rm -f $(srcdir)/$(D)/*.o.ur-safe;)
 
 install:
 	rm -f /lib/modules/$(KERNEL_VERS)/onic.ko
