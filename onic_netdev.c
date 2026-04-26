@@ -37,7 +37,7 @@
 #include "onic_hardware.h"
 #include "onic_lib.h"
 #include "onic_register.h"
-#include "qdma_access/qdma_register.h"
+#include "qdma_legacy/qdma_register.h"
 #include "onic.h"
 #include "onic_ptp.h"
 

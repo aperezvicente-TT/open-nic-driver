@@ -24,7 +24,7 @@ srcdir = $(PWD)
 obj-m += onic.o
 BASE_OBJS := $(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/*.c $(srcdir)/*/*.c $(srcdir)/*/*/*.c))
 onic-objs = $(BASE_OBJS)
-ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_access -I$(srcdir)/hwmon -I$(srcdir)
+ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_legacy -I$(srcdir)/hwmon -I$(srcdir)
 
 # MLNX_OFED integration: if OFED is installed, build against its rdma/*
 # headers and link CRCs against OFED's per-kernel ib_core Module.symvers.
@@ -72,7 +72,7 @@ with-clang:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f *.o.ur-safe
-	rm -f ./qdma_access/*.o.ur-safe
+	rm -f ./qdma_legacy/*.o.ur-safe
 
 install:
 	rm -f /lib/modules/$(KERNEL_VERS)/onic.ko

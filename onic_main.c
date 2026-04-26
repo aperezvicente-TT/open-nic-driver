@@ -36,8 +36,8 @@
 #include "onic_netdev.h"
 #include "onic_ptp.h"
 #include "onic_sysdma.h"
-#include "qdma_access/qdma_device.h"
-#include "qdma_access/qdma_context.h"
+#include "qdma_legacy/qdma_device.h"
+#include "qdma_legacy/qdma_context.h"
 
 #undef CMS_SUPPORT    /* Need CMS IP in the design @320000 offset */
 

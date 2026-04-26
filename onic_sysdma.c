@@ -33,10 +33,10 @@
 #include "onic.h"
 #include "onic_sysdma.h"
 #include "onic_qdma_mm.h"
-#include "qdma_access/qdma_register.h"
-#include "qdma_access/qdma_context.h"
-#include "qdma_access/qdma_device.h"
-#include "qdma_access/qdma_export.h"
+#include "qdma_legacy/qdma_register.h"
+#include "qdma_legacy/qdma_context.h"
+#include "qdma_legacy/qdma_device.h"
+#include "qdma_legacy/qdma_export.h"
 
 /* QDMA ring-size pool index for 256 entries (matches rngcnt_pool[4]
  * in onic_hardware.c). */
