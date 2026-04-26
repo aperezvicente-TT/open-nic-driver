@@ -29,13 +29,12 @@
 
 struct onic_private;
 
-/* Reserved queue id used for system DMA.  Picked from the top end of the
- * QDMA queue space so it never collides with netdev queues (which start
- * at 0).  Adjust if NUM_QUEUE in the FPGA shrinks below 64. */
-#define ONIC_SYSDMA_QID_OFFSET     2047  /* last queue */
-#define ONIC_SYSDMA_RING_DEPTH     256
-#define ONIC_SYSDMA_DESC_SIZE      32    /* MM descriptor: 32 bytes per PG302 */
-#define ONIC_SYSDMA_TIMEOUT_MS     500   /* completion poll cap */
+/* Per-call timeout for libqdma blocking submits.  500 ms is well above
+ * any plausible 1 MiB DDR4 round-trip; the original hand-rolled path
+ * used the same cap.  Internal to onic_sysdma.c only — kept in the
+ * public header because onic_sysdma_self_test references it via
+ * onic_ddr4_write's deadline contract. */
+#define ONIC_SYSDMA_TIMEOUT_MS     500
 
 /**
  * onic_sysdma_init - Allocate ring + CMPT + program QDMA queue for MM mode.
