@@ -301,7 +301,7 @@ static u32 onic_get_link(struct net_device *netdev)
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
 
-    cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    cmac_idx = priv->cmac_id;
 
     /* read twice to flush any previously latched value */
     val = onic_read_reg(hw, CMAC_OFFSET_STAT_RX_STATUS(cmac_idx));
@@ -327,7 +327,7 @@ static int onic_get_fecparam(struct net_device *netdev,
 {
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
-    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    u8 cmac_idx = priv->cmac_id;
     u32 rsfec_en;
 
     fec->fec = ETHTOOL_FEC_RS | ETHTOOL_FEC_OFF;
@@ -343,7 +343,7 @@ static int onic_set_fecparam(struct net_device *netdev,
 {
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
-    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    u8 cmac_idx = priv->cmac_id;
 
     if (fec->fec & ETHTOOL_FEC_RS) {
 	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_idx), 0x3);
@@ -367,7 +367,7 @@ static int onic_get_link_ksettings(struct net_device *netdev,
 {
     struct onic_private *priv = netdev_priv(netdev);
     struct onic_hardware *hw = &priv->hw;
-    u8 cmac_idx = test_bit(ONIC_FLAG_MASTER_PF, priv->flags) ? 0 : 1;
+    u8 cmac_idx = priv->cmac_id;
     u32 rx_status;
 
     ethtool_link_ksettings_zero_link_mode(cmd, supported);

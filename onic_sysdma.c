@@ -157,12 +157,20 @@ static int onic_sysdma_program_qctx(struct onic_private *priv,
 		return -ENODEV;
 	}
 
-	/* Build H2C SW context for MM mode.  Modeled after
-	 * onic_qdma_init_tx_queue() in onic_hardware.c, but with:
+	/* Build H2C SW context for MM mode.  Aligned with libqdma's
+	 * make_sw_context (qdma_context.c:64) — three fields are MM-mode-
+	 * critical that the existing cut-down ST setup doesn't set:
+	 *   mrkr_dis  = 1    (disable marker responses — ST-only sync;
+	 *                    leaving =0 in MM may cause spurious fetches)
+	 *   fetch_max = 7    (FETCH_MAX_NUM from libqdma)
+	 *   mm_chn    = 0    (MM channel id, 0 since we use a single channel)
+	 *   host_id   = 0    (eqdma field, not present in our cut-down struct)
+	 *
+	 * Other settings:
 	 *   is_mm    = 1     (vs 0 for ST netdev)
 	 *   desc_sz  = 2     (32-byte MM desc, vs 1=16B for ST H2C)
 	 *   wbi_chk  = 1     (writeback status enabled)
-	 *   wbi_intvl_en = 0 (write status after every descriptor, no batching)
+	 *   wbi_intvl_en = 0 (write status per descriptor)
 	 *   irq_en   = 0     (poll mode — no MSI-X for sysdma)
 	 *   fcrd_en  = 0     (direct PIDX doorbell, not credit-based)
 	 */
@@ -170,6 +178,9 @@ static int onic_sysdma_program_qctx(struct onic_private *priv,
 	sw_ctxt.func_id      = qdev->func_id;
 	sw_ctxt.qen          = 1;
 	sw_ctxt.is_mm        = 1;
+	sw_ctxt.mrkr_dis     = 1;       /* MM mode: disable marker responses */
+	sw_ctxt.fetch_max    = 7;       /* FETCH_MAX_NUM, per libqdma */
+	sw_ctxt.mm_chn       = 0;
 	sw_ctxt.wbk_en       = 1;
 	sw_ctxt.wbi_chk      = 1;
 	sw_ctxt.wbi_intvl_en = 0;
@@ -206,12 +217,59 @@ static int onic_sysdma_program_qctx(struct onic_private *priv,
 		return rv;
 	}
 
+	dev_info(&priv->pdev->dev,
+		 "onic_sysdma: about to write sw_ctxt: desc_base=0x%llx (ring_dma=0x%llx wb=%p) qid=%u func_id=%u rngsz_idx=%u desc_sz=%u is_mm=%u qen=%u wbi_chk=%u\n",
+		 (u64)sw_ctxt.desc_base, (u64)s->desc_ring_dma, s->wb_status,
+		 s->qid, sw_ctxt.func_id, sw_ctxt.rngsz_idx, sw_ctxt.desc_sz,
+		 sw_ctxt.is_mm, sw_ctxt.qen, sw_ctxt.wbi_chk);
+
 	rv = qdma_write_sw_ctxt(qdev, s->qid, QDMA_H2C, &sw_ctxt);
 	if (rv < 0) {
 		dev_err(&priv->pdev->dev,
 			"onic_sysdma: write_sw_ctxt qid=%u failed: %d\n",
 			s->qid, rv);
 		return rv;
+	}
+
+	/* Direct context-readback diagnostic — issue an OP_RD command via
+	 * qdev->addr (BAR0, where QDMA CSRs live; priv->hw.addr is BAR2,
+	 * which would read random shell registers).  Dump the 8
+	 * IND_CTXT_DATA words after the read completes to verify what
+	 * the IP actually stored. */
+	{
+		u32 cmd, busy;
+		u32 raw[8] = {0};
+		u16 abs_qid = s->qid + qdev->q_base;
+		int i, rb_rv = 0;
+
+		/* OP_RD = 2, SEL_SW_H2C = 1.  Bit positions per existing
+		 * cut-down lib's union qdma_ctxt_cmd: sel[4:1], op[6:5], qid[18:7]. */
+		cmd = ((u32)abs_qid << 7) | ((u32)2 << 5) | ((u32)1 << 1);
+		qdma_write_reg(qdev, QDMA_OFFSET_IND_CTXT_CMD, cmd);
+
+		for (i = 0; i < 50000; ++i) {
+			busy = qdma_read_reg(qdev, QDMA_OFFSET_IND_CTXT_CMD);
+			if ((busy & 0x1) == 0) break;
+			udelay(10);
+		}
+		if (i >= 50000) {
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: ctxt readback BUSY timeout (cmd=0x%08x last_busy=0x%08x)\n",
+				cmd, busy);
+			rb_rv = -ETIMEDOUT;
+		}
+
+		for (i = 0; i < 8; ++i) {
+			raw[i] = qdma_read_reg(qdev,
+				QDMA_OFFSET_IND_CTXT_DATA + (i * 4));
+		}
+		dev_info(&priv->pdev->dev,
+			 "onic_sysdma: ctxt readback (abs_qid=%u, rv=%d): W0=0x%08x W1=0x%08x W2=0x%08x W3=0x%08x W4=0x%08x W5=0x%08x W6=0x%08x W7=0x%08x\n",
+			 abs_qid, rb_rv, raw[0], raw[1], raw[2], raw[3],
+			 raw[4], raw[5], raw[6], raw[7]);
+		dev_info(&priv->pdev->dev,
+			 "onic_sysdma:   reconstructed desc_base = 0x%llx (W3:W2)\n",
+			 ((u64)raw[3] << 32) | raw[2]);
 	}
 
 	/* Enable the QDMA H2C MM engine globally (and C2H MM for the
@@ -266,6 +324,7 @@ int onic_sysdma_init(struct onic_private *priv)
 {
 	struct device *dev = &priv->pdev->dev;
 	struct onic_sysdma_state *s;
+	u64 saved_coherent_mask;
 	int ret;
 
 	if (!priv) {
@@ -275,6 +334,28 @@ int onic_sysdma_init(struct onic_private *priv)
 		dev_warn(&priv->pdev->dev,
 			 "onic_sysdma: already initialised\n");
 		return -EBUSY;
+	}
+
+	/* Driver-wide coherent mask is 32-bit (set in onic_main.c probe).
+	 * That gives our descriptor ring an IOVA below 4 GB, which on this
+	 * platform allocates from the top of the 32-bit IOVA space (e.g.
+	 * 0xff??????) — and the QDMA MM engine mishandles such addresses
+	 * (descriptor fetch faults at 0xff00000000 = high byte of IOVA
+	 * shifted to bits [39:32]).  Temporarily widen to 64-bit for our
+	 * own coherent allocations so the IOMMU can give us higher IOVAs
+	 * that don't tickle the bug.  Restore the mask afterward so other
+	 * driver paths see the same environment they were probed under. */
+	saved_coherent_mask = dma_get_required_mask(dev);
+	(void)saved_coherent_mask; /* avoid unused warning if we don't restore */
+	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
+	if (ret) {
+		dev_warn(dev,
+			 "onic_sysdma: failed to widen coherent mask to 64-bit (%d); will use existing 32-bit mask\n",
+			 ret);
+		/* Fall through: dma_alloc_coherent below will use whatever
+		 * mask is currently in force. */
+	} else {
+		dev_info(dev, "onic_sysdma: coherent mask widened to 64-bit for our allocations\n");
 	}
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
@@ -321,8 +402,13 @@ int onic_sysdma_init(struct onic_private *priv)
 
 	s->initialised = true;
 	priv->sysdma = s;
-	dev_info(dev, "onic_sysdma: ready (qid=%u, ring_depth=%u, max_xfer=%u)\n",
-		 s->qid, ONIC_SYSDMA_RING_DEPTH, ONIC_SYSDMA_MAX_XFER);
+	dev_info(dev, "onic_sysdma: ready (qid=%u, ring_depth=%u, max_xfer=%u, desc_dma=0x%llx, staging_dma=0x%llx)\n",
+		 s->qid, ONIC_SYSDMA_RING_DEPTH, ONIC_SYSDMA_MAX_XFER,
+		 (u64)s->desc_ring_dma, (u64)s->staging_dma);
+
+	/* Restore 32-bit coherent mask for the rest of the driver.  Our
+	 * allocations are already done; restoring doesn't free them. */
+	(void)dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	return 0;
 
 err_free_staging:
@@ -331,6 +417,7 @@ err_free_desc:
 	dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
 err_free_state:
 	kfree(s);
+	(void)dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	return ret;
 }
 
@@ -388,6 +475,20 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 	onic_qdma_pack_mm_desc(d, (u64)src, dst, len);
 	wmb(); /* descriptor visible to QDMA before doorbell */
 
+	/* DEBUG: dump the packed descriptor bytes so we can correlate with
+	 * QDMA's interpretation in case of fault. */
+	{
+		const u8 *db = (const u8 *)d;
+		dev_info(&priv->pdev->dev,
+			 "onic_sysdma: desc[%u] @ %p (dma=0x%llx) bytes=%02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x src=0x%llx dst=0x%llx len=%u\n",
+			 slot, d, (u64)(s->desc_ring_dma + slot * sizeof(*d)),
+			 db[0], db[1], db[2], db[3], db[4], db[5], db[6], db[7],
+			 db[8], db[9], db[10], db[11], db[12], db[13], db[14], db[15],
+			 db[16], db[17], db[18], db[19], db[20], db[21], db[22], db[23],
+			 db[24], db[25], db[26], db[27], db[28], db[29], db[30], db[31],
+			 (u64)src, dst, len);
+	}
+
 	s->pidx = (s->pidx + 1) & (ONIC_SYSDMA_RING_DEPTH - 1);
 	expected_cidx = s->pidx;  /* QDMA bumps cidx to match pidx on completion */
 
@@ -409,9 +510,62 @@ static int onic_sysdma_submit_one(struct onic_private *priv,
 			break;
 		}
 		if (time_after(jiffies, deadline)) {
+			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+			u32 mm_status, mm_err_code, mm_err_info;
+			u32 dsc_err_sts, dsc_err_log0, dsc_err_log1, dsc_err_log2;
+
+			/* Dump H2C MM engine state at failure.  Register offsets
+			 * per eqdma_soft_reg.h (EQDMA5.0 Soft IP).  Earlier code
+			 * read the wrong addresses for ERR_LOG0/LOG1 — the labels
+			 * matched neither the IP spec nor our cut-down register
+			 * header (qdma_register.h:62–71). */
+			mm_status    = qdma_read_reg(qdev_dbg, 0x1240); /* H2C_MM_STATUS */
+			mm_err_code  = qdma_read_reg(qdev_dbg, 0x1258); /* H2C_MM_ERR_CODE */
+			mm_err_info  = qdma_read_reg(qdev_dbg, 0x125C); /* H2C_MM_ERR_INFO */
+			dsc_err_sts  = qdma_read_reg(qdev_dbg, 0x254);  /* GLBL_DSC_ERR_STS  — fault category bits */
+			dsc_err_log0 = qdma_read_reg(qdev_dbg, 0x25C);  /* GLBL_DSC_ERR_LOG0 — VALID + QID */
+			dsc_err_log1 = qdma_read_reg(qdev_dbg, 0x260);  /* GLBL_DSC_ERR_LOG1 — CIDX + SUB_TYPE + ERR_TYPE */
+			dsc_err_log2 = qdma_read_reg(qdev_dbg, 0x27C);  /* GLBL_DSC_ERR_LOG2 — old/new PIDX */
+
 			dev_err(&priv->pdev->dev,
 				"onic_sysdma: timeout waiting for cidx=%u (got %u, pidx=%u)\n",
 				expected_cidx, cidx, s->pidx);
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: h2c_mm_status=0x%08x err_code=0x%08x err_info=0x%08x\n",
+				mm_status, mm_err_code, mm_err_info);
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: dsc_err_sts=0x%08x log0=0x%08x log1=0x%08x log2=0x%08x\n",
+				dsc_err_sts, dsc_err_log0, dsc_err_log1, dsc_err_log2);
+			/* Decode the most informative bits.  ERR_STS bits per
+			 * eqdma_soft_reg.h:472–490; LOG1 ERR_TYPE per
+			 * GLBL_DSC_ERR_LOG1_ERR_TYPE_MASK = bits[4:0]. */
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: ERR_STS bits: poison=%u ur_ca=%u param=%u addr=%u tag=%u flr=%u timeout=%u dat_poison=%u flr_cancel=%u dma=%u dsc=%u rq_cancel=%u dbe=%u sbe=%u port_id=%u\n",
+				!!(dsc_err_sts & BIT(1)),  !!(dsc_err_sts & BIT(2)),
+				!!(dsc_err_sts & BIT(4)),  !!(dsc_err_sts & BIT(5)),
+				!!(dsc_err_sts & BIT(6)),  !!(dsc_err_sts & BIT(8)),
+				!!(dsc_err_sts & BIT(9)),  !!(dsc_err_sts & BIT(16)),
+				!!(dsc_err_sts & BIT(19)), !!(dsc_err_sts & BIT(20)),
+				!!(dsc_err_sts & BIT(21)), !!(dsc_err_sts & BIT(22)),
+				!!(dsc_err_sts & BIT(23)), !!(dsc_err_sts & BIT(24)),
+				!!(dsc_err_sts & BIT(25)));
+			dev_err(&priv->pdev->dev,
+				"onic_sysdma: LOG0 valid=%u sel=%u qid=%u | LOG1 cidx=%u sub_type=%u err_type=%u | LOG2 old_pidx=%u new_pidx=%u\n",
+				!!(dsc_err_log0 & BIT(31)),
+				!!(dsc_err_log0 & BIT(30)),
+				dsc_err_log0 & 0x1FFF,
+				(dsc_err_log1 >> 12) & 0xFFFF,
+				(dsc_err_log1 >> 5) & 0xF,
+				dsc_err_log1 & 0x1F,
+				(dsc_err_log2 >> 16) & 0xFFFF,
+				dsc_err_log2 & 0xFFFF);
+			/* Also dump first 8 bytes of wb_status. */
+			{
+				u8 *wb = (u8 *)s->wb_status;
+				dev_err(&priv->pdev->dev,
+					"onic_sysdma: wb_status raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					wb[0], wb[1], wb[2], wb[3], wb[4], wb[5], wb[6], wb[7]);
+			}
 			return -ETIMEDOUT;
 		}
 		cpu_relax();

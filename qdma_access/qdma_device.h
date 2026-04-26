@@ -27,6 +27,7 @@ struct qdma_dev {
 	u16 q_base;
 	u16 num_queues;
 	void __iomem *addr;	/* mappaed address of device registers */
+	bool is_child;		/* true: shares addr with parent, no iounmap on destroy */
 };
 
 /**
@@ -39,10 +40,24 @@ struct qdma_dev {
 struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, u8 bar);
 
 /**
+ * qdma_create_child_dev - Create a child QDMA device sharing the parent's iomap
+ * @parent: parent QDMA device whose BAR iomap and func_id are shared
+ * @q_base: queue ID offset for this child (absolute qid = q_base + relative qid)
+ *
+ * A child shares @parent->pdev, @parent->addr, and @parent->func_id.  It is
+ * intended for single-PF multi-CMAC designs where two net_devices must own
+ * distinct queue ranges within one QDMA function.  The parent writes the fmap
+ * context once for the combined range; children only use queue-context ops,
+ * which route via q_base.  Children must be destroyed before the parent.
+ **/
+struct qdma_dev *qdma_create_child_dev(struct qdma_dev *parent, u16 q_base);
+
+/**
  * qdma_destroy_dev - Destroy a QDMA device
  * @qdev: pointer to QDMA device
  *
  * The input pointer is checked.  So it is safe to pass in NULL pointers.
+ * For child devices, the shared BAR iomap is left intact (parent owns it).
  **/
 void qdma_destroy_dev(struct qdma_dev *qdev);
 

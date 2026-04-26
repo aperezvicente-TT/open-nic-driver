@@ -41,11 +41,32 @@ struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, u8 bar)
 	return qdev;
 }
 
+struct qdma_dev *qdma_create_child_dev(struct qdma_dev *parent, u16 q_base)
+{
+	struct qdma_dev *qdev;
+
+	if (!parent)
+		return NULL;
+
+	qdev = kzalloc(sizeof(struct qdma_dev), GFP_KERNEL);
+	if (!qdev)
+		return NULL;
+
+	qdev->pdev = parent->pdev;
+	qdev->func_id = parent->func_id;
+	qdev->addr = parent->addr;
+	qdev->q_base = q_base;
+	qdev->is_child = true;
+
+	return qdev;
+}
+
 void qdma_destroy_dev(struct qdma_dev *qdev)
 {
 	if (!qdev)
 		return;
 
-	pci_iounmap(qdev->pdev, qdev->addr);
+	if (!qdev->is_child)
+		pci_iounmap(qdev->pdev, qdev->addr);
 	kfree(qdev);
 }
