@@ -313,10 +313,44 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		goto clear_capacity;
 	}
 
+	/* B7-libqdma: register this PCI function with libqdma.  Master-PF
+	 * only — secondary CMAC shares the same QDMA engine through the
+	 * primary's qdma_dev_handle.  POLL_MODE + zero msix counts keep us
+	 * out of MSI-X allocation conflicts with our own onic_init_interrupt
+	 * path that runs immediately afterward. */
+	memset(&priv->qdma_dev_conf, 0, sizeof(priv->qdma_dev_conf));
+	priv->qdma_dev_conf.pdev               = pdev;
+	priv->qdma_dev_conf.bar_num_config     = 0;
+	priv->qdma_dev_conf.bar_num_user       = 2;
+	priv->qdma_dev_conf.bar_num_bypass     = -1;
+	priv->qdma_dev_conf.qsets_base         = priv->qid_base;
+	{
+		struct qdma_dev *legacy_qdev =
+			(struct qdma_dev *)priv->hw.qdma;
+		priv->qdma_dev_conf.qsets_max =
+			legacy_qdev ? legacy_qdev->num_queues : 64;
+	}
+	priv->qdma_dev_conf.master_pf          = 1;
+	priv->qdma_dev_conf.qdma_drv_mode      = POLL_MODE;
+	priv->qdma_dev_conf.msix_qvec_max      = 0;
+	priv->qdma_dev_conf.user_msix_qvec_max = 0;
+	priv->qdma_dev_conf.data_msix_qvec_max = 0;
+
+	rv = qdma_device_open(onic_drv_name, &priv->qdma_dev_conf,
+			      &priv->qdma_dev_handle);
+	if (rv != 0) {
+		dev_err(&pdev->dev,
+			"qdma_device_open failed (%d) — sysdma path unavailable\n",
+			rv);
+		priv->qdma_dev_handle = 0;
+		/* Non-fatal here: legacy netdev path doesn't need libqdma.
+		 * Sysdma init below will skip if handle is zero. */
+	}
+
 	rv = onic_init_interrupt(priv);
 	if (rv < 0) {
 		dev_err(&pdev->dev, "onic_init_interrupt (primary), err = %d", rv);
-		goto clear_hardware;
+		goto clear_qdma;
 	}
 
 	rv = onic_ernic_irq_setup(priv);
@@ -366,7 +400,11 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 
 clear_interrupt:
 	onic_clear_interrupt(priv);
-clear_hardware:
+clear_qdma:
+	if (priv->qdma_dev_handle) {
+		qdma_device_close(pdev, priv->qdma_dev_handle);
+		priv->qdma_dev_handle = 0;
+	}
 	onic_clear_hardware(priv);
 clear_capacity:
 	onic_clear_capacity(priv);
@@ -481,6 +519,16 @@ static void onic_teardown_netdev(struct onic_private *priv)
 
 	onic_ptp_cleanup(priv);
 	unregister_netdev(priv->netdev);
+
+	/* B7-libqdma: close libqdma's view of this PCI function before we
+	 * tear down the QDMA hardware; libqdma keeps internal state
+	 * (descriptor rings, queue contexts, xdev list) that must be
+	 * released while the BAR is still mapped.  Only the primary takes
+	 * a handle; secondary's slot is always zero so we skip it there. */
+	if (priv->qdma_dev_handle) {
+		qdma_device_close(priv->pdev, priv->qdma_dev_handle);
+		priv->qdma_dev_handle = 0;
+	}
 
 	onic_clear_hardware(priv);
 	onic_clear_capacity(priv);
@@ -696,19 +744,38 @@ static struct pci_driver pci_driver = {
 
 static int __init onic_init_module(void)
 {
+	int rv;
+
 	/* Build-time contract: per-CMAC queue stride must fit within the
 	 * per-netdev queue array.  If these diverge the plugin's tagged qid
 	 * won't have a matching sw_ctxt in the driver and packets drop. */
 	BUILD_BUG_ON(ONIC_PER_CMAC_QUEUES > ONIC_MAX_QUEUES);
 
 	pr_info("%s %s", onic_drv_str, onic_drv_ver);
-	return pci_register_driver(&pci_driver);
+
+	/* Initialise vendored AMD libqdma.  num_threads=0 + POLL_MODE keeps
+	 * qdma_request_submit() synchronous in our use (host-driven sysdma
+	 * path); RecoNIC mirrors this exact call pattern. */
+	rv = libqdma_init(0, NULL);
+	if (rv != 0) {
+		pr_err("%s: libqdma_init() failed (%d)\n", onic_drv_name, rv);
+		return rv;
+	}
+
+	rv = pci_register_driver(&pci_driver);
+	if (rv < 0) {
+		pr_err("%s: pci_register_driver failed (%d)\n",
+		       onic_drv_name, rv);
+		libqdma_exit();
+	}
+	return rv;
 }
 
 static void __exit onic_exit_module(void)
 {
 	pr_info("%s %s unloaded", onic_drv_str, onic_drv_ver);
 	pci_unregister_driver(&pci_driver);
+	libqdma_exit();
 }
 
 module_init(onic_init_module);
