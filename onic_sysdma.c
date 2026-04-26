@@ -106,29 +106,47 @@ static void onic_sysdma_pack_desc(struct qdma_mm_desc *d,
  *      descq_mm_n_h2c_cmpl_status()
  *      descq_poll_mm_n_h2c_cmpl_status()
  *
- *  Three integration options (rough effort estimates):
+ *  Implementation plan (DECIDED — see commit log for the pivot):
  *
- *    A) Full libqdma integration (2-3 days).  Vendor the entire library
- *       into open-nic-driver/.  Best long-term — AMD-tested and gets
- *       MM, descriptor bypass, indirect interrupts, mailbox, debugfs
- *       all working.  Cost: rename our cut-down qdma_access/ to avoid
- *       symbol conflicts; rework onic_hardware.c queue init to use
- *       libqdma APIs; risks regressions on netdev TX/RX.
+ *  Hand-roll the minimal MM submit path using libqdma as DOCUMENTATION,
+ *  not as a vendored library.  Reasoning:
  *
- *    B) Cherry-pick the MM submit path (1-1.5 days).  Copy
- *       qdma_descq.{c,h}, the relevant qdma_context.c bits, and their
- *       qdma_access dependencies into a new open-nic-driver/qdma_mm/
- *       subdir.  Strip dependencies on libqdma's broader infra
- *       (mailbox, indirect intr, debugfs).  Self-contained.  Cost:
- *       creates two QDMA libs in the driver (technical debt).
+ *    - libqdma is a monolithic driver, not a cherry-pickable component.
+ *      Transitive header closure of qdma_request_submit is 22 headers
+ *      and ~11K LoC across the core .c files (qdma_descq, qdma_context,
+ *      libqdma_export, qdma_device, qdma_regs, xdev, qdma_intr,
+ *      qdma_st_c2h).  Every "core" file pulls in 5-8 others.
  *
- *    C) Hand-write the MM submit path using libqdma as documentation
- *       (1-2 days).  Stay in our existing qdma_access framework, add
- *       MM helpers modelled after libqdma's qdma_descq_mm.c logic.
- *       Cost: more code to debug ourselves; less proven than (A)/(B).
+ *    - Our requirements are tiny compared to libqdma's surface area:
+ *      one MM queue, sync H2C, sync C2H, poll completions, no
+ *      PF/VF, no mailbox, no descriptor bypass, no indirect intr,
+ *      no debugfs.  Hand-rolling gives ~300-500 LoC; cherry-picking
+ *      would import most of libqdma anyway, with weeks of dependency-
+ *      untangling.
  *
- *  Recommendation: (B) for v1.  Bounded, doesn't disturb netdev path,
- *  can migrate to (A) once B7 is functionally proven.
+ *    - We already have qdma_access/qdma_register.h with the register
+ *      offsets we need.  Hand-rolling extends our existing minimal
+ *      framework rather than introducing a parallel one.
+ *
+ *  Concrete reference points in libqdma (read these when implementing):
+ *
+ *    H2C SW context format & programming:
+ *      qdma_context.c:make_qdma_descq_sw_ctxt + qdma_indirect_reg_write
+ *      qdma_descq.c:descq_h2c_pidx_update for doorbell
+ *
+ *    MM submit logic:
+ *      qdma_descq.c:descq_mm_proc_request (the request-to-descriptor
+ *      conversion) and qdma_request_submit() in libqdma_export.c
+ *
+ *    Completion polling:
+ *      qdma_descq.c:descq_mm_n_h2c_cmpl_status
+ *      qdma_descq.c:descq_poll_mm_n_h2c_cmpl_status
+ *
+ *    Indirect register access (used to program contexts):
+ *      qdma_access/qdma_access_common.c:qdma_indirect_reg_write
+ *      Registers: QDMA_OFFSET_IND_CTXT_DATA (0x804..0x814),
+ *                 QDMA_OFFSET_IND_CTXT_MASK (0x824..0x834),
+ *                 QDMA_OFFSET_IND_CTXT_CMD  (0x844)
  * ------------------------------------------------------------------------- */
 static int onic_sysdma_program_qctx(struct onic_private *priv,
 				    struct onic_sysdma_state *s)
