@@ -91,26 +91,44 @@ static void onic_sysdma_pack_desc(struct qdma_mm_desc *d,
 /* ------------------------------------------------------------------------- *
  *  QDMA queue context programming for MM mode.
  *
- *  TODO(b7-driver-2): the existing onic_qdma_init_tx_queue() in
- *  onic_hardware.c programs ST-mode context.  For MM we need to either:
- *    (a) Add an "mm_mode" parameter to onic_qdma_init_tx_queue and have
- *        it set the appropriate bits in the H2C SW context register.
- *    (b) Write a parallel onic_qdma_init_mm_queue() that mirrors the
- *        flow but with ST_MODE bit cleared and MM-specific fields.
+ *  Reference: AMD's open-source dma_ip_drivers / libqdma implements this
+ *  fully.  Path on this machine:
+ *      /home/alex/fpga-wksp/dma_ip_drivers/QDMA/linux-kernel/driver/libqdma/
  *
- *  Either way the interaction is with qdma_access/qdma_context.c, which
- *  has the low-level WR_CTXT/RD_CTXT primitives but no MM helper.
+ *  Key entry points in libqdma:
+ *      qdma_queue_add()       libqdma_export.h:1248  — config + register
+ *      qdma_queue_start()     libqdma_export.h:1277  — bring online
+ *      qdma_request_submit()  libqdma_export.h:1462  — submit DMA work
  *
- *  Open questions for that work:
- *   - Does the H2C MM engine share the same descriptor-ring base register
- *     (DSC_RING_BAR0) as ST mode, just with different mode bit?  Per PG302
- *     §3.7 the SW context format is the same; only "is_mm" bit differs.
- *   - Does CMPT ring need separate setup?  ST-mode CMPT format
- *     (qdma_c2h_cmpl) doesn't apply; H2C MM completions go to a
- *     dedicated CMPT ring with 8B entries (status + cidx).
- *   - Doorbell offset: H2C MM uses QDMA_OFFSET_H2C_MM_CONTROL (0x1204)
- *     for global enable, plus per-queue PIDX register at QDMA_DBA_BASE +
- *     qid * 0x10.  Same as ST.
+ *  Mode selection is qdma_queue_conf.st = 0 (MM) or 1 (ST).
+ *  The MM-specific submit logic lives in qdma_descq.c:
+ *      descq_mm_proc_request()
+ *      descq_mm_n_h2c_cmpl_status()
+ *      descq_poll_mm_n_h2c_cmpl_status()
+ *
+ *  Three integration options (rough effort estimates):
+ *
+ *    A) Full libqdma integration (2-3 days).  Vendor the entire library
+ *       into open-nic-driver/.  Best long-term — AMD-tested and gets
+ *       MM, descriptor bypass, indirect interrupts, mailbox, debugfs
+ *       all working.  Cost: rename our cut-down qdma_access/ to avoid
+ *       symbol conflicts; rework onic_hardware.c queue init to use
+ *       libqdma APIs; risks regressions on netdev TX/RX.
+ *
+ *    B) Cherry-pick the MM submit path (1-1.5 days).  Copy
+ *       qdma_descq.{c,h}, the relevant qdma_context.c bits, and their
+ *       qdma_access dependencies into a new open-nic-driver/qdma_mm/
+ *       subdir.  Strip dependencies on libqdma's broader infra
+ *       (mailbox, indirect intr, debugfs).  Self-contained.  Cost:
+ *       creates two QDMA libs in the driver (technical debt).
+ *
+ *    C) Hand-write the MM submit path using libqdma as documentation
+ *       (1-2 days).  Stay in our existing qdma_access framework, add
+ *       MM helpers modelled after libqdma's qdma_descq_mm.c logic.
+ *       Cost: more code to debug ourselves; less proven than (A)/(B).
+ *
+ *  Recommendation: (B) for v1.  Bounded, doesn't disturb netdev path,
+ *  can migrate to (A) once B7 is functionally proven.
  * ------------------------------------------------------------------------- */
 static int onic_sysdma_program_qctx(struct onic_private *priv,
 				    struct onic_sysdma_state *s)
