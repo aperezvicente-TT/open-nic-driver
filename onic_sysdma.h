@@ -81,6 +81,14 @@ int onic_ddr4_write(struct onic_private *priv, u64 dst_axi,
 int onic_ddr4_read(struct onic_private *priv, void *dst,
                    u64 src_axi, size_t len);
 
+/**
+ * onic_sysdma_self_test - Smoke-test the H2C MM path at probe.
+ * Writes a 64-byte pattern to DDR4 offset 0 and waits for completion.
+ * Doesn't verify the data — just exercises desc build, doorbell, and
+ * wb_status cidx advance end-to-end.  Returns 0 on success.
+ */
+int onic_sysdma_self_test(struct onic_private *priv);
+
 #define ONIC_SYSDMA_MAX_XFER       (1u << 20)   /* 1 MiB per call */
 
 #endif /* __ONIC_SYSDMA_H__ */

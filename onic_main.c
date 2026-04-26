@@ -353,6 +353,11 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 			 rv);
 		/* deliberately not goto-out: probe continues. */
 		rv = 0;
+	} else {
+		/* Smoke-test the H2C MM path with a 64-byte write.  Failure
+		 * is logged at error level but probe still succeeds; the
+		 * RDMA verbs themselves will return more specific errors. */
+		(void)onic_sysdma_self_test(priv);
 	}
 
 	netif_carrier_off(priv->netdev);

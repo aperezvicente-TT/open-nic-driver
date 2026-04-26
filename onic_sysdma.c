@@ -439,3 +439,49 @@ int onic_ddr4_read(struct onic_private *priv, void *dst,
 	(void)len;
 	return -EOPNOTSUPP;
 }
+
+/* ------------------------------------------------------------------------- *
+ *  Probe-time self-test
+ * ------------------------------------------------------------------------- */
+
+/**
+ * onic_sysdma_self_test - Smoke-test the H2C MM path with a tiny known write.
+ *
+ * Writes a 64-byte pattern to DDR4 AXI offset 0 and waits for completion.
+ * Doesn't verify the data landed (would need ddr4_read which is still a
+ * stub).  Just exercises descriptor build → doorbell → wb_status → cidx
+ * advance, end-to-end.  If the wb_status cidx never updates, the MM
+ * engine isn't actually consuming descriptors — most likely cause is
+ * QDMA H2C MM control register (0x1204) global enable not set.
+ *
+ * Called once at the end of onic_sysdma_init().  Failure is logged but
+ * non-fatal (init still returns 0 — RDMA path will fail later with a
+ * more specific error).
+ *
+ * Return: 0 on success, negative on probe-time test failure.
+ */
+int onic_sysdma_self_test(struct onic_private *priv)
+{
+	static const u8 pattern[64] = "ONIC_SYSDMA_PROBE_PATTERN_64B___v4_route_x_smoke_test_2026";
+	const u64 dst_axi_offset = 0x0;
+	int rv;
+
+	if (!priv || !priv->sysdma) {
+		return -ENODEV;
+	}
+
+	dev_info(&priv->pdev->dev,
+		 "onic_sysdma: self-test — writing 64 B to DDR4 @ 0x%llx\n",
+		 dst_axi_offset);
+
+	rv = onic_ddr4_write(priv, dst_axi_offset, pattern, sizeof(pattern));
+	if (rv) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: self-test FAILED: %d\n", rv);
+		return rv;
+	}
+
+	dev_info(&priv->pdev->dev,
+		 "onic_sysdma: self-test OK — H2C MM path operational\n");
+	return 0;
+}
