@@ -91,9 +91,51 @@ struct onic_qdma_h2c_sw_ctxt {
 };
 
 /* ------------------------------------------------------------------------ *
- *  H2C HW context, CMPT context — opaque structs, exposed only to the
- *  programmer below.  See libqdma eqdma_soft_access.c for full layouts.
+ *  H2C HW context layout (from eqdma_soft_reg.h HW_IND_CTXT_DATA_W*):
+ *
+ *  W0:  [31:16] CRD_USE   (credit usage — 0 for our use)
+ *       [15:0]  CIDX      (consumer index — initial 0)
+ *  W1:  [14:11] FETCH_PND (fetch pending — 0 initially)
+ *       [10]    EVT_PND   (event pending — 0)
+ *       [8]     DSC_PND   (descriptor pending — 0)
+ *
+ *  Nearly always programmed with all-zeros — HW updates these as DMA
+ *  proceeds.  We just need to make sure the context exists so HW can
+ *  update it.
  * ------------------------------------------------------------------------ */
+
+struct onic_qdma_h2c_hw_ctxt {
+	u16 cidx;
+	u16 crd_use;     /* credit-use counter; 0 in fcrd_en=0 mode */
+	u8  fetch_pnd;   /* 4-bit */
+	bool evt_pnd;
+	bool dsc_pnd;
+};
+
+/* ------------------------------------------------------------------------ *
+ *  Completion mechanism for MM mode: writeback-status (WBI), not CMPT ring.
+ *
+ *  When wbi_chk=1 in the SW context, QDMA writes a 8-byte status word
+ *  past the end of the descriptor ring (slot index = ring_size, just
+ *  after the last real descriptor) every time it completes a batch.
+ *  Layout:
+ *      [15:0]  pidx (advancing as descriptors are submitted)
+ *      [31:16] cidx (advancing as descriptors complete)
+ *      [bits beyond] error / overrun flags
+ *
+ *  We poll cidx >= our_pidx to detect completion.  No CMPT context
+ *  programming needed for MM mode — that's only used for ST C2H.
+ *
+ *  See libqdma qdma_descq.c:descq_mm_n_h2c_cmpl_status for the reference
+ *  read pattern.
+ * ------------------------------------------------------------------------ */
+
+struct onic_qdma_wb_status {
+	__le16 pidx;
+	__le16 cidx;
+	__le32 reserved;
+} __packed;
+
 
 /* ------------------------------------------------------------------------ *
  *  MM descriptor (32 bytes per PG302 v5.1 §5.1).
@@ -142,6 +184,21 @@ int onic_qdma_indirect_reg_write(void __iomem *csr_base,
  */
 void onic_qdma_pack_h2c_sw_ctxt(const struct onic_qdma_h2c_sw_ctxt *ctxt,
 				u32 data[ONIC_QDMA_IND_CTXT_NUM_REGS]);
+
+/**
+ * onic_qdma_pack_h2c_hw_ctxt - Pack an H2C HW context struct.
+ *   Almost always called with all-zero ctxt (HW initialises itself);
+ *   the call exists so the context slot exists post-clear.
+ */
+void onic_qdma_pack_h2c_hw_ctxt(const struct onic_qdma_h2c_hw_ctxt *ctxt,
+				u32 data[ONIC_QDMA_IND_CTXT_NUM_REGS]);
+
+/**
+ * onic_qdma_clear_ctxt - Clear (invalidate) a context slot.
+ *   Equivalent to indirect-write with op=CLR.
+ */
+int onic_qdma_clear_ctxt(void __iomem *csr_base,
+			 enum onic_qdma_ctxt_sel sel, u16 qid);
 
 /**
  * onic_qdma_pack_mm_desc - Pack src/dst/len into a 32-byte MM descriptor.

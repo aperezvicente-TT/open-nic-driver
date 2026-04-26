@@ -135,3 +135,61 @@ void onic_qdma_pack_h2c_sw_ctxt(const struct onic_qdma_h2c_sw_ctxt *ctxt,
 
 	/* W5..W7 = 0 (no PASID, no virtio) */
 }
+
+/* ------------------------------------------------------------------------ *
+ *  Pack an H2C HW context.  Layout (eqdma_soft_reg.h HW_IND_CTXT_DATA_W*):
+ *    W0 [31:16] CRD_USE  [15:0] CIDX
+ *    W1 [14:11] FETCH_PND  [10] EVT_PND  [8] DSC_PND
+ * ------------------------------------------------------------------------ */
+
+void onic_qdma_pack_h2c_hw_ctxt(const struct onic_qdma_h2c_hw_ctxt *ctxt,
+				u32 data[ONIC_QDMA_IND_CTXT_NUM_REGS])
+{
+	memset(data, 0, ONIC_QDMA_IND_CTXT_NUM_REGS * sizeof(u32));
+
+	data[0] = ((u32)(ctxt->crd_use & 0xFFFFu) << 16) |
+		  ((u32)(ctxt->cidx    & 0xFFFFu));
+
+	data[1] = ((u32)(ctxt->fetch_pnd & 0xFu) << 11) |
+		  (ctxt->evt_pnd ? BIT(10) : 0) |
+		  (ctxt->dsc_pnd ? BIT(8)  : 0);
+}
+
+/* ------------------------------------------------------------------------ *
+ *  Clear a context slot (used at queue teardown).  Same indirect-write
+ *  sequence but with op=CLR and no data payload.
+ * ------------------------------------------------------------------------ */
+
+int onic_qdma_clear_ctxt(void __iomem *csr_base,
+			 enum onic_qdma_ctxt_sel sel, u16 qid)
+{
+	u32 cmd, busy;
+	u16 i;
+	int rv;
+
+	if (!csr_base) {
+		return -EINVAL;
+	}
+
+	/* Data + mask not consulted by HW for CLR, but write zeros for
+	 * predictability. */
+	for (i = 0; i < ONIC_QDMA_IND_CTXT_NUM_REGS; i++) {
+		writel(0, csr_base + QDMA_OFFSET_IND_CTXT_DATA + (i * 4));
+		writel(0, csr_base + QDMA_OFFSET_IND_CTXT_MASK + (i * 4));
+	}
+
+	cmd = ((u32)qid << ONIC_QDMA_IND_CTXT_CMD_QID_SHIFT) |
+	      ((u32)ONIC_QDMA_CTXT_CMD_CLR << ONIC_QDMA_IND_CTXT_CMD_OP_SHIFT) |
+	      ((u32)sel << ONIC_QDMA_IND_CTXT_CMD_SEL_SHIFT);
+	writel(cmd, csr_base + QDMA_OFFSET_IND_CTXT_CMD);
+
+	rv = readl_poll_timeout(csr_base + QDMA_OFFSET_IND_CTXT_CMD,
+				busy,
+				(busy & ONIC_QDMA_IND_CTXT_CMD_BUSY_BIT) == 0,
+				10, 500 * 1000);
+	if (rv) {
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
