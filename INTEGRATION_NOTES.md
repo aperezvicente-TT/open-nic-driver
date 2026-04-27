@@ -152,3 +152,109 @@ Secondary's `clear_hardware:` label is unaffected (separate function).
 Plan's stopping condition was "module builds clean and is ready for the
 user to scp to the FPGA host."  Met.  No hardware run was attempted.
 See `TESTING.md` for the user's runbook.
+
+---
+
+# Option 3: BAR ownership refactor — 2026-04-27
+
+Branch:   `worktree-agent-a94cc7ba` (continued)
+Started:  2026-04-27 13:42 UTC
+Finished: 2026-04-27 13:50 UTC
+
+## Phases
+
+1. Revert Option 2 — `git revert 4f2dc17` (commit `ecbf2a9`).
+2. Add libqdma accessors `qdma_device_get_{config,user}_regs()` plus a
+   user-BAR ioremap inside `xdev_identify_bars` (commit `f78e150`).
+3. Refactor `qdma_legacy/qdma_device.{c,h}` to take a borrowed BAR 0
+   pointer; add `borrowed_addr` flag mirroring `is_child` to skip
+   iounmap on destroy (commit `40851eb`).
+4. Update `onic_hardware.c` to source `hw->addr` (BAR2 + SHELL_START)
+   and the BAR0 pointer from libqdma; drop the iounmap_bar2 cleanup
+   path and the BAR2 pci_iounmap in `onic_clear_hardware`
+   (commit `42186f9`).
+5. Update `onic_main.c`: drop pci_request_mem_regions /
+   pci_release_mem_regions / pci_disable_device redundancy, reorder
+   probe so qdma_device_open runs before onic_init_hardware, add
+   defensive checks (R1 + R8), reorder failure-label cascade, reorder
+   teardown so clear_hardware runs before qdma_device_close
+   (commit `77d6f92`).
+
+## Key architectural detail discovered
+
+The plan said "after the user-BAR ioremap" in xdev_map_bars, but
+libqdma's stock `xdev_map_bars` only ioremaps the *config* BAR.  The
+user (AXI Master Lite, BAR 2) BAR is referenced by number only and
+never mapped by libqdma itself.  I added the user-BAR ioremap inside
+`xdev_identify_bars` (after `bar_num_user` is identified) and the
+matching iounmap in `xdev_unmap_bars`.  This is a sensible extension
+of libqdma rather than a hack — the field, accessor, and ioremap all
+live behind libqdma's abstractions.
+
+## Teardown ordering subtlety
+
+Original plan put `qdma_device_close` BEFORE `onic_clear_hardware` in
+`onic_teardown_netdev`.  That doesn't work under Option 3 because
+`onic_clear_hardware` writes through `hw->addr` (the QDMA shell reset
+and `QDMA_FUNC_OFFSET_QCONF(0) = 0`), and `hw->addr` is borrowed from
+libqdma — once `qdma_device_close` iounmaps BAR 2, that pointer is
+dangling.  Reordered: `onic_clear_hardware` first (still has a valid
+mapping), then `qdma_device_close` (the iounmap point).  The same
+ordering inversion is reflected in the failure-label cascade in
+`onic_setup_primary`.
+
+## Probe failure path: pci_disable_device balance
+
+`qdma_device_close` itself calls `pci_disable_device`.  On the probe
+failure path, after `onic_setup_primary` partially unwinds (which may
+or may not have called `qdma_device_close` depending on how far it
+got), the outer `onic_probe` must avoid double-disabling.  Fix:
+`if (pci_is_enabled(pdev)) pci_disable_device(pdev)` after a failed
+setup_primary.  The earlier `goto disable_device` from the dma_set_mask
+failure remains an unconditional disable because pci_enable_device_mem
+just succeeded one line above.
+
+## Risk register status (Option 3 update)
+
+- R1 (bar_num_user): defensive check at probe step 4 fails fast if
+  libqdma reports anything other than 2.
+- R2 (qdma_device_close double-disable): handled — `onic_remove` no
+  longer calls `pci_disable_device`, and the probe failure path uses
+  `pci_is_enabled()` to gate.
+- R3 (double-mapping eliminated): legacy borrows BAR 0 via
+  `qdma_create_dev(pdev, bar0_regs)`.  Onic does not iomap BAR 2; it
+  borrows libqdma's mapping with a SHELL_START offset.
+- R4 (sysdma_fini before qdma_device_close): verified, unchanged.
+- R5 (POLL_MODE): unchanged.
+- R6 (mem regions only on AU200): unchanged — pci_request_regions in
+  libqdma is now the only claim.
+- R7 (rmmod warning eliminated): redundant calls removed.
+- R8 (qsets_max underflow): defensive check at probe step 5.
+- R9 (FMAP programmed twice): unchanged (harmless).
+- R10 (bar identification log): kept the existing libqdma `pr_info`
+  plus an added "AXI Master Lite BAR N mapped at PTR" line for
+  Option 3 verification.
+
+## Files changed (Option 3 only)
+
+- `libqdma/xdev.h` — add `user_regs` field.
+- `libqdma/xdev.c` — ioremap user BAR in `xdev_identify_bars`,
+  iounmap in `xdev_unmap_bars`, define accessors.
+- `libqdma/libqdma_export.h` — declare accessors.
+- `qdma_legacy/qdma_device.{c,h}` — borrow BAR 0 instead of mapping.
+- `onic_hardware.c` — source BAR pointers from libqdma; drop
+  iounmap_bar2 path.
+- `onic_main.c` — drop pci_request/release/disable redundancy;
+  reorder probe + teardown; add defensive checks.
+
+## Build artifact
+
+`onic.ko` — 14 MB, zero compile warnings (one stock kernel notice
+"compiler differs" is host-environment unrelated).  Build log:
+`/tmp/option3_build.log`.
+
+## Stopping condition
+
+Plan's stopping condition was "Final clean build: clean, similar size
+.ko (~14 MB)."  Met.  No hardware run attempted; that is the user's
+job per the plan.

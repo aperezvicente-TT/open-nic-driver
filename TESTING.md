@@ -1,6 +1,11 @@
-# Testing the libqdma-vendored onic.ko
+# Testing the libqdma-vendored onic.ko (Option 3 BAR ownership)
 
 Built on the dev host; needs to be scp'd to the FPGA host and insmod'd.
+
+This build implements the canonical RecoNIC BAR-ownership pattern:
+**libqdma is the sole owner of the PCIe BAR claims and ioremaps**;
+onic borrows BAR pointers via `qdma_device_get_{config,user}_regs()`.
+This replaces the temporary Option 2 release-the-claim hack.
 
 ## 1. Copy artifacts
 
@@ -37,11 +42,23 @@ What you should see (in order):
 ```
 onic: OpenNIC Linux Kernel Driver ...
 onic: device is a master PF
+onic: <name>: AXI Master Lite BAR 2 mapped at <ptr> (len=...)   <- new in Option 3
 onic: ...   (other init lines: hardware, interrupt, ernic, register_netdev)
 onic: onic_sysdma: ready via libqdma (h2c=<h> c2h=<c> staging_dma=0x... max_xfer=1048576)
 onic: onic_sysdma: self-test - writing 64 B to DDR4 @ 0x0 (libqdma)
 onic: onic_sysdma: self-test OK - H2C+C2H round-trip verified (libqdma)
 ```
+
+What you should NOT see anymore (was an Option 2 artifact):
+
+```
+onic 0000:01:00.0: pci_release_mem_regions: ...   <- absent under Option 3
+```
+
+On rmmod, the Option 2 build emitted a benign warning about a redundant
+`pci_disable_device`; under Option 3 that warning is gone because
+`qdma_device_close` is the sole caller and `onic_remove` no longer makes
+the redundant call.
 
 If the read-back passes, the host->DDR4 path is correct end-to-end.
 This is the regression we were chasing with the hand-rolled MM submit:
@@ -62,9 +79,23 @@ sudo lspci -vvv -s <bdf> | head -80
 Likely failure modes and what they mean:
 
 - `qdma_device_open() failed: -EBUSY/-ENODEV` — libqdma can't claim the
-  PCI function.  Usually means the legacy qdma_legacy/ path also opened
-  it.  Check that `priv->hw.qdma` was set up before
-  `qdma_device_open` was called (it should be — see onic_setup_primary).
+  PCI function.  Under Option 3 onic should NEVER hold the BAR claim
+  itself.  Verify that no `pci_request_mem_regions` call survived in
+  the source (`grep pci_request onic_main.c` should return nothing).
+  Also: if the kernel module load order ever puts another driver that
+  binds the same BDF first, libqdma's claim will fail here.
+
+- `libqdma reports user BAR N, expected 2 — refusing to bind` — the
+  defensive check at probe step 4 fired.  R1 in the design plan.
+  Inspect the shell's `qdma_get_user_bar` CSR; if the design genuinely
+  uses a different user BAR, update the constant in `onic_setup_primary`
+  (and the `SHELL_START` offset will likely move too).
+
+- `libqdma reports qsets_max=N, need >= 32 for sysdma — refusing to bind`
+  — the defensive check at probe step 5 fired (R8).  Either the shell
+  exposes too few queues, or libqdma's resource manager reduced the
+  available range.  sysdma's self-test uses qid 31; widening to 32 or
+  more is the only way forward.
 
 - `qdma_queue_add(H2C) failed (-EINVAL): ...` — qsets_max in
   qdma_dev_conf is smaller than ONIC_SYSDMA_REL_QID (31).
