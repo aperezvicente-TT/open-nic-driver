@@ -357,3 +357,68 @@ values rather than the legacy override.
 - Did NOT add `pci_request_mem_regions` back.  libqdma is the BAR owner.
 - Did NOT touch the sysdma path.  `qdma_queue_add`, `qdma_request_submit`,
   the self-test — unchanged.
+
+## 8. Legacy ST H2C descriptor SOP/EOP fix (2026-04-26)
+
+After the Option 3 + perf_opt fixes the QDMA-core CSRs were correct but
+ST TX still produced `stat_tx_total_pkts = 0` at the CMAC under ping
+traffic, even though the driver-side ifconfig TX counter incremented
+normally.  Diagnostic chain:
+
+1. CMAC counters frozen at 0 ⇒ frames never reach the CMAC TX FIFO.
+2. QDMA H2C-engine debug counters showed descriptors fetched and
+   completions written ⇒ QDMA itself was running.
+3. Comparison of the legacy `qdma_pack_h2c_st_desc()` byte layout
+   against libqdma's reference `struct qdma_h2c_desc` (in
+   `libqdma/qdma_regs.h`) showed bytes 6-7 — where libqdma writes the
+   `flags` field, including `S_H2C_DESC_F_SOP` (=1) and
+   `S_H2C_DESC_F_EOP` (=2) — were left as compiler padding (zero) by
+   the legacy struct/packer.
+4. EQDMA5 Soft IP requires SOP|EOP on every single-descriptor frame.
+   With both bits clear the IP silently drops the frame between QDMA
+   and CMAC.
+
+### Fix
+
+In `qdma_legacy/qdma_export.h`:
+- Replace the 16-bit compiler padding in `struct qdma_h2c_st_desc`
+  with a named `u16 flags` field at the same offset (bytes 6-7).
+- Add `QDMA_H2C_ST_DESC_F_SOP`/`_EOP` (BIT(0)/BIT(1)) and
+  `QDMA_H2C_ST_DESC_DW0_FLAGS_MASK` (bits 63:48 of DW0).  Bit
+  positions match libqdma's `S_H2C_DESC_F_SOP`/`_EOP` macros.
+
+In `qdma_legacy/qdma_export.c::qdma_pack_h2c_st_desc()`:
+- OR `SOP|EOP` into the caller-supplied `flags` and pack the result
+  into bits 63:48 of DW0.  Set unconditionally because every netdev
+  TX frame on this driver is a single descriptor (caller in
+  `onic_xmit_frame` / `onic_xmit_xdp_ring` always writes one
+  descriptor per skb/xdp_frame).
+
+DW0 layout (LE on x86 / PCIe):
+
+```
+bits  [31: 0]  metadata
+bits  [47:32]  len
+bits  [63:48]  flags    <-- bit 0 = SOP, bit 1 = EOP  (was zero padding)
+DW1   [63: 0]  src_addr
+```
+
+### Files changed
+
+- `qdma_legacy/qdma_export.h` — add named `flags` field; add
+  `QDMA_H2C_ST_DESC_F_SOP/_EOP` and `_FLAGS_MASK` macros.
+- `qdma_legacy/qdma_export.c` — pack `flags | SOP | EOP` into DW0
+  bits 63:48.
+- `INTEGRATION_NOTES.md` — this section.
+- `TESTING.md` — concrete post-fix expectation: ping succeeds and
+  `stat_tx_total_pkts` increments.
+
+### What we did NOT do
+
+- Did NOT modify libqdma sources — fix is in `qdma_legacy/` only,
+  matching the constraint that libqdma stays vendored verbatim.
+- Did NOT touch sysdma — sysdma uses libqdma's `qdma_request_submit`
+  which goes through `struct qdma_h2c_desc` and already sets SOP/EOP
+  correctly when needed (`libqdma/qdma_descq.c`, ~line 632).
+- Did NOT change the callers in `onic_netdev.c`.  They leave
+  `desc.flags = 0` (default-init); the packer ORs SOP|EOP in.

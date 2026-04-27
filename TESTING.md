@@ -194,3 +194,53 @@ eqdma_set_perf_opt` during probe (libqdma's QDMA5 perf init ran), and
 that no driver code is writing to `0x250 / 0xB08 / 0xE24` after
 that.  `git log -- onic_hardware.c | head` should show the
 "ST datapath fix" commit applied.
+
+## 8. ST H2C SOP/EOP descriptor fix verification (post-`qdma_legacy` patch)
+
+After applying the `qdma_legacy: set SOP|EOP on ST H2C descriptors for
+EQDMA5` commit, both halves of the ST datapath (QDMA-core CSRs from
+section 7, *and* per-descriptor SOP/EOP from this fix) are in place.
+Run the same procedure as section 7 with these stricter pass criteria:
+
+```bash
+sudo ip addr add 10.0.0.1/24 dev enp1s0
+sudo ip addr add 10.0.0.2/24 dev enp1s0d1
+sudo ip link set enp1s0 up
+sudo ip link set enp1s0d1 up
+
+# Snapshot
+sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts
+
+# Generate traffic — ping MUST succeed end-to-end now
+ping -c 10 10.0.0.2
+
+# Snapshot
+sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts
+sudo ethtool -S enp1s0    | grep stat_rx_total_pkts
+```
+
+PASS criteria (concrete, post SOP/EOP fix):
+
+- `ping -c 10` reports 0% packet loss.
+- `sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts` returns a
+  NONZERO value and increments by ≥10 across the ping run (every TX
+  descriptor now has SOP|EOP, so EQDMA5 forwards each frame to the
+  CMAC instead of dropping it).
+- `sudo ethtool -S enp1s0   | grep stat_rx_total_pkts` increments by
+  ≥10 on the receiving side.
+- Driver `ifconfig enp1s0d1` TX counter and `stat_tx_total_pkts` both
+  increment, and by the same amount.
+
+FAIL signature for THIS fix specifically:
+
+- Driver TX counter increments, `stat_tx_total_pkts` still 0:
+  the SOP/EOP bits aren't reaching the descriptor.  Confirm the
+  packer change with:
+
+  ```bash
+  grep -n "QDMA_H2C_ST_DESC_F_SOP\|QDMA_H2C_ST_DESC_DW0_FLAGS_MASK" \
+      qdma_legacy/qdma_export.c qdma_legacy/qdma_export.h
+  ```
+
+  Both files should reference the macros; `qdma_export.c` should OR
+  `SOP|EOP` and `FIELD_SET` them into DW0.
