@@ -28,16 +28,21 @@ struct qdma_dev {
 	u16 num_queues;
 	void __iomem *addr;	/* mappaed address of device registers */
 	bool is_child;		/* true: shares addr with parent, no iounmap on destroy */
+	bool borrowed_addr;	/* true: addr was borrowed from libqdma, no iounmap on destroy */
 };
 
 /**
- * qdma_create_dev - Create a QDMA device
+ * qdma_create_dev - Create a QDMA device using a borrowed BAR 0 mapping
  * @pdev: pointer to PCI device
- * @bar: BAR number for QDMA registers
+ * @bar0_regs: ioremap pointer for BAR 0 (config), borrowed from libqdma via
+ *             qdma_device_get_config_regs().  Must be non-NULL.  The legacy
+ *             qdma_dev keeps a copy of this pointer for its register pokes
+ *             but does NOT own the mapping — qdma_destroy_dev will not
+ *             iounmap it.
  *
- * Return a pointer to the created QDMA devcie, or NULL on failure
+ * Return a pointer to the created QDMA device, or NULL on failure.
  **/
-struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, u8 bar);
+struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, void __iomem *bar0_regs);
 
 /**
  * qdma_create_child_dev - Create a child QDMA device sharing the parent's iomap

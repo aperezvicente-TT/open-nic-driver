@@ -16,12 +16,12 @@
  */
 #include "qdma_device.h"
 
-struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, u8 bar)
+struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, void __iomem *bar0_regs)
 {
 	struct qdma_dev *qdev;
 
-	if (bar > 6) {
-		dev_err(&pdev->dev, "Bad BAR number %d", bar);
+	if (!bar0_regs) {
+		dev_err(&pdev->dev, "qdma_create_dev: NULL bar0_regs");
 		return NULL;
 	}
 
@@ -32,11 +32,12 @@ struct qdma_dev *qdma_create_dev(struct pci_dev *pdev, u8 bar)
 	qdev->pdev = pdev;
 	qdev->func_id = PCI_FUNC(pdev->devfn);
 
-	qdev->addr = pci_iomap(pdev, bar, pci_resource_len(pdev, bar));
-	if (!qdev->addr) {
-		kfree(qdev);
-		return NULL;
-	}
+	/* Borrow libqdma's BAR 0 ioremap.  We do NOT pci_iomap here, since
+	 * libqdma already holds the PCI region claim (pci_request_regions in
+	 * qdma_device_open).  Marking borrowed_addr makes qdma_destroy_dev
+	 * skip the matching iounmap. */
+	qdev->addr = bar0_regs;
+	qdev->borrowed_addr = true;
 
 	return qdev;
 }
@@ -66,7 +67,9 @@ void qdma_destroy_dev(struct qdma_dev *qdev)
 	if (!qdev)
 		return;
 
-	if (!qdev->is_child)
+	/* Children share the parent's addr; borrowed devices share libqdma's
+	 * mapping.  In both cases we have no iomap to release here. */
+	if (!qdev->is_child && !qdev->borrowed_addr)
 		pci_iounmap(qdev->pdev, qdev->addr);
 	kfree(qdev);
 }
