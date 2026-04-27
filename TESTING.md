@@ -139,3 +139,58 @@ shell teardown.
   drop -DMBOX_INTERRUPT_DISABLE from the Makefile and rebuild.  We set
   that to match RecoNIC because we run libqdma in poll mode; in
   interrupt mode libqdma also pulls in mailbox handlers.
+
+## 7. ST netdev datapath verification (post-Option 3 ST regression fix)
+
+After the Option 3 BAR ownership refactor, ST-mode TX/RX appeared to
+work at the driver level (driver-side counters incremented) but the
+QDMA→CMAC and CMAC→QDMA datapaths silently dropped traffic.  Driver
+ifconfig counters alone are NOT sufficient to confirm ST is working —
+they count packets the driver pushed/pulled at QDMA, not what the CMAC
+actually transmitted/received on the wire.
+
+The ST-regression fix (delete legacy `onic_qdma_init_csr`, align pool
+tables to libqdma values) restores correct QDMA-core CSR programming.
+Verify it on hardware as follows:
+
+```bash
+# 1. Configure both interfaces
+sudo ip addr add 10.0.0.1/24 dev enp1s0
+sudo ip addr add 10.0.0.2/24 dev enp1s0d1
+sudo ip link set enp1s0 up
+sudo ip link set enp1s0d1 up
+
+# 2. Snapshot CMAC counters BEFORE traffic
+sudo ethtool -S enp1s0 | grep -E 'stat_(tx|rx)_total_pkts'
+
+# 3. Generate traffic (ping, or a short iperf3 burst)
+ping -c 10 10.0.0.2
+
+# 4. Snapshot CMAC counters AFTER traffic
+sudo ethtool -S enp1s0    | grep -E 'stat_(tx|rx)_total_pkts'
+sudo ethtool -S enp1s0d1  | grep -E 'stat_(tx|rx)_total_pkts'
+```
+
+PASS criteria:
+
+- `stat_tx_total_pkts` MUST increment by ~10 on the side that sent the
+  pings (driver pushed → CMAC transmitted on the wire).
+- `stat_rx_total_pkts` MUST increment by ~10 on the side that received
+  them (CMAC pulled from the wire → driver delivered to NAPI).
+- `ifconfig` / `ip -s link show` packet counters MUST also increment
+  on both sides.
+
+FAIL signature (the regression we fixed):
+
+- Driver `ifconfig` TX counter increments but `stat_tx_total_pkts`
+  stays at 0 — packets never crossed the QDMA→CMAC boundary.
+- `stat_rx_total_pkts` increments under cable traffic but driver RX
+  counter stays at 0 — CMAC saw packets but they never crossed
+  CMAC→QDMA→NAPI.
+
+If either FAIL signature appears: re-check that
+`eqdma_set_perf_opt: reg = 0x...` lines appear in `dmesg | grep
+eqdma_set_perf_opt` during probe (libqdma's QDMA5 perf init ran), and
+that no driver code is writing to `0x250 / 0xB08 / 0xE24` after
+that.  `git log -- onic_hardware.c | head` should show the
+"ST datapath fix" commit applied.

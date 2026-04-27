@@ -258,3 +258,102 @@ just succeeded one line above.
 Plan's stopping condition was "Final clean build: clean, similar size
 .ko (~14 MB)."  Met.  No hardware run attempted; that is the user's
 job per the plan.
+
+## ST datapath regression after Option 3 — diagnosis and fix (2026-04-26)
+
+### Symptom (verified on hardware after `2a16bb1`)
+
+For both netdev interfaces (enp1s0, enp1s0d1):
+
+| Path | Driver counter | CMAC ethtool counter            |
+|------|----------------|----------------------------------|
+| TX   | 37 packets     | 0  (`stat_tx_total_pkts: 0`)    |
+| RX   | 0  packets     | 70 (`stat_rx_total_pkts: 70`)   |
+
+Sysdma (MM-mode) self-test passes — QDMA engine itself is alive.  Only
+the streaming (ST-mode) netdev datapath was broken.
+
+### Root cause
+
+Option 3 made libqdma the BAR owner and required `qdma_device_open` to
+run BEFORE `onic_init_hardware`.  `qdma_device_open` invokes
+`eqdma_set_default_global_csr()` which programs the QDMA core's global
+CSR pool tables (rng_sz / c2h_buf_sz / c2h_timer_cnt / c2h_cnt_th) and,
+for EQDMA5, calls `eqdma_set_perf_opt()` which carefully tunes 14
+performance/throttling registers (visible as `eqdma_set_perf_opt: reg
+= 0x...` lines in dmesg).
+
+Then `onic_init_hardware_master()` ran legacy
+`onic_qdma_init_csr(qdev)` which re-programmed the SAME global CSR
+pools with QDMA4-style values AND directly clobbered three of the
+EQDMA5 perf_opt registers:
+
+- `0x250` GLBL_DSC_CFG       — overwritten with legacy value
+- `0xB08` C2H_PFCH_CFG       — overwritten (also computed from
+  `0xBE0` cache-depth using QDMA4-style field layout)
+- `0xE24` H2C_REQ_THROT      — overwritten with legacy value
+- `0xB50` C2H_WB_COAL_CFG    — overwritten
+- `0x204…0x240` GLBL_RNG_SZ pool — overwritten with off-by-one values
+- `0xA00…` C2H timer pool    — overwritten
+- `0xA40…` C2H counter-th pool — overwritten
+- `0xAB0…` C2H buffer-size pool — overwritten
+
+The result: ST-mode queue contexts written by the driver indexed pool
+entries with the wrong sizes, and EQDMA5's perf_opt landed in a hybrid
+state that caused TX descriptors to land in QDMA but never advance to
+CMAC, and CMAC RX completions to never propagate up.  MM-mode sysdma
+is permissive enough to tolerate the mis-tuned perf_opt and uses a
+single fixed-size descriptor ring, so it kept working.
+
+The previous probe order (libqdma after onic) made the legacy CSR
+init "win" the race and ST happened to work — by accident, on values
+that happened to match QDMA4-era expectations for that shell.
+
+### Fix chosen — Fix A (delete the redundant CSR init)
+
+`onic_qdma_init_csr()` and its call site are removed.  All registers
+it touched are programmed by libqdma's `eqdma_set_default_global_csr`
+(BEFORE `onic_init_hardware_master` runs, per Option 3 ordering).
+
+The driver-side ring/buffer/timer/counter pool tables in `onic_hardware.c`
+are re-aligned to match libqdma's defaults so that per-queue
+`rngsz_idx` / `bufsz_idx` etc. address the same hardware sizes the
+driver allocates DMA rings for:
+
+```
+rngcnt_pool[0] = 2049  (was 4096)  — match libqdma rng_sz[0]
+c2h_timer_pool = {1,2,4,...}       — match libqdma tmr_cnt
+c2h_thres_pool = {2,4,8,16,...}    — match libqdma cnt_th
+c2h_bufsz_pool                     — already matched libqdma buf_sz
+```
+
+Fix B (reorder shell reset before `qdma_device_open`) was not needed:
+the only "shell reset" in `onic_init_hardware_master` is
+`onic_reset_cmac_shell` which targets shell-only registers
+(SYSCFG_OFFSET_SHELL_RESET) that libqdma never touches.  The
+QDMA-shell reset that DOES run before libqdma's perf_opt is internal
+to libqdma's own bring-up and does not clobber perf_opt.
+
+Sysdma's MM round-trip is preserved logically: `qdma_queue_add` /
+`qdma_request_submit` are unaffected by deleting `onic_qdma_init_csr`
+because libqdma was already programming the same registers (and
+correctly).  If anything, sysdma is now using the canonical libqdma
+values rather than the legacy override.
+
+### Files changed
+
+- `onic_hardware.c` — delete `onic_qdma_init_csr()` and its call
+  site; re-align pool tables to libqdma defaults; long comment in
+  the pool-table block explains the contract.
+- `INTEGRATION_NOTES.md` — this section.
+- `TESTING.md` — add ethtool counter check (TX/RX counters must
+  increment under traffic, not just driver counters).
+
+### What we did NOT do
+
+- Did NOT revert Option 3's BAR ownership.  `qdma_device_get_user_regs`,
+  `qdma_device_get_config_regs`, the new probe ordering, the
+  `pci_request_mem_regions` removal — all preserved.
+- Did NOT add `pci_request_mem_regions` back.  libqdma is the BAR owner.
+- Did NOT touch the sysdma path.  `qdma_queue_add`, `qdma_request_submit`,
+  the self-test — unchanged.
