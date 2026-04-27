@@ -489,6 +489,10 @@ int xdev_check_hndl(const char *fname, struct pci_dev *pdev, unsigned long hndl)
  *****************************************************************************/
 static void xdev_unmap_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 {
+	if (xdev->user_regs) {
+		pci_iounmap(pdev, xdev->user_regs);
+		xdev->user_regs = NULL;
+	}
 	if (xdev->regs) {
 		/* unmap BAR */
 		pci_iounmap(pdev, xdev->regs);
@@ -603,6 +607,31 @@ static int xdev_identify_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 						xdev->conf.bar_num_bypass);
 					break;
 				}
+			}
+		}
+
+		/* ioremap the AXI Master Lite (user) BAR so consumers like the
+		 * onic driver can borrow a single mapping via
+		 * qdma_device_get_user_regs() instead of taking an independent
+		 * pci_iomap() that would conflict with libqdma's PCI region
+		 * claim.  Skipped on SR-IOV/no-user-bar designs. */
+		if (xdev->conf.bar_num_user >= 0 &&
+		    xdev->conf.bar_num_user < QDMA_BAR_NUM) {
+			int ubar = xdev->conf.bar_num_user;
+			resource_size_t ulen = pci_resource_len(pdev, ubar);
+
+			if (ulen) {
+				xdev->user_regs = pci_iomap(pdev, ubar, ulen);
+				if (!xdev->user_regs) {
+					pr_err("%s: unable to map user bar %d (len=%llu)\n",
+					       xdev->conf.name, ubar,
+					       (unsigned long long)ulen);
+					return -ENOMEM;
+				}
+				pr_info("%s: AXI Master Lite BAR %d mapped at %p (len=%llu)\n",
+					xdev->conf.name, ubar,
+					xdev->user_regs,
+					(unsigned long long)ulen);
 			}
 		}
 	}
@@ -1272,6 +1301,29 @@ int qdma_device_close(struct pci_dev *pdev, unsigned long dev_hndl)
 	kfree(xdev);
 
 	return 0;
+}
+
+/*****************************************************************************/
+/**
+ * qdma_device_get_config_regs() - return libqdma's BAR-config ioremap
+ * qdma_device_get_user_regs()   - return libqdma's AXI Master Lite ioremap
+ *
+ * Pointers are owned by libqdma; consumers borrow them and must NOT iounmap.
+ * Lifetime ends at qdma_device_close().  Returns NULL if @dev_hndl is invalid
+ * or the corresponding BAR was not mapped.
+ *****************************************************************************/
+void __iomem *qdma_device_get_config_regs(unsigned long dev_hndl)
+{
+	struct xlnx_dma_dev *xdev = (struct xlnx_dma_dev *)dev_hndl;
+
+	return xdev ? xdev->regs : NULL;
+}
+
+void __iomem *qdma_device_get_user_regs(unsigned long dev_hndl)
+{
+	struct xlnx_dma_dev *xdev = (struct xlnx_dma_dev *)dev_hndl;
+
+	return xdev ? xdev->user_regs : NULL;
 }
 
 /*****************************************************************************/

@@ -284,6 +284,10 @@ struct xlnx_dma_dev {
 #endif
 	/**< PCIe config. bar */
 	void __iomem *regs;
+	/**< ioremap of bar_num_user; populated by xdev_map_bars.
+	 *   Exposed via qdma_device_get_user_regs() so consumers (onic) can
+	 *   borrow a single mapping instead of double-ioremaping BAR 2. */
+	void __iomem *user_regs;
 	/**< number of MSI-X interrupt vectors per device */
 	int num_vecs;
 	/**< msix_entry list for all MSIx vectors associated for device */

@@ -901,6 +901,20 @@ int qdma_device_open(const char *mod_name, struct qdma_dev_conf *conf,
 
 /*****************************************************************************/
 /**
+ * qdma_device_get_config_regs() - return the BAR-config ioremap pointer
+ * qdma_device_get_user_regs()   - return the AXI Master Lite (user) ioremap
+ *
+ * Both pointers are owned by libqdma; consumers must NOT iounmap.  Lifetime
+ * is bounded by qdma_device_close().  Returns NULL if @dev_hndl is invalid
+ * or the corresponding BAR was not mapped (e.g. user BAR absent on VF/SR-IOV).
+ *
+ * @param dev_hndl	handle returned from qdma_device_open()
+ *****************************************************************************/
+void __iomem *qdma_device_get_config_regs(unsigned long dev_hndl);
+void __iomem *qdma_device_get_user_regs(unsigned long dev_hndl);
+
+/*****************************************************************************/
+/**
  * Prepare fpga for removal: disable all interrupts (users
  * and qdma) and release all resources.This API should be called from remove()
  *
