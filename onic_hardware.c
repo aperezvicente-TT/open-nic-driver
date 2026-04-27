@@ -23,6 +23,7 @@
 #include "qdma_register.h"
 #include "qdma_context.h"
 #include "qdma_error_info.h"
+#include "libqdma/libqdma_export.h"
 
 /* default CSR values for QDMA */
 #define DEFAULT_MAX_DESC_FETCH			6
@@ -261,20 +262,46 @@ static int onic_init_hardware_master(struct onic_private *priv)
 	struct pci_dev *pdev = priv->pdev;
 	struct qdma_dev *qdev;
 	struct qdma_fmap_ctxt fmap_ctxt;
+	void __iomem *bar0_regs;
+	void __iomem *bar2_regs;
 	u16 qmax, total_qmax;
 	u32 val;
 	int i, rv;
 
-	/* shell registers use BAR-2 */
-	hw->addr = pci_iomap_range(pdev, 2, SHELL_START, SHELL_MAXLEN);
-	if (!hw->addr)
+	/* Option 3: libqdma owns the BAR claims and ioremaps.  We must run
+	 * after qdma_device_open so priv->qdma_dev_handle is valid, and we
+	 * borrow both BAR pointers from libqdma instead of ioremaping them
+	 * ourselves.  Anything else would re-introduce the BAR conflict. */
+	if (!priv->qdma_dev_handle) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: qdma_dev_handle not set — qdma_device_open must run first");
 		return -EINVAL;
+	}
 
-	/* QDMA IP registers use BAR-0 */
-	qdev = qdma_create_dev(pdev, 0);
+	bar2_regs = qdma_device_get_user_regs(priv->qdma_dev_handle);
+	if (!bar2_regs) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: libqdma did not map user (BAR2) — design must expose it");
+		return -EINVAL;
+	}
+	/* hw->addr is the shell-register window, which lives at SHELL_START
+	 * inside BAR 2.  libqdma maps the whole BAR; we offset into it. */
+	hw->addr = bar2_regs + SHELL_START;
+
+	bar0_regs = qdma_device_get_config_regs(priv->qdma_dev_handle);
+	if (!bar0_regs) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: libqdma did not map config (BAR0)");
+		hw->addr = NULL;
+		return -EINVAL;
+	}
+
+	/* QDMA IP registers use BAR-0 — borrow libqdma's mapping */
+	qdev = qdma_create_dev(pdev, bar0_regs);
 	if (!qdev) {
 		rv = -ENOMEM;
-		goto iounmap_bar2;
+		hw->addr = NULL;
+		return rv;
 	}
 	hw->qdma = (unsigned long)qdev;
 
@@ -338,10 +365,6 @@ static int onic_init_hardware_master(struct onic_private *priv)
 
 clear_hardware:
 	onic_clear_hardware(priv);
-	return rv;
-iounmap_bar2:
-	pci_iounmap(pdev, hw->addr);
-	hw->addr = NULL;
 	return rv;
 }
 
@@ -441,8 +464,10 @@ void onic_clear_hardware(struct onic_private *priv)
 
 	if (master_pf) {
 		/* Runs after all secondaries have torn down.  Reset the QDMA
-		 * DMA engine, clear the single fmap entry, and release the
-		 * BAR2 iomap that children shared. */
+		 * DMA engine and clear the single fmap entry.  BAR0 / BAR2
+		 * mappings are owned by libqdma (Option 3) — qdma_destroy_dev
+		 * frees only the legacy wrapper, qdma_device_close in the
+		 * caller will iounmap. */
 		rv = onic_shell_qdma_reset(hw);
 		if (rv)
 			dev_warn(&pdev->dev,
@@ -450,8 +475,7 @@ void onic_clear_hardware(struct onic_private *priv)
 
 		onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(0), 0);
 		qdma_invalidate_fmap_ctxt(qdev);
-		qdma_destroy_dev(qdev); /* not a child — iounmaps BAR0 */
-		pci_iounmap(pdev, hw->addr); /* BAR2 */
+		qdma_destroy_dev(qdev); /* borrowed BAR0 — no iounmap here */
 	} else {
 		/* Slave: free the child qdma_dev wrapper only.  Parent iomap
 		 * is still owned by primary, and the shell-slot registers
