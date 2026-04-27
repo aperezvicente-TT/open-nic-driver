@@ -307,29 +307,23 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		goto free_netdev;
 	}
 
-	rv = onic_init_hardware(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_init_hardware (primary), err = %d", rv);
-		goto clear_capacity;
-	}
-
-	/* B7-libqdma: register this PCI function with libqdma.  Master-PF
-	 * only — secondary CMAC shares the same QDMA engine through the
-	 * primary's qdma_dev_handle.  POLL_MODE + zero msix counts keep us
-	 * out of MSI-X allocation conflicts with our own onic_init_interrupt
-	 * path that runs immediately afterward. */
+	/* Option 3: libqdma owns the PCI BARs.  qdma_device_open MUST run
+	 * BEFORE onic_init_hardware, because onic_init_hardware borrows
+	 * the BAR ioremaps from priv->qdma_dev_handle.  POLL_MODE + zero
+	 * msix counts keep libqdma out of the MSI-X allocation that our
+	 * own onic_init_interrupt does immediately afterward. */
 	memset(&priv->qdma_dev_conf, 0, sizeof(priv->qdma_dev_conf));
 	priv->qdma_dev_conf.pdev               = pdev;
 	priv->qdma_dev_conf.bar_num_config     = 0;
 	priv->qdma_dev_conf.bar_num_user       = 2;
 	priv->qdma_dev_conf.bar_num_bypass     = -1;
 	priv->qdma_dev_conf.qsets_base         = priv->qid_base;
-	{
-		struct qdma_dev *legacy_qdev =
-			(struct qdma_dev *)priv->hw.qdma;
-		priv->qdma_dev_conf.qsets_max =
-			legacy_qdev ? legacy_qdev->num_queues : 64;
-	}
+	/* Cover the absolute qid namespace this PF will use.  The shell
+	 * carves [0, num_cmacs * PER_CMAC_QUEUES); even on single-CMAC builds
+	 * sysdma reserves qid 31 for the H2C/C2H MM round-trip, so we never
+	 * want qsets_max < 32.  64 matches ONIC_PER_CMAC_QUEUES and is the
+	 * legacy default. */
+	priv->qdma_dev_conf.qsets_max          = 64;
 	priv->qdma_dev_conf.master_pf          = 1;
 	priv->qdma_dev_conf.qdma_drv_mode      = POLL_MODE;
 	priv->qdma_dev_conf.msix_qvec_max      = 0;
@@ -340,17 +334,45 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 			      &priv->qdma_dev_handle);
 	if (rv != 0) {
 		dev_err(&pdev->dev,
-			"qdma_device_open failed (%d) — sysdma path unavailable\n",
+			"qdma_device_open failed (%d) — cannot claim BARs\n",
 			rv);
 		priv->qdma_dev_handle = 0;
-		/* Non-fatal here: legacy netdev path doesn't need libqdma.
-		 * Sysdma init below will skip if handle is zero. */
+		goto clear_capacity;
+	}
+
+	/* Defensive (R1): libqdma's get_user_bar may reprogram bar_num_user
+	 * from a CSR.  Anything other than 2 means our SHELL_START offset
+	 * would land in the wrong BAR — abort rather than silently corrupt
+	 * shell registers. */
+	if (priv->qdma_dev_conf.bar_num_user != 2) {
+		dev_err(&pdev->dev,
+			"libqdma reports user BAR %d, expected 2 — refusing to bind\n",
+			priv->qdma_dev_conf.bar_num_user);
+		rv = -EINVAL;
+		goto clear_qdma;
+	}
+
+	/* Defensive (R8): libqdma may have reduced qsets_max internally.
+	 * sysdma's self-test uses qid 31; require >= 32 so the legacy MM
+	 * path keeps working. */
+	if (priv->qdma_dev_conf.qsets_max < 32) {
+		dev_err(&pdev->dev,
+			"libqdma reports qsets_max=%u, need >= 32 for sysdma — refusing to bind\n",
+			priv->qdma_dev_conf.qsets_max);
+		rv = -EINVAL;
+		goto clear_qdma;
+	}
+
+	rv = onic_init_hardware(priv);
+	if (rv < 0) {
+		dev_err(&pdev->dev, "onic_init_hardware (primary), err = %d", rv);
+		goto clear_qdma;
 	}
 
 	rv = onic_init_interrupt(priv);
 	if (rv < 0) {
 		dev_err(&pdev->dev, "onic_init_interrupt (primary), err = %d", rv);
-		goto clear_qdma;
+		goto clear_hardware;
 	}
 
 	rv = onic_ernic_irq_setup(priv);
@@ -400,12 +422,16 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 
 clear_interrupt:
 	onic_clear_interrupt(priv);
+clear_hardware:
+	onic_clear_hardware(priv);
 clear_qdma:
+	/* Option 3: qdma_device_close runs LAST because qdma_device_open
+	 * ran FIRST.  It is the sole owner of the PCI region claim and
+	 * the BAR ioremaps that onic_clear_hardware just released back. */
 	if (priv->qdma_dev_handle) {
 		qdma_device_close(pdev, priv->qdma_dev_handle);
 		priv->qdma_dev_handle = 0;
 	}
-	onic_clear_hardware(priv);
 clear_capacity:
 	onic_clear_capacity(priv);
 free_netdev:
@@ -520,17 +546,19 @@ static void onic_teardown_netdev(struct onic_private *priv)
 	onic_ptp_cleanup(priv);
 	unregister_netdev(priv->netdev);
 
-	/* B7-libqdma: close libqdma's view of this PCI function before we
-	 * tear down the QDMA hardware; libqdma keeps internal state
-	 * (descriptor rings, queue contexts, xdev list) that must be
-	 * released while the BAR is still mapped.  Only the primary takes
-	 * a handle; secondary's slot is always zero so we skip it there. */
+	/* Option 3: clear_hardware FIRST — it still needs hw->addr (borrowed
+	 * from libqdma) to issue the QDMA shell reset and the
+	 * QDMA_FUNC_OFFSET_QCONF(0)=0 write before the BAR mapping goes
+	 * away.  qdma_device_close runs LAST and is the iounmap point. */
+	onic_clear_hardware(priv);
+
+	/* Close libqdma's view of this PCI function.  Only the primary holds
+	 * a handle; secondary's slot is zero so we skip it there. */
 	if (priv->qdma_dev_handle) {
 		qdma_device_close(priv->pdev, priv->qdma_dev_handle);
 		priv->qdma_dev_handle = 0;
 	}
 
-	onic_clear_hardware(priv);
 	onic_clear_capacity(priv);
 
 	free_netdev(priv->netdev);
@@ -570,12 +598,11 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
 	}
 
-	rv = pci_request_mem_regions(pdev, onic_drv_name);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "pci_request_mem_regions, err = %d", rv);
-		goto disable_device;
-	}
-
+	/* Option 3: do NOT pci_request_mem_regions here.  libqdma claims the
+	 * PCI BAR region inside qdma_device_open (called from
+	 * onic_setup_primary), and onic borrows libqdma's mappings.  Two
+	 * pci_request_regions on the same pdev would conflict; we let
+	 * libqdma be the sole claimer. */
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_EXT_TAG);
 	pci_set_master(pdev);
@@ -583,8 +610,17 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	pcie_set_readrq(pdev, 512);
 
 	rv = onic_setup_primary(pdev, &primary);
-	if (rv < 0)
-		goto release_pci_mem;
+	if (rv < 0) {
+		/* If onic_setup_primary failed AFTER qdma_device_open
+		 * succeeded, qdma_device_close already called
+		 * pci_disable_device for us.  We can detect that by checking
+		 * whether the device is still enabled.  If yes (early
+		 * failure before qdma_device_open), we still need to balance
+		 * the pci_enable_device_mem above. */
+		if (pci_is_enabled(pdev))
+			pci_disable_device(pdev);
+		return rv;
+	}
 
 	pci_set_drvdata(pdev, primary);
 
@@ -626,8 +662,6 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	return 0;
 
-release_pci_mem:
-	pci_release_mem_regions(pdev);
 disable_device:
 	pci_disable_device(pdev);
 	return rv;
@@ -686,8 +720,10 @@ static void onic_remove(struct pci_dev *pdev)
 	onic_teardown_netdev(primary);
 
 	pci_set_drvdata(pdev, NULL);
-	pci_release_mem_regions(pdev);
-	pci_disable_device(pdev);
+	/* Option 3: libqdma's qdma_device_close (run inside
+	 * onic_teardown_netdev) calls pci_release_regions and
+	 * pci_disable_device on its own.  Doing them again here would
+	 * underflow the enable refcount and produce the rmmod warning. */
 
 #ifdef CMS_SUPPORT
         if(xmc_remove == 0)
