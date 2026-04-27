@@ -336,6 +336,13 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 	priv->qdma_dev_conf.user_msix_qvec_max = 0;
 	priv->qdma_dev_conf.data_msix_qvec_max = 0;
 
+	/* libqdma's qdma_device_open will pci_request_regions() under its own
+	 * name. Our earlier pci_request_mem_regions() in onic_probe blocks that.
+	 * Surrender the kernel's claim bookkeeping — our ioremap of priv->hw.addr
+	 * survives this. (Option 2 quick fix; Option 3 will properly refactor
+	 * onic to never claim the BARs in the first place.)
+	 */
+	pci_release_mem_regions(pdev);
 	rv = qdma_device_open(onic_drv_name, &priv->qdma_dev_conf,
 			      &priv->qdma_dev_handle);
 	if (rv != 0) {
