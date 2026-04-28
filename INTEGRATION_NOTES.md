@@ -422,3 +422,110 @@ DW1   [63: 0]  src_addr
   correctly when needed (`libqdma/qdma_descq.c`, ~line 632).
 - Did NOT change the callers in `onic_netdev.c`.  They leave
   `desc.flags = 0` (default-init); the packer ORs SOP|EOP in.
+
+## Secondary-PF queue diagnostics ([SEC_DIAG])
+
+Diagnostic-only `pr_info` traces added to find the bug in the secondary
+netdev (CMAC1, qid_base=64) datapath: TX descriptors are written and
+the doorbell is rung, but neither CMAC0 nor CMAC1 sees frames at
+`stat_tx_total_pkts`.
+
+All prints are tagged `[SEC_DIAG]` for easy filtering:
+
+```
+sudo dmesg -T | grep '\[SEC_DIAG\]'
+```
+
+### Diagnostics, what each line means
+
+- **`child_qdev: parent->addr=… child->addr=… q_base=…`**
+  (`qdma_legacy/qdma_device.c::qdma_create_child_dev`)
+  Fires once when the secondary's child `qdma_dev` wrapper is created.
+  `parent->addr` and `child->addr` MUST be identical — both should
+  point to libqdma's borrowed BAR0 ioremap.  If they differ, the
+  child re-mapped BAR0 (wasteful, but only matters if the addresses
+  look wildly wrong, e.g. one is NULL).  `q_base` should be 64 for
+  CMAC1 (one print) and the primary path does not hit this print at
+  all (primary uses `qdma_create_dev`, not `qdma_create_child_dev`).
+
+- **`write_sw_ctxt: qdev=… qdev->q_base=… relative_qid=… abs_qid=…
+  dir=… desc_base=0x… qen=… func_id=…`**
+  (`qdma_legacy/qdma_context.c::qdma_write_sw_ctxt`)
+  Fires once per queue per direction during `onic_open_netdev`.
+  Cross-check that secondary writes to `abs_qid = 64..77`
+  (q_base=64 + relative 0..13) for both H2C (dir=0) and C2H (dir=1).
+  `qen` must be 1 and `desc_base` must be a non-zero DMA address.
+  If primary's contexts at abs_qid 0..13 program `qen=1` but
+  secondary's at 64..77 silently get a different func_id or qen=0,
+  that's hypothesis #2 confirmed.
+
+- **`set_q_pidx: q_base=… rel_qid=… abs_qid=… dir=… offset=0x… val=0x…`**
+  (`onic_hardware.c::onic_qdma_set_q_pidx`)
+  Fires for every TX (dir=0) and RX (dir=1) doorbell ring.  The DMAP
+  PIDX register block is indexed by ABSOLUTE qid, so for the secondary
+  to deliver packets the offset MUST step through the
+  `0x18000 + 64*16` … `0x18000 + 77*16` range (or the C2H equivalent
+  at 0x18004 + abs_qid*16).  Cross-reference with the SW context
+  write trace: doorbell `abs_qid` for each packet must equal the
+  `abs_qid` used at SW-context program time.  If the doorbell goes to
+  abs_qid 64 but no SW context was ever written for abs_qid 64, the
+  IP discards the doorbell — no error, no frame.
+
+- **`FMAP readback (func_id=…): W0=0x… W1=0x… (qbase=… qmax=…)
+  [wrote qbase=… qmax=…]`**
+  (`onic_hardware.c::onic_init_hardware_master`)
+  Fires once after the master writes the FMAP context.  The decoded
+  `qbase`/`qmax` must equal what we wrote (typically qbase=0,
+  qmax=128 for a 2-CMAC build).  If `qmax` reads back as 64 even
+  though we wrote 128, libqdma or another agent later clobbered FMAP
+  back to its `qsets_max` value, and qids 64-127 are NOT claimed by
+  this function — every context write/read at those qids targets a
+  function-less slot.  That would be hypothesis #3 confirmed.
+
+- **`SW_CTXT abs_qid=… H2C (cmac_id=… q_base=… rel_qid=0 rv=…):
+  W0=0x… W1=0x… W2=0x… W3=0x… W4=0x…`** plus a decoded follow-up
+  line (`qen`, `desc_base`, `pidx`, `func_id`).
+  (`onic_netdev.c::onic_open_netdev`)
+  Fires once per netdev open, after `onic_init_tx_resource` and
+  `onic_init_rx_resource` complete.  This is the load-bearing
+  diagnostic.  Run from primary first (`ip link set enp1s0 up`) to
+  capture the known-working `abs_qid=0` baseline, then bring up
+  secondary (`ip link set enp1s0d1 up`) for `abs_qid=64`.
+  - `qen` MUST be 1.  If 0, the queue is not enabled in the IP and
+    every doorbell at that abs_qid is silently dropped.
+  - `desc_base` MUST equal a non-zero DMA address that matches the
+    `desc_base` printed by the corresponding `write_sw_ctxt` line
+    above.  If it reads back zero, the FMAP didn't claim this qid
+    for the function and the indirect-context write went to a
+    nonexistent slot.
+  - All zeros across W0..W4 → hypothesis #2 OR #3 confirmed.
+  - `func_id` must equal the primary's func_id (single-PF design).
+
+### Files changed
+
+- `qdma_legacy/qdma_device.c` — add child-qdev creation print.
+- `qdma_legacy/qdma_context.c` — add write_sw_ctxt entry print and
+  new `qdma_read_sw_ctxt_raw` helper.
+- `qdma_legacy/qdma_context.h` — declare `qdma_read_sw_ctxt_raw`.
+- `onic_hardware.c` — add doorbell abs_qid print and FMAP readback
+  inside `onic_init_hardware_master`.
+- `onic_netdev.c` — include `qdma_context.h`; in `onic_open_netdev`,
+  read back the H2C SW context for relative qid 0 and dump it.
+
+### How to read the trace from a single ping
+
+1. `sudo modprobe onic` (or `insmod ./onic.ko`).
+2. Bring up primary: `sudo ip link set enp1s0 up && sudo ip addr add
+   10.0.0.2/24 dev enp1s0`.
+3. Bring up secondary: `sudo ip link set enp1s0d1 up && sudo ip addr
+   add 10.0.0.3/24 dev enp1s0d1`.
+4. Move cable to CMAC1 and ping from secondary:
+   `sudo ping -I enp1s0d1 -c 1 10.0.0.1`.
+5. `sudo dmesg -T | grep '\[SEC_DIAG\]' > /tmp/sec_diag.log` and
+   inspect.
+
+Compare the secondary lines (`abs_qid` 64-77) with the primary
+baseline (`abs_qid` 0-13).  Any structural divergence (different
+func_id, qen=0, desc_base mismatch, FMAP qmax narrowed to 64,
+doorbell hitting wrong abs_qid) localises the bug to one of the
+three hypotheses.

@@ -59,6 +59,9 @@ struct qdma_dev *qdma_create_child_dev(struct qdma_dev *parent, u16 q_base)
 	qdev->q_base = q_base;
 	qdev->is_child = true;
 
+	pr_info("[SEC_DIAG] child_qdev: parent->addr=%p, child->addr=%p, q_base=%u\n",
+		parent->addr, qdev->addr, qdev->q_base);
+
 	return qdev;
 }
 

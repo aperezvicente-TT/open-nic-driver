@@ -238,6 +238,35 @@ static int onic_init_hardware_master(struct onic_private *priv)
 	if (rv < 0)
 		goto clear_hardware;
 
+	/* [SEC_DIAG] FMAP readback to confirm hardware accepted the values
+	 * libqdma may program FMAP with qmax=qsets_max (e.g. 64) and we
+	 * overwrite with total_qmax (e.g. 128).  If something else clobbers
+	 * this back to 64, qids 64-127 will not be claimed by the function. */
+	{
+		union qdma_ctxt_cmd cmd_rd;
+		u32 raw0 = 0, raw1 = 0, busy;
+		int j;
+
+		cmd_rd.word = 0;
+		cmd_rd.bits.sel = QDMA_CTXT_CMD_SEL_FMAP;
+		cmd_rd.bits.op = QDMA_CTXT_CMD_OP_RD;
+		cmd_rd.bits.qid = qdev->func_id;
+
+		qdma_write_reg(qdev, QDMA_OFFSET_IND_CTXT_CMD, cmd_rd.word);
+		for (j = 0; j < 50000; ++j) {
+			busy = qdma_read_reg(qdev, QDMA_OFFSET_IND_CTXT_CMD);
+			if ((busy & QDMA_IND_CTXT_CMD_BUSY_MASK) == 0)
+				break;
+			udelay(10);
+		}
+		raw0 = qdma_read_reg(qdev, QDMA_OFFSET_IND_CTXT_DATA);
+		raw1 = qdma_read_reg(qdev, QDMA_OFFSET_IND_CTXT_DATA + 4);
+		pr_info("[SEC_DIAG] FMAP readback (func_id=%u): W0=0x%08x W1=0x%08x (qbase=%u qmax=%u) [wrote qbase=%u qmax=%u]\n",
+			qdev->func_id, raw0, raw1,
+			raw0 & 0x7FF, raw1 & 0xFFF,
+			fmap_ctxt.qbase, fmap_ctxt.qmax);
+	}
+
 	/* Single shell function slot for all CMACs.  The RDMA plugin arbitrates
 	 * CMAC0+CMAC1 non-RoCE streams into slot 0 and encodes CMAC identity
 	 * into the queue ID (CMAC0 → [0, N), CMAC1 → [N, 2N)).  QCONF(0) must
@@ -658,6 +687,10 @@ static void onic_qdma_set_q_pidx(unsigned long qdma, u16 qid,
 
 	val = (FIELD_SET(QDMA_DMAP_SEL_DESC_PIDX_MASK, pidx) |
 	       FIELD_SET(QDMA_DMAP_SEL_DESC_IRQ_ARM_MASK, irq_arm));
+
+	pr_info("[SEC_DIAG] set_q_pidx: q_base=%u rel_qid=%u abs_qid=%u dir=%d offset=0x%x val=0x%x\n",
+		qdev->q_base, qid, qdev->q_base + qid, dir, offset, val);
+
 	qdma_write_reg(qdev, offset, val);
 }
 

@@ -38,6 +38,7 @@
 #include "onic_lib.h"
 #include "onic_register.h"
 #include "qdma_legacy/qdma_register.h"
+#include "qdma_legacy/qdma_context.h"
 #include "onic.h"
 #include "onic_ptp.h"
 
@@ -1054,6 +1055,32 @@ int onic_open_netdev(struct net_device *dev)
 	rv = onic_init_rx_resource(priv);
 	if (rv < 0)
 		goto stop_netdev;
+
+	/* [SEC_DIAG] After all per-queue contexts have been written, read
+	 * back the H2C SW context for relative qid 0 of THIS netdev.  For
+	 * the primary (q_base=0) this is absolute qid 0; for the secondary
+	 * (q_base=64) it is absolute qid 64.  This is the load-bearing
+	 * diagnostic for hypothesis #2: if W1 bit 0 (qen) is 0 or W2:W3
+	 * (desc_base) is zero/wrong, queue 64's context did not land in
+	 * the right indirect slot and that explains why doorbell rings
+	 * are silently ignored on the secondary path. */
+	{
+		struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
+		u32 raw[8] = {0};
+		int rrv;
+
+		rrv = qdma_read_sw_ctxt_raw(qdev, 0, QDMA_H2C, raw);
+		pr_info("[SEC_DIAG] SW_CTXT abs_qid=%u H2C (cmac_id=%u q_base=%u rel_qid=0 rv=%d): W0=0x%08x W1=0x%08x W2=0x%08x W3=0x%08x W4=0x%08x W5=0x%08x W6=0x%08x W7=0x%08x\n",
+			qdev->q_base + 0, priv->cmac_id, qdev->q_base, rrv,
+			raw[0], raw[1], raw[2], raw[3],
+			raw[4], raw[5], raw[6], raw[7]);
+		pr_info("[SEC_DIAG] SW_CTXT abs_qid=%u H2C decoded: qen=%u desc_base=0x%08x%08x pidx=%u func_id=%u\n",
+			qdev->q_base + 0,
+			raw[1] & 0x1,
+			raw[3], raw[2],
+			raw[0] & 0xFFFF,
+			(raw[0] >> 17) & 0xFF);
+	}
 
 	netif_tx_start_all_queues(dev);
 

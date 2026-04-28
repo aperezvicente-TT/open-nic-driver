@@ -436,4 +436,17 @@ int qdma_clear_fmap_ctxt(struct qdma_dev *dev);
  **/
 int qdma_invalidate_fmap_ctxt(struct qdma_dev *dev);
 
+/**
+ * qdma_read_sw_ctxt_raw - [SEC_DIAG] read raw SW context words
+ * @dev: pointer to QDMA device
+ * @qid: relative queue ID (translated to absolute via dev->q_base)
+ * @dir: queue direction
+ * @raw: 8-word output buffer (only first QDMA_SW_CTXT_NUM_WORDS=5 are valid;
+ *       remainder are zero-padded for convenience).
+ *
+ * Returns 0 on success, negative on failure.
+ **/
+int qdma_read_sw_ctxt_raw(struct qdma_dev *dev, u16 qid, enum qdma_dir dir,
+			  u32 raw[8]);
+
 #endif
