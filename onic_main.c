@@ -63,7 +63,7 @@ module_param(RS_FEC_ENABLED, int, 0644);
 
 int onic_debug_level = 0;
 module_param_named(debug_level, onic_debug_level, int, 0644);
-MODULE_PARM_DESC(debug_level, "Debug verbosity (0=off, 1=info, 2=init, 3=data-path)");
+MODULE_PARM_DESC(debug_level, "Debug verbosity (0=off, 1=info, 2=init, 3=data-path, 4=per-packet xpath trace)");
 
 static int host_id = -1;
 module_param(host_id, int, 0444);

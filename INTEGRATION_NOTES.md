@@ -529,3 +529,83 @@ baseline (`abs_qid` 0-13).  Any structural divergence (different
 func_id, qen=0, desc_base mismatch, FMAP qmax narrowed to 64,
 doorbell hitting wrong abs_qid) localises the bug to one of the
 three hypotheses.
+
+## `[DBG_XPATH]` per-packet trace — dual-CMAC drop localisation
+
+When CMAC0 (`enp1s0`) and CMAC1 (`enp1s0d1`) are both link-up and
+receiving traffic, `enp1s0d1` shows ~46% bursty packet loss on a 1
+pps ping (drops are NOT throughput-related — 7 of 15 lost in 15 s).
+The `[DBG_XPATH]` trace fires on every TX submission, every TX
+completion advance, every NAPI poll entry/exit, and every delivered
+RX packet, so the drop site can be pinpointed by correlating the
+packet sequence on each netdev.
+
+### Enabling
+
+`onic_debug_level >= 4` activates the trace.  Load with
+`sudo insmod onic.ko debug_level=4` (or
+`echo 4 > /sys/module/onic/parameters/debug_level` at runtime).
+At 1 pps the trace produces a few hundred lines per minute — fine
+for normal use.  Drop back to `debug_level=0` after debugging.
+
+### Trace tags (all prefixed `[DBG_XPATH]`)
+
+- `TX_SUB <netdev> qid=R abs_qid=A skb_len=L proto=... dst_ip=...
+  ntu=N ntc=M cpu=C ts=T` — emitted in `onic_xmit_frame` after
+  `qdma_pack_h2c_st_desc` but before the doorbell.  Confirms the
+  driver received the skb and built a descriptor.
+- `TX_BUSY ... reason=ring_full` — TX ring full, NETDEV_TX_BUSY
+  returned.
+- `TX_DROP ... reason=dma_map_err` — DMA map failure path.
+- `TX_DONE <netdev> qid=R abs_qid=A cidx_advance=O->N work=W
+  wb_cidx=C cpu=C ts=T` — fires inside `onic_tx_clean` whenever
+  `wb.cidx` advances past `next_to_clean`.  Pairing each TX_SUB
+  with a TX_DONE proves the QDMA H2C engine actually consumed the
+  descriptor.
+- `RX_POLL_START <netdev> qid=R abs_qid=A budget=B cpu=C ts=T` — at
+  entry to `onic_rx_poll`.
+- `RX_PKT <netdev> qid=R abs_qid=A len=L proto=... src_ip=... cpu=C
+  ts=T` — per delivered packet (XDP_PASS branch only).
+- `RX_DROP ... reason=cmpl_err` — completion error bit set in the
+  C2H descriptor.
+- `RX_POLL_END <netdev> qid=R abs_qid=A processed=W done=D cpu=C
+  ts=T` — `done=1` is the normal `napi_complete_done` exit; `done=0`
+  is the budget-exhausted reschedule path.
+- `RX_RING <netdev> qid=R abs_qid=A ntc=N nte=U rng=C fill=F
+  cmpl_ntc=N2 cmpl_pidx=P` — desc-ring fill state and completion
+  ring pointers, paired with each RX_POLL_END.
+
+### Files touched
+
+- `onic.h` — define `ONIC_DBG_XPATH` (=4) and the `onic_xpath()`
+  macro.
+- `onic_main.c` — extend `debug_level` parm description.
+- `onic_netdev.c` — include `<linux/ip.h>`/`<linux/ktime.h>`; emit
+  TX_SUB/TX_BUSY/TX_DROP in `onic_xmit_frame`, TX_DONE in
+  `onic_tx_clean`, RX_POLL_START / RX_PKT / RX_DROP / RX_POLL_END /
+  RX_RING in `onic_rx_poll`.
+
+### Reading the trace
+
+After running e.g. `ping -c 20 -W 1 -I enp1s0d1 10.0.0.1`,
+`sudo dmesg -T | grep DBG_XPATH > /tmp/xpath.log`.
+
+Patterns to look for:
+
+- TX_SUB with no matching TX_DONE within ~10 ms → QDMA H2C engine
+  stuck on that queue (HW/shell side, not SW).
+- TX_SUB present on enp1s0d1 but RX_PKT shows the echo-reply on
+  enp1s0 (or vice versa) → RSS hash collision or queue-ID
+  cross-routing in the shell.
+- Repeated `RX_POLL_END processed=0 done=1` on one netdev while the
+  peer keeps sending → NAPI being woken without work, likely shared
+  IRQ vector or spurious schedule.
+- `RX_POLL_END processed=64 done=0` repeating (budget exhausted) on
+  the active CMAC while the other shows zero progress → NAPI
+  starvation between CMACs on the same CPU.
+- `RX_RING fill=0` while peer is actively transmitting → packets
+  never reach the C2H engine (CMAC RX FIFO drop, plugin RTL drop,
+  or QDMA prefetch starvation).
+- TX_SUB / TX_DONE / RX_POLL_START emitted from the *same* CPU for
+  both CMACs → NAPI/IRQ affinity collision; try
+  `irqbalance off` + manual SMP affinity to spread vectors.

@@ -25,6 +25,8 @@
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <linux/bpf_trace.h>
+#include <linux/ip.h>
+#include <linux/ktime.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #include <net/page_pool/helpers.h>
@@ -83,6 +85,7 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 	struct onic_ring *ring = &q->ring;
 	struct qdma_wb_stat wb;
 	int work, i;
+	u16 ntc_old_dbg;
 
 	// this is a locking mechanism to guarantee that only one thread is cleaning the ring
 	// bitmask functions are atomic!
@@ -95,6 +98,8 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		clear_bit(0, q->state);
 		return;
 	}
+
+	ntc_old_dbg = ring->next_to_clean;
 
 	work = wb.cidx - ring->next_to_clean;
 	if (work < 0)
@@ -134,6 +139,19 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		buf->type = 0;
 
 		onic_ring_increment_tail(ring);
+	}
+
+	/* [DBG_XPATH] TX completion trace — log the ntc advance.  If TX_SUB
+	 * fires but no matching TX_DONE follows within ~tens of ms, the QDMA
+	 * H2C engine is stuck (descriptor fetched but no writeback) — the
+	 * drop is HW/shell-side, not a SW path issue. */
+	if (onic_debug_level >= ONIC_DBG_XPATH && work > 0) {
+		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + q->qid) : q->qid;
+		pr_info("[DBG_XPATH] TX_DONE %s qid=%u abs_qid=%u cidx_advance=%u->%u work=%d wb_cidx=%u cpu=%d ts=%llu\n",
+			netdev_name(q->netdev), q->qid, abs_qid_dbg,
+			ntc_old_dbg, ring->next_to_clean, work, wb.cidx,
+			smp_processor_id(), ktime_get_ns());
 	}
 
 	clear_bit(0, q->state);
@@ -387,6 +405,17 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	if (qid < priv->num_tx_queues)
 		onic_tx_clean(priv->tx_queue[qid]);
 
+	/* [DBG_XPATH] RX_POLL_START — fires once per NAPI poll invocation.
+	 * Useful for: "is NAPI being woken on the right CPU/queue?" and "are
+	 * both CMACs' polls coscheduled on the same core?" (CPU + ts). */
+	if (onic_debug_level >= ONIC_DBG_XPATH) {
+		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+		pr_info("[DBG_XPATH] RX_POLL_START %s qid=%u abs_qid=%u budget=%d cpu=%d ts=%llu\n",
+			netdev_name(q->netdev), qid, abs_qid_dbg, budget,
+			smp_processor_id(), ktime_get_ns());
+	}
+
 	cmpl_ptr =
 		cmpl_ring->desc + QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean;
 	cmpl_stat_ptr =
@@ -420,6 +449,14 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	}
 
 	if (cmpl.err == 1) {
+		if (onic_debug_level >= ONIC_DBG_XPATH) {
+			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+			pr_info("[DBG_XPATH] RX_DROP %s qid=%u abs_qid=%u reason=cmpl_err len=%u ntc=%u pidx=%u\n",
+				netdev_name(q->netdev), qid, abs_qid_dbg,
+				cmpl.pkt_len, cmpl_ring->next_to_clean,
+				cmpl_stat.pidx);
+		}
 		netdev_warn(q->netdev, "completion error at ntc=%u pidx=%u — rescheduling",
 			    cmpl_ring->next_to_clean, cmpl_stat.pidx);
 		/* Do not disarm the global error IRQ here; onic_error_thread_fn
@@ -476,6 +513,34 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 
 				skb->protocol = eth_type_trans(skb, q->netdev);
 				skb_record_rx_queue(skb, qid);
+
+				/* [DBG_XPATH] RX_PKT — fires per delivered packet.
+				 * Use to confirm packets actually arrive on this
+				 * netdev's queue.  src_ip lets you correlate ICMP
+				 * echo-reply with the originating ping. */
+				if (onic_debug_level >= ONIC_DBG_XPATH) {
+					struct qdma_dev *qdev_dbg =
+						(struct qdma_dev *)priv->hw.qdma;
+					u16 abs_qid_dbg = qdev_dbg ?
+						(qdev_dbg->q_base + qid) : qid;
+					if (skb->protocol == htons(ETH_P_IP) &&
+					    skb_network_header(skb) >= skb->data) {
+						pr_info("[DBG_XPATH] RX_PKT %s qid=%u abs_qid=%u len=%u proto=0x%04x src_ip=%pI4 cpu=%d ts=%llu\n",
+							netdev_name(q->netdev),
+							qid, abs_qid_dbg, len,
+							ntohs(skb->protocol),
+							&ip_hdr(skb)->saddr,
+							smp_processor_id(),
+							ktime_get_ns());
+					} else {
+						pr_info("[DBG_XPATH] RX_PKT %s qid=%u abs_qid=%u len=%u proto=0x%04x src_ip=non-ip cpu=%d ts=%llu\n",
+							netdev_name(q->netdev),
+							qid, abs_qid_dbg, len,
+							ntohs(skb->protocol),
+							smp_processor_id(),
+							ktime_get_ns());
+					}
+				}
 
 				/* Deliver RX hardware timestamp from 16B completion.
 				 *
@@ -595,7 +660,45 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	if (cmpl_ring->next_to_clean != cmpl_stat.pidx)
 		napi_schedule(&q->napi);
 
+	/* [DBG_XPATH] RX_POLL_END — normal (napi_complete_done) exit path.
+	 * If processed=0 with budget=64 fires repeatedly on enp1s0d1 while
+	 * enp1s0 is also active, NAPI is being woken without work — likely
+	 * shared IRQ vector / spurious schedule.  RX_RING gives ring fill
+	 * level so we can distinguish "ring empty, NAPI spurious" from
+	 * "ring full, but completion ring stuck". */
+	if (onic_debug_level >= ONIC_DBG_XPATH) {
+		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+		u16 dr_cnt = onic_ring_get_real_count(desc_ring);
+		u16 nte = desc_ring->next_to_use;
+		u16 ntc = desc_ring->next_to_clean;
+		u16 fill = (dr_cnt > 0) ? ((nte - ntc) % dr_cnt) : 0;
+		pr_info("[DBG_XPATH] RX_POLL_END %s qid=%u abs_qid=%u processed=%d done=1 cpu=%d ts=%llu\n",
+			netdev_name(q->netdev), qid, abs_qid_dbg, work,
+			smp_processor_id(), ktime_get_ns());
+		pr_info("[DBG_XPATH] RX_RING %s qid=%u abs_qid=%u ntc=%u nte=%u rng=%u fill=%u cmpl_ntc=%u cmpl_pidx=%u\n",
+			netdev_name(q->netdev), qid, abs_qid_dbg,
+			ntc, nte, dr_cnt, fill,
+			cmpl_ring->next_to_clean, cmpl_stat.pidx);
+	}
+	return work;
+
 out_of_budget:
+	if (onic_debug_level >= ONIC_DBG_XPATH) {
+		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+		u16 dr_cnt = onic_ring_get_real_count(desc_ring);
+		u16 nte = desc_ring->next_to_use;
+		u16 ntc = desc_ring->next_to_clean;
+		u16 fill = (dr_cnt > 0) ? ((nte - ntc) % dr_cnt) : 0;
+		pr_info("[DBG_XPATH] RX_POLL_END %s qid=%u abs_qid=%u processed=%d done=0 cpu=%d ts=%llu\n",
+			netdev_name(q->netdev), qid, abs_qid_dbg, work,
+			smp_processor_id(), ktime_get_ns());
+		pr_info("[DBG_XPATH] RX_RING %s qid=%u abs_qid=%u ntc=%u nte=%u rng=%u fill=%u cmpl_ntc=%u cmpl_pidx=%u\n",
+			netdev_name(q->netdev), qid, abs_qid_dbg,
+			ntc, nte, dr_cnt, fill,
+			cmpl_ring->next_to_clean, cmpl_stat.pidx);
+	}
 	return work;
 }
 
@@ -1252,8 +1355,16 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	onic_tx_clean(q);
 
-	if (unlikely(onic_ring_full(ring)))
+	if (unlikely(onic_ring_full(ring))) {
+		if (onic_debug_level >= ONIC_DBG_XPATH) {
+			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+			pr_info("[DBG_XPATH] TX_BUSY %s qid=%u abs_qid=%u reason=ring_full ntu=%u ntc=%u\n",
+				netdev_name(dev), qid, abs_qid_dbg,
+				ring->next_to_use, ring->next_to_clean);
+		}
 		return NETDEV_TX_BUSY;
+	}
 
 	rv = skb_put_padto(skb, ETH_ZLEN);
 	if (rv < 0) {
@@ -1265,6 +1376,12 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 				  DMA_TO_DEVICE);
 
 	if (unlikely(dma_mapping_error(&priv->pdev->dev, dma_addr))) {
+		if (onic_debug_level >= ONIC_DBG_XPATH) {
+			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+			pr_info("[DBG_XPATH] TX_DROP %s qid=%u abs_qid=%u reason=dma_map_err len=%u\n",
+				netdev_name(dev), qid, abs_qid_dbg, skb->len);
+		}
 		dev_kfree_skb(skb);
 		pcpu_stats_pointer->tx_dropped++;
 		pcpu_stats_pointer->tx_errors++;
@@ -1309,6 +1426,29 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	pcpu_stats_pointer->tx_packets++;
 	pcpu_stats_pointer->tx_bytes += skb->len;
+
+	/* [DBG_XPATH] TX submission trace — fires before doorbell.  Captures
+	 * src netdev, relative + absolute qid (q_base distinguishes CMAC0 vs
+	 * CMAC1), skb length, ethertype, dst IP if v4, and a monotonic ns
+	 * timestamp for cross-correlation with TX_DONE / RX_PKT. */
+	if (onic_debug_level >= ONIC_DBG_XPATH) {
+		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
+		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
+		__be16 proto = skb->protocol;
+		if (proto == htons(ETH_P_IP) && skb_network_header(skb) >= skb->data) {
+			pr_info("[DBG_XPATH] TX_SUB %s qid=%u abs_qid=%u skb_len=%u proto=0x%04x dst_ip=%pI4 ntu=%u ntc=%u cpu=%d ts=%llu\n",
+				netdev_name(dev), qid, abs_qid_dbg, skb->len,
+				ntohs(proto), &ip_hdr(skb)->daddr,
+				ring->next_to_use, ring->next_to_clean,
+				smp_processor_id(), ktime_get_ns());
+		} else {
+			pr_info("[DBG_XPATH] TX_SUB %s qid=%u abs_qid=%u skb_len=%u proto=0x%04x dst_ip=non-ip ntu=%u ntc=%u cpu=%d ts=%llu\n",
+				netdev_name(dev), qid, abs_qid_dbg, skb->len,
+				ntohs(proto),
+				ring->next_to_use, ring->next_to_clean,
+				smp_processor_id(), ktime_get_ns());
+		}
+	}
 
 	onic_ring_increment_head(ring);
 
