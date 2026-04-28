@@ -319,11 +319,13 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 	priv->qdma_dev_conf.bar_num_bypass     = -1;
 	priv->qdma_dev_conf.qsets_base         = priv->qid_base;
 	/* Cover the absolute qid namespace this PF will use.  The shell
-	 * carves [0, num_cmacs * PER_CMAC_QUEUES); even on single-CMAC builds
-	 * sysdma reserves qid 31 for the H2C/C2H MM round-trip, so we never
-	 * want qsets_max < 32.  64 matches ONIC_PER_CMAC_QUEUES and is the
-	 * legacy default. */
-	priv->qdma_dev_conf.qsets_max          = 64;
+	 * carves [0, num_cmacs * PER_CMAC_QUEUES); secondary netdev uses
+	 * qid 64-77 (CMAC1's range).  When this was 64, libqdma programmed
+	 * the QDMA's per-function queue limit register to 64; the engine
+	 * then refused to fetch descriptors for qid >= 64 (HW context
+	 * shows idl_stp_b=1 forever).  Set to ONIC_MAX_QUEUES so libqdma
+	 * sees the full 128-queue range secondary uses. */
+	priv->qdma_dev_conf.qsets_max          = 2 * ONIC_PER_CMAC_QUEUES;
 	priv->qdma_dev_conf.master_pf          = 1;
 	priv->qdma_dev_conf.qdma_drv_mode      = POLL_MODE;
 	priv->qdma_dev_conf.msix_qvec_max      = 0;
