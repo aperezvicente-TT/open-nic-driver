@@ -143,6 +143,7 @@ void onic_set_rx_head(unsigned long qdma, u16 qid, u16 head);
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm);
 
 int  onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset);
+int  onic_reset_cmac_shell(struct onic_hardware *hw, u8 cmac_id);
 
 /**
  * onic_qdma_dump_error_regs - log all QDMA error status registers

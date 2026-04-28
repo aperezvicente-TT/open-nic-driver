@@ -2,26 +2,33 @@
 /*
  * onic_sysdma.c - QDMA AXI-MM-mode system DMA for host <-> card-DDR4
  *
- * See onic_sysdma.h for design rationale.
+ * libqdma-backed implementation (Phase E of the libqdma vendoring plan).
  *
- * Hardware path: host buffer -> coherent staging -> QDMA H2C MM descriptor
- *   -> dev_mem 4:1 crossbar (s_axi_qdma_mm_* slave) -> DDR4 controller.
+ * What this used to be: a hand-rolled MM submit path that built 32-byte
+ * descriptors directly, programmed the SW context via the cut-down
+ * qdma_legacy/ helpers, and polled wb_status to detect completion.  It
+ * faulted at probe-time self-test with a DMAR error at 0xff00000000 even
+ * though descriptor bytes and SW-context readbacks were bit-perfect, and
+ * we ran out of differential-debug ammunition against a hand-rolled
+ * implementation we couldn't fully audit.
  *
- * The QDMA IP must have been generated with en_axi_mm_qdma=true and
- * dma_intf_sel=AXI_MM_and_AXI_Stream_with_Completion (v4 bitstream config).
- * The wrapper's qdma_no_sriov instantiation must drive m_axi_* into the
- * dev_mem crossbar (commit b18430a).  Without those, the MM engine is
- * either inactive (older bitstream) or the m_axi_* outputs dangle.
+ * What it is now: a thin wrapper over AMD libqdma's public API.  We open
+ * one Q_H2C and one Q_C2H queue at probe (st=0, irq_en=0, wb_status_en=1,
+ * mm_channel=0) and submit blocking sg requests on each.  libqdma owns
+ * the descriptor format, doorbell sequencing, completion polling, and
+ * SW-context programming — paths AMD has shipped, customers test, and
+ * we don't have to reverse-engineer.
  *
- * MM descriptor format (PG302 v5.1 Ch 5, 32 bytes):
- *   [255:192] reserved
- *   [191:160] sop/eop control + reserved
- *   [159]     valid (driven by QDMA itself based on PIDX, not user-set)
- *   [158]     eop
- *   [157]     sop
- *   [156:128] length (28 bits, byte count, max 256 MiB per descriptor)
- *   [127:64]  dst_addr (card-side AXI address)
- *   [63:0]    src_addr (host-side PCIe address; for H2C this is dma_addr_t)
+ * Lifecycle:
+ *   onic_sysdma_init   — qdma_queue_add(H2C) + qdma_queue_start(H2C)
+ *                        + qdma_queue_add(C2H) + qdma_queue_start(C2H)
+ *   onic_ddr4_write    — copy host buf into staging, build sgl,
+ *                        qdma_request_submit(write=1) blocking
+ *   onic_ddr4_read     — symmetric, write=0
+ *   onic_sysdma_fini   — qdma_queue_stop + qdma_queue_remove for both
+ *
+ * Note: priv->qdma_dev_handle must be nonzero (set by
+ * qdma_device_open in onic_setup_primary) before calling sysdma_init.
  */
 
 #include <linux/dma-mapping.h>
@@ -32,306 +39,244 @@
 
 #include "onic.h"
 #include "onic_sysdma.h"
-#include "onic_qdma_mm.h"
-#include "qdma_access/qdma_register.h"
-#include "qdma_access/qdma_context.h"
-#include "qdma_access/qdma_device.h"
-#include "qdma_access/qdma_export.h"
+#include "libqdma/libqdma_export.h"
 
-/* QDMA ring-size pool index for 256 entries (matches rngcnt_pool[4]
- * in onic_hardware.c). */
-#define ONIC_SYSDMA_RNGSZ_IDX  4
+#define ONIC_SYSDMA_REL_QID    31         /* relative queue index */
+#define ONIC_SYSDMA_RNGSZ_IDX  4          /* libqdma global_csr_conf.ring_sz[4] */
+#define ONIC_SYSDMA_ERR_BUFLEN 256
 
-/* Reserved qid (relative to function's qid_base).  Netdev uses 0..N-1
- * for its TX/RX queues; we use a value past the netdev range.  Queue
- * 31 is well past 14-queue netdev allocations and within typical
- * num_q=2048 caps. */
-#define ONIC_SYSDMA_REL_QID    31
-
-/* ------------------------------------------------------------------------- *
- *  Per-queue state — embedded in onic_private as priv->sysdma (TODO: add
- *  the field to onic.h).  Kept opaque to other files for now.
- *
- *  Memory layout of desc_ring buffer:
- *
- *      offset 0:                 onic_qdma_mm_desc[0]
- *      offset 32:                onic_qdma_mm_desc[1]
- *      ...
- *      offset (N-1)*32:          onic_qdma_mm_desc[N-1]
- *      offset N*32:              onic_qdma_wb_status (8 bytes)
- *
- *  QDMA writes wb_status here when wbi_chk=1; we poll cidx for completion.
- * ------------------------------------------------------------------------- */
+/* Per-instance state stored on priv->sysdma. */
 struct onic_sysdma_state {
 	struct mutex            lock;       /* serialises ddr4_write/read */
 	bool                    initialised;
 
-	/* QDMA queue identity */
-	u16                     qid;        /* relative qid within this qdev */
-	u16                     pidx;       /* next descriptor index to push */
+	unsigned long           qhndl_h2c;  /* opaque from qdma_queue_add */
+	unsigned long           qhndl_c2h;
+	bool                    h2c_started;
+	bool                    c2h_started;
 
-	/* Descriptor ring (MM format, 32 B/desc) + wb_status sentinel.
-	 * Allocated size = (ring_depth + 1) * 32. */
-	void                   *desc_ring;
-	dma_addr_t              desc_ring_dma;
-	size_t                  desc_ring_size;
-	struct onic_qdma_wb_status *wb_status; /* points into desc_ring */
-
-	/* Staging buffer for write payloads.  Reused across calls. */
+	/* Staging buffer reused across calls — DMA-mapped once at init.
+	 * Caller payload is memcpy'd in (write) or memcpy'd out (read). */
 	void                   *staging;
 	dma_addr_t              staging_dma;
 	size_t                  staging_size;
 };
 
-/* MM descriptor + WB-status structs: see onic_qdma_mm.h. */
+/* ----------------------------------------------------------------- *
+ *  Internal helpers
+ * ----------------------------------------------------------------- */
 
-/* ------------------------------------------------------------------------- *
- *  QDMA queue context programming for MM mode.
- *
- *  Reference: AMD's open-source dma_ip_drivers / libqdma implements this
- *  fully.  Path on this machine:
- *      /home/alex/fpga-wksp/dma_ip_drivers/QDMA/linux-kernel/driver/libqdma/
- *
- *  Key entry points in libqdma:
- *      qdma_queue_add()       libqdma_export.h:1248  — config + register
- *      qdma_queue_start()     libqdma_export.h:1277  — bring online
- *      qdma_request_submit()  libqdma_export.h:1462  — submit DMA work
- *
- *  Mode selection is qdma_queue_conf.st = 0 (MM) or 1 (ST).
- *  The MM-specific submit logic lives in qdma_descq.c:
- *      descq_mm_proc_request()
- *      descq_mm_n_h2c_cmpl_status()
- *      descq_poll_mm_n_h2c_cmpl_status()
- *
- *  Implementation plan (DECIDED — see commit log for the pivot):
- *
- *  Hand-roll the minimal MM submit path using libqdma as DOCUMENTATION,
- *  not as a vendored library.  Reasoning:
- *
- *    - libqdma is a monolithic driver, not a cherry-pickable component.
- *      Transitive header closure of qdma_request_submit is 22 headers
- *      and ~11K LoC across the core .c files (qdma_descq, qdma_context,
- *      libqdma_export, qdma_device, qdma_regs, xdev, qdma_intr,
- *      qdma_st_c2h).  Every "core" file pulls in 5-8 others.
- *
- *    - Our requirements are tiny compared to libqdma's surface area:
- *      one MM queue, sync H2C, sync C2H, poll completions, no
- *      PF/VF, no mailbox, no descriptor bypass, no indirect intr,
- *      no debugfs.  Hand-rolling gives ~300-500 LoC; cherry-picking
- *      would import most of libqdma anyway, with weeks of dependency-
- *      untangling.
- *
- *    - We already have qdma_access/qdma_register.h with the register
- *      offsets we need.  Hand-rolling extends our existing minimal
- *      framework rather than introducing a parallel one.
- *
- *  Concrete reference points in libqdma (read these when implementing):
- *
- *    H2C SW context format & programming:
- *      qdma_context.c:make_qdma_descq_sw_ctxt + qdma_indirect_reg_write
- *      qdma_descq.c:descq_h2c_pidx_update for doorbell
- *
- *    MM submit logic:
- *      qdma_descq.c:descq_mm_proc_request (the request-to-descriptor
- *      conversion) and qdma_request_submit() in libqdma_export.c
- *
- *    Completion polling:
- *      qdma_descq.c:descq_mm_n_h2c_cmpl_status
- *      qdma_descq.c:descq_poll_mm_n_h2c_cmpl_status
- *
- *    Indirect register access (used to program contexts):
- *      qdma_access/qdma_access_common.c:qdma_indirect_reg_write
- *      Registers: QDMA_OFFSET_IND_CTXT_DATA (0x804..0x814),
- *                 QDMA_OFFSET_IND_CTXT_MASK (0x824..0x834),
- *                 QDMA_OFFSET_IND_CTXT_CMD  (0x844)
- * ------------------------------------------------------------------------- */
-static int onic_sysdma_program_qctx(struct onic_private *priv,
-				    struct onic_sysdma_state *s)
+static int sysdma_add_and_start(struct onic_private *priv,
+				enum queue_type_t q_type,
+				unsigned long *out_qhndl)
 {
-	struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
-	struct qdma_sw_ctxt sw_ctxt;
+	struct qdma_queue_conf qconf;
+	char errbuf[ONIC_SYSDMA_ERR_BUFLEN] = {0};
 	int rv;
 
-	if (!qdev) {
-		dev_err(&priv->pdev->dev, "onic_sysdma: priv->hw.qdma is NULL\n");
-		return -ENODEV;
-	}
+	memset(&qconf, 0, sizeof(qconf));
+	qconf.qidx          = ONIC_SYSDMA_REL_QID;
+	qconf.st            = 0;            /* AXI-MM, not stream */
+	qconf.q_type        = q_type;
+	qconf.irq_en        = 0;            /* poll-mode submit */
+	qconf.wb_status_en  = 1;
+	qconf.cmpl_status_acc_en = 0;
+	qconf.cmpl_status_pend_chk = 0;
+	qconf.desc_bypass   = 0;
+	qconf.pfetch_en     = 0;
+	qconf.fetch_credit  = 0;
+	qconf.desc_rng_sz_idx = ONIC_SYSDMA_RNGSZ_IDX;
+	qconf.mm_channel    = 0;
 
-	/* Build H2C SW context for MM mode.  Modeled after
-	 * onic_qdma_init_tx_queue() in onic_hardware.c, but with:
-	 *   is_mm    = 1     (vs 0 for ST netdev)
-	 *   desc_sz  = 2     (32-byte MM desc, vs 1=16B for ST H2C)
-	 *   wbi_chk  = 1     (writeback status enabled)
-	 *   wbi_intvl_en = 0 (write status after every descriptor, no batching)
-	 *   irq_en   = 0     (poll mode — no MSI-X for sysdma)
-	 *   fcrd_en  = 0     (direct PIDX doorbell, not credit-based)
-	 */
-	memset(&sw_ctxt, 0, sizeof(sw_ctxt));
-	sw_ctxt.func_id      = qdev->func_id;
-	sw_ctxt.qen          = 1;
-	sw_ctxt.is_mm        = 1;
-	sw_ctxt.wbk_en       = 1;
-	sw_ctxt.wbi_chk      = 1;
-	sw_ctxt.wbi_intvl_en = 0;
-	sw_ctxt.irq_arm      = 0;
-	sw_ctxt.irq_en       = 0;
-	sw_ctxt.desc_sz      = 2;       /* 32B MM descriptor */
-	sw_ctxt.fcrd_en      = 0;
-	sw_ctxt.at           = 0;
-	sw_ctxt.rngsz_idx    = ONIC_SYSDMA_RNGSZ_IDX;
-	sw_ctxt.desc_base    = s->desc_ring_dma;
-	sw_ctxt.vec          = 0;
-	sw_ctxt.intr_aggr    = 0;
-
-	/* Clear any stale state, then write our context. */
-	rv = qdma_clear_sw_ctxt(qdev, s->qid, QDMA_H2C);
+	rv = qdma_queue_add(priv->qdma_dev_handle, &qconf, out_qhndl,
+			    errbuf, sizeof(errbuf));
 	if (rv < 0) {
 		dev_err(&priv->pdev->dev,
-			"onic_sysdma: clear_sw_ctxt qid=%u failed: %d\n",
-			s->qid, rv);
-		return rv;
-	}
-	rv = qdma_clear_hw_ctxt(qdev, s->qid, QDMA_H2C);
-	if (rv < 0) {
-		dev_err(&priv->pdev->dev,
-			"onic_sysdma: clear_hw_ctxt qid=%u failed: %d\n",
-			s->qid, rv);
-		return rv;
-	}
-	rv = qdma_clear_cr_ctxt(qdev, s->qid, QDMA_H2C);
-	if (rv < 0) {
-		dev_err(&priv->pdev->dev,
-			"onic_sysdma: clear_cr_ctxt qid=%u failed: %d\n",
-			s->qid, rv);
+			"onic_sysdma: qdma_queue_add(%s) failed (%d): %s\n",
+			(q_type == Q_H2C) ? "H2C" : "C2H", rv, errbuf);
 		return rv;
 	}
 
-	rv = qdma_write_sw_ctxt(qdev, s->qid, QDMA_H2C, &sw_ctxt);
+	errbuf[0] = '\0';
+	rv = qdma_queue_start(priv->qdma_dev_handle, *out_qhndl,
+			      errbuf, sizeof(errbuf));
 	if (rv < 0) {
 		dev_err(&priv->pdev->dev,
-			"onic_sysdma: write_sw_ctxt qid=%u failed: %d\n",
-			s->qid, rv);
+			"onic_sysdma: qdma_queue_start(%s) failed (%d): %s\n",
+			(q_type == Q_H2C) ? "H2C" : "C2H", rv, errbuf);
+		/* Caller will run sysdma_fini which removes the queue. */
 		return rv;
-	}
-
-	/* Enable the QDMA H2C MM engine globally (and C2H MM for the
-	 * future read path).  Without this, the engine is idle regardless
-	 * of any per-queue context — programmed queues are visible but no
-	 * descriptors are consumed.
-	 *
-	 * Bits per PG302 §3.7: [0] RUN=1 (engine active), [8] STEP=1
-	 * (single-step disabled = continuous mode).  Use the W1S
-	 * (write-1-set) variant so we don't clobber other bits.
-	 *
-	 * Only the master PF should do this — secondary PFs share the
-	 * same QDMA engine.  We're already in master-only path. */
-	{
-		const u32 mm_run = 0x1;        /* RUN bit */
-		qdma_write_reg(qdev, QDMA_OFFSET_H2C_MM_CONTROL_W1S, mm_run);
-		qdma_write_reg(qdev, QDMA_OFFSET_C2H_MM_CONTROL_W1S, mm_run);
-		dev_info(&priv->pdev->dev,
-			 "onic_sysdma: enabled H2C/C2H MM engines (control reg RUN bit set)\n");
 	}
 
 	dev_info(&priv->pdev->dev,
-		 "onic_sysdma: queue programmed qid=%u (MM mode, ring=256, desc_sz=32B)\n",
-		 s->qid);
+		 "onic_sysdma: %s queue ready (qid=%u, qhndl=%lu)\n",
+		 (q_type == Q_H2C) ? "H2C" : "C2H",
+		 ONIC_SYSDMA_REL_QID, *out_qhndl);
 	return 0;
 }
 
-static void onic_sysdma_clear_qctx(struct onic_private *priv,
-				   struct onic_sysdma_state *s)
+static void sysdma_stop_and_remove(struct onic_private *priv,
+				   unsigned long *qhndl, bool *started,
+				   const char *label)
 {
-	struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
+	char errbuf[ONIC_SYSDMA_ERR_BUFLEN] = {0};
 
-	if (!qdev || !s) {
-		return;
+	if (*started) {
+		(void)qdma_queue_stop(priv->qdma_dev_handle, *qhndl,
+				      errbuf, sizeof(errbuf));
+		*started = false;
 	}
-
-	/* Invalidate first (engine stops fetching), then clear (slot
-	 * marked free for reuse).  Order matters: clearing without
-	 * invalidating can race with in-flight descriptor fetches. */
-	qdma_invalidate_sw_ctxt(qdev, s->qid, QDMA_H2C);
-	qdma_invalidate_hw_ctxt(qdev, s->qid, QDMA_H2C);
-	qdma_clear_sw_ctxt(qdev, s->qid, QDMA_H2C);
-	qdma_clear_hw_ctxt(qdev, s->qid, QDMA_H2C);
-	qdma_clear_cr_ctxt(qdev, s->qid, QDMA_H2C);
+	if (*qhndl) {
+		(void)qdma_queue_remove(priv->qdma_dev_handle, *qhndl,
+					errbuf, sizeof(errbuf));
+		*qhndl = 0;
+	}
+	(void)label;
 }
 
-/* ------------------------------------------------------------------------- *
+/* Build a single-entry sgl pointing at @dma/@len, then submit a
+ * blocking request. */
+static int sysdma_submit_blocking(struct onic_private *priv,
+				  unsigned long qhndl, bool write,
+				  dma_addr_t dma, u64 ep_addr, u32 len)
+{
+	struct qdma_sw_sg sg;
+	struct qdma_request req;
+	ssize_t rv;
+
+	memset(&sg, 0, sizeof(sg));
+	sg.next     = NULL;
+	sg.pg       = NULL;            /* virt_to_page not needed when dma_mapped=1 */
+	sg.offset   = 0;
+	sg.len      = len;
+	sg.dma_addr = dma;
+
+	memset(&req, 0, sizeof(req));
+	req.sgl         = &sg;
+	req.sgcnt       = 1;
+	req.count       = len;
+	req.ep_addr     = ep_addr;
+	req.write       = write ? 1 : 0;
+	req.dma_mapped  = 1;           /* staging is already coherent */
+	req.no_memcpy   = 1;           /* we already memcpy'd in/out */
+	req.timeout_ms  = ONIC_SYSDMA_TIMEOUT_MS;
+	req.fp_done     = NULL;        /* NULL => blocking submit */
+
+	rv = qdma_request_submit(priv->qdma_dev_handle, qhndl, &req);
+	if (rv < 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: %s submit failed (%zd) ep=0x%llx len=%u dma=0x%llx\n",
+			write ? "H2C" : "C2H",
+			rv, ep_addr, len, (u64)dma);
+		return (int)rv;
+	}
+	if ((u32)rv != len) {
+		dev_warn(&priv->pdev->dev,
+			 "onic_sysdma: short xfer (%zd of %u) ep=0x%llx\n",
+			 rv, len, ep_addr);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* ----------------------------------------------------------------- *
  *  Public API
- * ------------------------------------------------------------------------- */
+ * ----------------------------------------------------------------- */
 
 int onic_sysdma_init(struct onic_private *priv)
 {
-	struct device *dev = &priv->pdev->dev;
+	struct device *dev;
 	struct onic_sysdma_state *s;
-	int ret;
+	int rv;
 
 	if (!priv) {
 		return -EINVAL;
 	}
+	dev = &priv->pdev->dev;
 	if (priv->sysdma) {
-		dev_warn(&priv->pdev->dev,
-			 "onic_sysdma: already initialised\n");
+		dev_warn(dev, "onic_sysdma: already initialised\n");
 		return -EBUSY;
+	}
+	if (!priv->qdma_dev_handle) {
+		dev_warn(dev,
+			 "onic_sysdma: libqdma device handle is zero — skipping\n");
+		return -ENODEV;
+	}
+
+	/* Widen coherent mask: libqdma's queue_add allocates internal
+	 * descriptor rings via dma_alloc_coherent.  Our driver-wide
+	 * default is 32-bit, which gives addresses in the 0xff?? range
+	 * on this platform that the QDMA MM engine has historically
+	 * mishandled.  64-bit lets the IOMMU give libqdma cleaner IOVAs. */
+	rv = dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
+	if (rv) {
+		dev_warn(dev,
+			 "onic_sysdma: failed to widen coherent mask (%d) — using 32-bit\n",
+			 rv);
 	}
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s) {
-		return -ENOMEM;
+		rv = -ENOMEM;
+		goto err_restore_mask;
 	}
-
 	mutex_init(&s->lock);
-	/* TODO: derive absolute qid from priv->qid_base + offset, once the
-	 * qdma_dev exposes the queue-base accessor.  For now, hard-code the
-	 * relative offset. */
-	s->qid  = ONIC_SYSDMA_REL_QID;
-	s->pidx = 0;
 
-	/* Descriptor ring + wb_status sentinel in one coherent buffer.
-	 * Size = (ring_depth + 1) * 32 B = 8 KiB + 32 B (sentinel takes
-	 * a full descriptor slot to keep alignment).  QDMA writes the
-	 * wb_status word at offset ring_depth*32 when wbi_chk=1. */
-	s->desc_ring_size = (ONIC_SYSDMA_RING_DEPTH + 1) * ONIC_SYSDMA_DESC_SIZE;
-	s->desc_ring = dma_alloc_coherent(dev, s->desc_ring_size,
-					  &s->desc_ring_dma, GFP_KERNEL);
-	if (!s->desc_ring) {
-		ret = -ENOMEM;
+	/* Bring up the H2C MM queue first — this is the load-bearing
+	 * path for the original sysdma host->DDR4 self-test.  C2H is
+	 * needed for ddr4_read and the round-trip self-test. */
+	rv = sysdma_add_and_start(priv, Q_H2C, &s->qhndl_h2c);
+	if (rv < 0) {
 		goto err_free_state;
 	}
-	memset(s->desc_ring, 0, s->desc_ring_size);
-	s->wb_status = (struct onic_qdma_wb_status *)
-		((u8 *)s->desc_ring + (ONIC_SYSDMA_RING_DEPTH * ONIC_SYSDMA_DESC_SIZE));
+	s->h2c_started = true;
 
-	/* Staging buffer — reused across writes, sized to ONIC_SYSDMA_MAX_XFER. */
+	rv = sysdma_add_and_start(priv, Q_C2H, &s->qhndl_c2h);
+	if (rv < 0) {
+		dev_warn(dev,
+			 "onic_sysdma: C2H setup failed (%d) — write-only mode\n",
+			 rv);
+		/* Not fatal: legacy callers only used H2C anyway. */
+		s->c2h_started = false;
+		s->qhndl_c2h   = 0;
+	} else {
+		s->c2h_started = true;
+	}
+
+	/* Staging buffer for payload memcpy.  One ONIC_SYSDMA_MAX_XFER
+	 * slab reused across calls.  Coherent so we don't have to manage
+	 * dma_sync_*. */
 	s->staging_size = ONIC_SYSDMA_MAX_XFER;
 	s->staging = dma_alloc_coherent(dev, s->staging_size,
 					&s->staging_dma, GFP_KERNEL);
 	if (!s->staging) {
-		ret = -ENOMEM;
-		goto err_free_desc;
-	}
-
-	/* Program QDMA queue context — this is the load-bearing TODO. */
-	ret = onic_sysdma_program_qctx(priv, s);
-	if (ret) {
-		goto err_free_staging;
+		rv = -ENOMEM;
+		goto err_remove_queues;
 	}
 
 	s->initialised = true;
 	priv->sysdma = s;
-	dev_info(dev, "onic_sysdma: ready (qid=%u, ring_depth=%u, max_xfer=%u)\n",
-		 s->qid, ONIC_SYSDMA_RING_DEPTH, ONIC_SYSDMA_MAX_XFER);
+
+	dev_info(dev,
+		 "onic_sysdma: ready via libqdma (h2c=%lu c2h=%lu staging_dma=0x%llx max_xfer=%u)\n",
+		 s->qhndl_h2c, s->qhndl_c2h, (u64)s->staging_dma,
+		 ONIC_SYSDMA_MAX_XFER);
+
+	/* Restore 32-bit coherent mask so other driver paths see the
+	 * environment they were probed under.  Already-allocated
+	 * coherent regions remain valid. */
+	(void)dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	return 0;
 
-err_free_staging:
-	dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
-err_free_desc:
-	dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
+err_remove_queues:
+	sysdma_stop_and_remove(priv, &s->qhndl_c2h, &s->c2h_started, "C2H");
+	sysdma_stop_and_remove(priv, &s->qhndl_h2c, &s->h2c_started, "H2C");
 err_free_state:
+	mutex_destroy(&s->lock);
 	kfree(s);
-	return ret;
+err_restore_mask:
+	(void)dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+	return rv;
 }
 
 void onic_sysdma_fini(struct onic_private *priv)
@@ -349,75 +294,20 @@ void onic_sysdma_fini(struct onic_private *priv)
 	dev = &priv->pdev->dev;
 	priv->sysdma = NULL;  /* prevent re-entry from racing callers */
 
-	if (s->initialised) {
-		onic_sysdma_clear_qctx(priv, s);
+	if (s->staging) {
+		dma_free_coherent(dev, s->staging_size, s->staging,
+				  s->staging_dma);
 	}
 
-	if (s->staging) {
-		dma_free_coherent(dev, s->staging_size, s->staging, s->staging_dma);
-	}
-	if (s->desc_ring) {
-		dma_free_coherent(dev, s->desc_ring_size, s->desc_ring, s->desc_ring_dma);
+	if (priv->qdma_dev_handle) {
+		sysdma_stop_and_remove(priv, &s->qhndl_c2h,
+				       &s->c2h_started, "C2H");
+		sysdma_stop_and_remove(priv, &s->qhndl_h2c,
+				       &s->h2c_started, "H2C");
 	}
 
 	mutex_destroy(&s->lock);
 	kfree(s);
-}
-
-/* ------------------------------------------------------------------------- *
- *  ddr4_write / ddr4_read core path
- * ------------------------------------------------------------------------- */
-
-static int onic_sysdma_submit_one(struct onic_private *priv,
-				  struct onic_sysdma_state *s,
-				  dma_addr_t src, u64 dst, u32 len)
-{
-	struct onic_qdma_mm_desc *ring = s->desc_ring;
-	struct onic_qdma_mm_desc *d;
-	u16 slot, expected_cidx;
-	unsigned long deadline;
-	u16 cidx;
-
-	if (len == 0 || len > ONIC_SYSDMA_MAX_XFER) {
-		return -EINVAL;
-	}
-
-	slot = s->pidx & (ONIC_SYSDMA_RING_DEPTH - 1);
-	d    = &ring[slot];
-
-	onic_qdma_pack_mm_desc(d, (u64)src, dst, len);
-	wmb(); /* descriptor visible to QDMA before doorbell */
-
-	s->pidx = (s->pidx + 1) & (ONIC_SYSDMA_RING_DEPTH - 1);
-	expected_cidx = s->pidx;  /* QDMA bumps cidx to match pidx on completion */
-
-	/* Ring the H2C PIDX doorbell via the existing helper.  This writes
-	 * QDMA_OFFSET_DMAP_SEL_H2C_DESC_PIDX + abs_qid*16 with the new
-	 * pidx.  irq_arm=0 since we poll. */
-	onic_set_tx_head(priv->hw.qdma, s->qid, s->pidx);
-
-	/* Poll the wb_status sentinel.  QDMA writes pidx/cidx into this
-	 * 8-byte word at the end of the descriptor ring after each
-	 * completed batch (wbi_chk=1, wbi_intvl_en=0 → write per descriptor).
-	 *
-	 * Reference: libqdma qdma_descq.c:descq_mm_n_h2c_cmpl_status. */
-	deadline = jiffies + msecs_to_jiffies(ONIC_SYSDMA_TIMEOUT_MS);
-	for (;;) {
-		rmb(); /* re-read wb_status fresh from coherent memory */
-		cidx = be16_to_cpu(s->wb_status->cidx);
-		if (cidx == expected_cidx) {
-			break;
-		}
-		if (time_after(jiffies, deadline)) {
-			dev_err(&priv->pdev->dev,
-				"onic_sysdma: timeout waiting for cidx=%u (got %u, pidx=%u)\n",
-				expected_cidx, cidx, s->pidx);
-			return -ETIMEDOUT;
-		}
-		cpu_relax();
-	}
-
-	return 0;
 }
 
 int onic_ddr4_write(struct onic_private *priv, u64 dst_axi,
@@ -430,17 +320,16 @@ int onic_ddr4_write(struct onic_private *priv, u64 dst_axi,
 		return -EINVAL;
 	}
 	s = priv->sysdma;
-	if (!s || !s->initialised) {
+	if (!s || !s->initialised || !s->h2c_started) {
 		return -ENODEV;
 	}
 
 	mutex_lock(&s->lock);
-
 	memcpy(s->staging, src, len);
-	wmb(); /* host-side write visible before QDMA reads */
+	wmb();   /* host write visible to QDMA before submit */
 
-	ret = onic_sysdma_submit_one(priv, s, s->staging_dma, dst_axi, len);
-
+	ret = sysdma_submit_blocking(priv, s->qhndl_h2c, /*write=*/true,
+				     s->staging_dma, dst_axi, (u32)len);
 	mutex_unlock(&s->lock);
 	return ret;
 }
@@ -448,41 +337,40 @@ int onic_ddr4_write(struct onic_private *priv, u64 dst_axi,
 int onic_ddr4_read(struct onic_private *priv, void *dst,
 		   u64 src_axi, size_t len)
 {
-	/* TODO: implement.  Same shape as write but uses the C2H MM path
-	 * (descriptor src=DDR4_AXI, dst=staging_dma).  Then memcpy from
-	 * staging into caller's dst.  Requires a separate C2H MM queue +
-	 * context programming, similar to the H2C side. */
-	(void)priv;
-	(void)dst;
-	(void)src_axi;
-	(void)len;
-	return -EOPNOTSUPP;
+	struct onic_sysdma_state *s;
+	int ret;
+
+	if (!priv || !dst || len == 0 || len > ONIC_SYSDMA_MAX_XFER) {
+		return -EINVAL;
+	}
+	s = priv->sysdma;
+	if (!s || !s->initialised || !s->c2h_started) {
+		return -ENODEV;
+	}
+
+	mutex_lock(&s->lock);
+
+	ret = sysdma_submit_blocking(priv, s->qhndl_c2h, /*write=*/false,
+				     s->staging_dma, src_axi, (u32)len);
+	if (ret == 0) {
+		rmb();   /* QDMA write visible before host read */
+		memcpy(dst, s->staging, len);
+	}
+
+	mutex_unlock(&s->lock);
+	return ret;
 }
 
-/* ------------------------------------------------------------------------- *
- *  Probe-time self-test
- * ------------------------------------------------------------------------- */
+/* ----------------------------------------------------------------- *
+ *  Probe-time self-test — write 64 B, read it back, memcmp.
+ * ----------------------------------------------------------------- */
 
-/**
- * onic_sysdma_self_test - Smoke-test the H2C MM path with a tiny known write.
- *
- * Writes a 64-byte pattern to DDR4 AXI offset 0 and waits for completion.
- * Doesn't verify the data landed (would need ddr4_read which is still a
- * stub).  Just exercises descriptor build → doorbell → wb_status → cidx
- * advance, end-to-end.  If the wb_status cidx never updates, the MM
- * engine isn't actually consuming descriptors — most likely cause is
- * QDMA H2C MM control register (0x1204) global enable not set.
- *
- * Called once at the end of onic_sysdma_init().  Failure is logged but
- * non-fatal (init still returns 0 — RDMA path will fail later with a
- * more specific error).
- *
- * Return: 0 on success, negative on probe-time test failure.
- */
 int onic_sysdma_self_test(struct onic_private *priv)
 {
-	static const u8 pattern[64] = "ONIC_SYSDMA_PROBE_PATTERN_64B___v4_route_x_smoke_test_2026";
+	static const u8 pattern[64] =
+		"ONIC_SYSDMA_LIBQDMA_SELF_TEST_64B___v5_with_round_trip_2026";
 	const u64 dst_axi_offset = 0x0;
+	u8 readback[64] = {0};
 	int rv;
 
 	if (!priv || !priv->sysdma) {
@@ -490,17 +378,40 @@ int onic_sysdma_self_test(struct onic_private *priv)
 	}
 
 	dev_info(&priv->pdev->dev,
-		 "onic_sysdma: self-test — writing 64 B to DDR4 @ 0x%llx\n",
+		 "onic_sysdma: self-test — writing 64 B to DDR4 @ 0x%llx (libqdma)\n",
 		 dst_axi_offset);
 
 	rv = onic_ddr4_write(priv, dst_axi_offset, pattern, sizeof(pattern));
 	if (rv) {
 		dev_err(&priv->pdev->dev,
-			"onic_sysdma: self-test FAILED: %d\n", rv);
+			"onic_sysdma: self-test WRITE FAILED: %d\n", rv);
 		return rv;
 	}
 
+	if (!priv->sysdma->c2h_started) {
+		dev_warn(&priv->pdev->dev,
+			 "onic_sysdma: self-test write OK; C2H not online so skipping read-back\n");
+		return 0;
+	}
+
+	rv = onic_ddr4_read(priv, readback, dst_axi_offset, sizeof(readback));
+	if (rv) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: self-test READ FAILED: %d\n", rv);
+		return rv;
+	}
+
+	if (memcmp(pattern, readback, sizeof(pattern)) != 0) {
+		dev_err(&priv->pdev->dev,
+			"onic_sysdma: self-test DATA MISMATCH — H2C wrote, C2H read, bytes differ\n");
+		print_hex_dump(KERN_ERR, "expect: ", DUMP_PREFIX_OFFSET,
+			       16, 1, pattern, sizeof(pattern), true);
+		print_hex_dump(KERN_ERR, "got:    ", DUMP_PREFIX_OFFSET,
+			       16, 1, readback, sizeof(readback), true);
+		return -EIO;
+	}
+
 	dev_info(&priv->pdev->dev,
-		 "onic_sysdma: self-test OK — H2C MM path operational\n");
+		 "onic_sysdma: self-test OK — H2C+C2H round-trip verified (libqdma)\n");
 	return 0;
 }

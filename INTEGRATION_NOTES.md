@@ -1,0 +1,424 @@
+# libqdma vendoring — integration notes
+
+Worktree: `/home/alex/mpi-shfs/fpga/open-nic-driver/.claude/worktrees/agent-a94cc7ba`
+Branch:   `worktree-agent-a94cc7ba` (forked off `feature/ernic-v4.2-rebuild`)
+Started:  2026-04-26 02:17 UTC
+Finished: 2026-04-26 02:50 UTC
+
+## Plan executed
+
+All four phases per the plan, all four build gates green:
+
+- Phase A: rename `qdma_access/` -> `qdma_legacy/` (commit `25b50e6`)
+- Phase B+C: vendor `libqdma/` from dma_ip_drivers + Makefile integration (commit `7795428`)
+- Phase D: wire `libqdma_init/exit` + `qdma_device_open/close` (commit `a4e1721`)
+- Phase E: rewrite `onic_sysdma.c` over libqdma's public API (commit `2e2c920`)
+
+Final `onic.ko` size: 14 MB (was ~1 MB).  Symbols `qdma_device_open`,
+`qdma_queue_add`, `qdma_request_submit`, `libqdma_init`,
+`libqdma_exit` all defined.
+
+## Deviations from the plan
+
+### 1. Worktree state at start
+
+The worktree branch was a stale fork-only history (last commit `3de2269`
+"resolve other compiler warnings") missing the entire B7 sysdma series
+that the plan operates on.  The user's main tree is at
+`feature/ernic-v4.2-rebuild` (`2794dfb`) with seven uncommitted
+modifications staged on top.
+
+Recovery: `git reset --hard feature/ernic-v4.2-rebuild` in the
+worktree, then copied the seven uncommitted files
+(onic_ethtool.c, onic_hardware.{c,h}, onic_lib.h, onic_sysdma.c,
+qdma_access/qdma_device.{c,h}) from the main tree and committed them
+as a "wip: import uncommitted main tree changes" baseline commit
+(`35690fc`) so the integration could start from a green tree.
+
+This means the user's uncommitted main-tree edits are preserved in the
+worktree's history but not in the main tree — when they review/merge,
+they should compare against `feature/ernic-v4.2-rebuild` *plus* their
+working-directory changes, not just the branch tip.
+
+### 2. libreconic symlink
+
+`onic_ib.c` includes `../libreconic/reconic_reg.h`.  In the main tree
+this resolves to `/home/alex/mpi-shfs/fpga/libreconic/`.  In the
+worktree the relative path goes to `.claude/worktrees/libreconic` which
+doesn't exist.  Fix: created a symlink
+`/home/alex/mpi-shfs/fpga/open-nic-driver/.claude/worktrees/libreconic
+-> /home/alex/mpi-shfs/fpga/libreconic`.  This is local to the worktree
+filesystem layout and won't affect anything in the main tree.
+
+### 3. qsets_max derivation in qdma_dev_conf
+
+The plan said "qsets_max = priv->hw.num_q" but `struct onic_hardware`
+has no `num_q` member.  Derived it instead from
+`((struct qdma_dev *)priv->hw.qdma)->num_queues` (the legacy struct's
+field) with a fallback of 64 if the legacy handle isn't set.
+
+### 4. Comment-level qdma_access references
+
+Two comment blocks (in `onic_qdma_mm.h` and the original `onic_sysdma.c`
+TODO header) still mentioned `qdma_access/` after Phase A.  Both files
+were deleted/rewritten in Phase E, so the final tree is clean.
+
+### 5. -Werror / kernel module build
+
+The plan said to drop -Werror because libqdma has unused-variable
+warnings.  In practice libqdma compiled cleanly under gcc-12 and
+kernel 6.8 — zero warnings, zero errors.  Dropped -Werror anyway per
+plan (defensive against future kernel/gcc bumps).  -Wall is still on.
+
+### 6. `clear_hardware` label rename
+
+In `onic_setup_primary`, inserted `qdma_device_open` between
+`onic_init_hardware` and `onic_init_interrupt`, which required a new
+`clear_qdma:` goto target.  Renamed the existing `clear_hardware:`
+label to `clear_qdma:` and made it fall through to
+`onic_clear_hardware`; the failure-path label graph is now
+`clear_interrupt -> clear_qdma -> clear_capacity -> free_netdev`.
+Secondary's `clear_hardware:` label is unaffected (separate function).
+
+## Things the user should look at
+
+1. **Master PF only — secondary CMAC1 has no libqdma handle.**
+   `qdma_device_open` is called once per PCI function in our driver,
+   in `onic_setup_primary` only.  The secondary netdev for CMAC1 (when
+   `num_cmacs >= 2`) reaches into the primary's QDMA via a child
+   `qdma_dev` that was already created in the legacy hardware setup —
+   that path is untouched.  If we ever want sysdma on CMAC1 we'd need
+   either (a) a second `qdma_device_open` call (likely conflicts with
+   our shared-MSI-X model) or (b) routing CMAC1's sysdma through the
+   primary's `qdma_dev_handle` with an offset queue.  Out of scope.
+
+2. **Coherent mask widening still in place.**
+   The hand-rolled path widened to 64-bit at sysdma_init, allocated,
+   then restored to 32-bit.  Kept this in the new path because libqdma
+   does its own coherent allocations inside `qdma_queue_add`.  Without
+   the widen, those allocations would land in the same 0xff?? IOVA
+   range that the original DMAR fault came from.  If runtime testing
+   reveals libqdma still gets a low-address ring, we may need to keep
+   the mask at 64-bit longer.
+
+3. **fp_done = NULL means blocking submit.**
+   libqdma's `qdma_request_submit` waits internally on a wait queue
+   when fp_done is NULL.  Confirmed by reading
+   `libqdma_export.c:2413` (`wait = req->fp_done ? 0 : 1;`).  This
+   matches the plan's requirement and the old hand-rolled
+   "submit + poll" semantics.
+
+4. **Netdev path still on legacy.**
+   Netdev queue setup, doorbells, completion polling, tx/rx fast
+   paths — all still go through `qdma_legacy/` (renamed from
+   `qdma_access/`).  No data-plane change.  Only sysdma's *one* queue
+   per PF moved to libqdma.
+
+5. **POLL_MODE was load-bearing.**
+   With INTR_MODE libqdma allocates MSI-X vectors that conflict with
+   our `onic_init_interrupt`.  POLL_MODE + zero msix counts (as set
+   in `priv->qdma_dev_conf`) make `qdma_device_open` a register-only
+   operation.  Don't change this without also rewriting the netdev
+   IRQ allocator.
+
+## Risk register status
+
+- R1 (struct qdma_dev collision): Mitigated.  `grep -l 'libqdma/qdma_device.h' onic_*.c` returns nothing.
+- R6 (POLL_MODE): Set in `priv->qdma_dev_conf.qdma_drv_mode`.
+- R8 (Threading): `libqdma_init(0, NULL)`.
+- R10 (Coherent mask): Widened to 64-bit at sysdma_init, restored to 32-bit afterward.  See note 2 above if probe trouble appears.
+- R11 (API drift): Did not need to fall back — vendored tree from `dma_ip_drivers/` built first try.
+- R12 (Probe ordering): `onic_sysdma_init` runs after `qdma_device_open` succeeds.  Sysdma init also explicitly checks `priv->qdma_dev_handle != 0` before doing anything.
+
+## Files changed
+
+- `Makefile` — SRC_FOLDERS list + per-folder -I, dropped -Werror, added -DMBOX_INTERRUPT_DISABLE.
+- `onic.h` — include `libqdma/libqdma_export.h`, add `qdma_dev_handle` + `qdma_dev_conf` fields.
+- `onic_main.c` — libqdma_init/exit in module init/exit, qdma_device_open in setup_primary, qdma_device_close in teardown_netdev, clear_hardware -> clear_qdma label rename.
+- `onic_sysdma.c` — total rewrite over libqdma queue API.
+- `onic_sysdma.h` — drop now-unused ring/desc constants.
+- `onic_qdma_mm.h` — deleted (libqdma owns descriptor format).
+- `onic_netdev.c`, `onic_main.c`, `onic_sysdma.c` — `qdma_access/` -> `qdma_legacy/` include path updates.
+- `qdma_access/` -> `qdma_legacy/` rename (15 files moved).
+- `libqdma/` — new tree, ~50 files copied verbatim from dma_ip_drivers.
+
+## Final build artifacts
+
+- `onic.ko` — 14 MB, BTF skipped (no vmlinux), zero compile warnings.
+- `/tmp/onic_libqdma_final_build.log` — clean compile of all phases.
+
+## Stopping condition
+
+Plan's stopping condition was "module builds clean and is ready for the
+user to scp to the FPGA host."  Met.  No hardware run was attempted.
+See `TESTING.md` for the user's runbook.
+
+---
+
+# Option 3: BAR ownership refactor — 2026-04-27
+
+Branch:   `worktree-agent-a94cc7ba` (continued)
+Started:  2026-04-27 13:42 UTC
+Finished: 2026-04-27 13:50 UTC
+
+## Phases
+
+1. Revert Option 2 — `git revert 4f2dc17` (commit `ecbf2a9`).
+2. Add libqdma accessors `qdma_device_get_{config,user}_regs()` plus a
+   user-BAR ioremap inside `xdev_identify_bars` (commit `f78e150`).
+3. Refactor `qdma_legacy/qdma_device.{c,h}` to take a borrowed BAR 0
+   pointer; add `borrowed_addr` flag mirroring `is_child` to skip
+   iounmap on destroy (commit `40851eb`).
+4. Update `onic_hardware.c` to source `hw->addr` (BAR2 + SHELL_START)
+   and the BAR0 pointer from libqdma; drop the iounmap_bar2 cleanup
+   path and the BAR2 pci_iounmap in `onic_clear_hardware`
+   (commit `42186f9`).
+5. Update `onic_main.c`: drop pci_request_mem_regions /
+   pci_release_mem_regions / pci_disable_device redundancy, reorder
+   probe so qdma_device_open runs before onic_init_hardware, add
+   defensive checks (R1 + R8), reorder failure-label cascade, reorder
+   teardown so clear_hardware runs before qdma_device_close
+   (commit `77d6f92`).
+
+## Key architectural detail discovered
+
+The plan said "after the user-BAR ioremap" in xdev_map_bars, but
+libqdma's stock `xdev_map_bars` only ioremaps the *config* BAR.  The
+user (AXI Master Lite, BAR 2) BAR is referenced by number only and
+never mapped by libqdma itself.  I added the user-BAR ioremap inside
+`xdev_identify_bars` (after `bar_num_user` is identified) and the
+matching iounmap in `xdev_unmap_bars`.  This is a sensible extension
+of libqdma rather than a hack — the field, accessor, and ioremap all
+live behind libqdma's abstractions.
+
+## Teardown ordering subtlety
+
+Original plan put `qdma_device_close` BEFORE `onic_clear_hardware` in
+`onic_teardown_netdev`.  That doesn't work under Option 3 because
+`onic_clear_hardware` writes through `hw->addr` (the QDMA shell reset
+and `QDMA_FUNC_OFFSET_QCONF(0) = 0`), and `hw->addr` is borrowed from
+libqdma — once `qdma_device_close` iounmaps BAR 2, that pointer is
+dangling.  Reordered: `onic_clear_hardware` first (still has a valid
+mapping), then `qdma_device_close` (the iounmap point).  The same
+ordering inversion is reflected in the failure-label cascade in
+`onic_setup_primary`.
+
+## Probe failure path: pci_disable_device balance
+
+`qdma_device_close` itself calls `pci_disable_device`.  On the probe
+failure path, after `onic_setup_primary` partially unwinds (which may
+or may not have called `qdma_device_close` depending on how far it
+got), the outer `onic_probe` must avoid double-disabling.  Fix:
+`if (pci_is_enabled(pdev)) pci_disable_device(pdev)` after a failed
+setup_primary.  The earlier `goto disable_device` from the dma_set_mask
+failure remains an unconditional disable because pci_enable_device_mem
+just succeeded one line above.
+
+## Risk register status (Option 3 update)
+
+- R1 (bar_num_user): defensive check at probe step 4 fails fast if
+  libqdma reports anything other than 2.
+- R2 (qdma_device_close double-disable): handled — `onic_remove` no
+  longer calls `pci_disable_device`, and the probe failure path uses
+  `pci_is_enabled()` to gate.
+- R3 (double-mapping eliminated): legacy borrows BAR 0 via
+  `qdma_create_dev(pdev, bar0_regs)`.  Onic does not iomap BAR 2; it
+  borrows libqdma's mapping with a SHELL_START offset.
+- R4 (sysdma_fini before qdma_device_close): verified, unchanged.
+- R5 (POLL_MODE): unchanged.
+- R6 (mem regions only on AU200): unchanged — pci_request_regions in
+  libqdma is now the only claim.
+- R7 (rmmod warning eliminated): redundant calls removed.
+- R8 (qsets_max underflow): defensive check at probe step 5.
+- R9 (FMAP programmed twice): unchanged (harmless).
+- R10 (bar identification log): kept the existing libqdma `pr_info`
+  plus an added "AXI Master Lite BAR N mapped at PTR" line for
+  Option 3 verification.
+
+## Files changed (Option 3 only)
+
+- `libqdma/xdev.h` — add `user_regs` field.
+- `libqdma/xdev.c` — ioremap user BAR in `xdev_identify_bars`,
+  iounmap in `xdev_unmap_bars`, define accessors.
+- `libqdma/libqdma_export.h` — declare accessors.
+- `qdma_legacy/qdma_device.{c,h}` — borrow BAR 0 instead of mapping.
+- `onic_hardware.c` — source BAR pointers from libqdma; drop
+  iounmap_bar2 path.
+- `onic_main.c` — drop pci_request/release/disable redundancy;
+  reorder probe + teardown; add defensive checks.
+
+## Build artifact
+
+`onic.ko` — 14 MB, zero compile warnings (one stock kernel notice
+"compiler differs" is host-environment unrelated).  Build log:
+`/tmp/option3_build.log`.
+
+## Stopping condition
+
+Plan's stopping condition was "Final clean build: clean, similar size
+.ko (~14 MB)."  Met.  No hardware run attempted; that is the user's
+job per the plan.
+
+## ST datapath regression after Option 3 — diagnosis and fix (2026-04-26)
+
+### Symptom (verified on hardware after `2a16bb1`)
+
+For both netdev interfaces (enp1s0, enp1s0d1):
+
+| Path | Driver counter | CMAC ethtool counter            |
+|------|----------------|----------------------------------|
+| TX   | 37 packets     | 0  (`stat_tx_total_pkts: 0`)    |
+| RX   | 0  packets     | 70 (`stat_rx_total_pkts: 70`)   |
+
+Sysdma (MM-mode) self-test passes — QDMA engine itself is alive.  Only
+the streaming (ST-mode) netdev datapath was broken.
+
+### Root cause
+
+Option 3 made libqdma the BAR owner and required `qdma_device_open` to
+run BEFORE `onic_init_hardware`.  `qdma_device_open` invokes
+`eqdma_set_default_global_csr()` which programs the QDMA core's global
+CSR pool tables (rng_sz / c2h_buf_sz / c2h_timer_cnt / c2h_cnt_th) and,
+for EQDMA5, calls `eqdma_set_perf_opt()` which carefully tunes 14
+performance/throttling registers (visible as `eqdma_set_perf_opt: reg
+= 0x...` lines in dmesg).
+
+Then `onic_init_hardware_master()` ran legacy
+`onic_qdma_init_csr(qdev)` which re-programmed the SAME global CSR
+pools with QDMA4-style values AND directly clobbered three of the
+EQDMA5 perf_opt registers:
+
+- `0x250` GLBL_DSC_CFG       — overwritten with legacy value
+- `0xB08` C2H_PFCH_CFG       — overwritten (also computed from
+  `0xBE0` cache-depth using QDMA4-style field layout)
+- `0xE24` H2C_REQ_THROT      — overwritten with legacy value
+- `0xB50` C2H_WB_COAL_CFG    — overwritten
+- `0x204…0x240` GLBL_RNG_SZ pool — overwritten with off-by-one values
+- `0xA00…` C2H timer pool    — overwritten
+- `0xA40…` C2H counter-th pool — overwritten
+- `0xAB0…` C2H buffer-size pool — overwritten
+
+The result: ST-mode queue contexts written by the driver indexed pool
+entries with the wrong sizes, and EQDMA5's perf_opt landed in a hybrid
+state that caused TX descriptors to land in QDMA but never advance to
+CMAC, and CMAC RX completions to never propagate up.  MM-mode sysdma
+is permissive enough to tolerate the mis-tuned perf_opt and uses a
+single fixed-size descriptor ring, so it kept working.
+
+The previous probe order (libqdma after onic) made the legacy CSR
+init "win" the race and ST happened to work — by accident, on values
+that happened to match QDMA4-era expectations for that shell.
+
+### Fix chosen — Fix A (delete the redundant CSR init)
+
+`onic_qdma_init_csr()` and its call site are removed.  All registers
+it touched are programmed by libqdma's `eqdma_set_default_global_csr`
+(BEFORE `onic_init_hardware_master` runs, per Option 3 ordering).
+
+The driver-side ring/buffer/timer/counter pool tables in `onic_hardware.c`
+are re-aligned to match libqdma's defaults so that per-queue
+`rngsz_idx` / `bufsz_idx` etc. address the same hardware sizes the
+driver allocates DMA rings for:
+
+```
+rngcnt_pool[0] = 2049  (was 4096)  — match libqdma rng_sz[0]
+c2h_timer_pool = {1,2,4,...}       — match libqdma tmr_cnt
+c2h_thres_pool = {2,4,8,16,...}    — match libqdma cnt_th
+c2h_bufsz_pool                     — already matched libqdma buf_sz
+```
+
+Fix B (reorder shell reset before `qdma_device_open`) was not needed:
+the only "shell reset" in `onic_init_hardware_master` is
+`onic_reset_cmac_shell` which targets shell-only registers
+(SYSCFG_OFFSET_SHELL_RESET) that libqdma never touches.  The
+QDMA-shell reset that DOES run before libqdma's perf_opt is internal
+to libqdma's own bring-up and does not clobber perf_opt.
+
+Sysdma's MM round-trip is preserved logically: `qdma_queue_add` /
+`qdma_request_submit` are unaffected by deleting `onic_qdma_init_csr`
+because libqdma was already programming the same registers (and
+correctly).  If anything, sysdma is now using the canonical libqdma
+values rather than the legacy override.
+
+### Files changed
+
+- `onic_hardware.c` — delete `onic_qdma_init_csr()` and its call
+  site; re-align pool tables to libqdma defaults; long comment in
+  the pool-table block explains the contract.
+- `INTEGRATION_NOTES.md` — this section.
+- `TESTING.md` — add ethtool counter check (TX/RX counters must
+  increment under traffic, not just driver counters).
+
+### What we did NOT do
+
+- Did NOT revert Option 3's BAR ownership.  `qdma_device_get_user_regs`,
+  `qdma_device_get_config_regs`, the new probe ordering, the
+  `pci_request_mem_regions` removal — all preserved.
+- Did NOT add `pci_request_mem_regions` back.  libqdma is the BAR owner.
+- Did NOT touch the sysdma path.  `qdma_queue_add`, `qdma_request_submit`,
+  the self-test — unchanged.
+
+## 8. Legacy ST H2C descriptor SOP/EOP fix (2026-04-26)
+
+After the Option 3 + perf_opt fixes the QDMA-core CSRs were correct but
+ST TX still produced `stat_tx_total_pkts = 0` at the CMAC under ping
+traffic, even though the driver-side ifconfig TX counter incremented
+normally.  Diagnostic chain:
+
+1. CMAC counters frozen at 0 ⇒ frames never reach the CMAC TX FIFO.
+2. QDMA H2C-engine debug counters showed descriptors fetched and
+   completions written ⇒ QDMA itself was running.
+3. Comparison of the legacy `qdma_pack_h2c_st_desc()` byte layout
+   against libqdma's reference `struct qdma_h2c_desc` (in
+   `libqdma/qdma_regs.h`) showed bytes 6-7 — where libqdma writes the
+   `flags` field, including `S_H2C_DESC_F_SOP` (=1) and
+   `S_H2C_DESC_F_EOP` (=2) — were left as compiler padding (zero) by
+   the legacy struct/packer.
+4. EQDMA5 Soft IP requires SOP|EOP on every single-descriptor frame.
+   With both bits clear the IP silently drops the frame between QDMA
+   and CMAC.
+
+### Fix
+
+In `qdma_legacy/qdma_export.h`:
+- Replace the 16-bit compiler padding in `struct qdma_h2c_st_desc`
+  with a named `u16 flags` field at the same offset (bytes 6-7).
+- Add `QDMA_H2C_ST_DESC_F_SOP`/`_EOP` (BIT(0)/BIT(1)) and
+  `QDMA_H2C_ST_DESC_DW0_FLAGS_MASK` (bits 63:48 of DW0).  Bit
+  positions match libqdma's `S_H2C_DESC_F_SOP`/`_EOP` macros.
+
+In `qdma_legacy/qdma_export.c::qdma_pack_h2c_st_desc()`:
+- OR `SOP|EOP` into the caller-supplied `flags` and pack the result
+  into bits 63:48 of DW0.  Set unconditionally because every netdev
+  TX frame on this driver is a single descriptor (caller in
+  `onic_xmit_frame` / `onic_xmit_xdp_ring` always writes one
+  descriptor per skb/xdp_frame).
+
+DW0 layout (LE on x86 / PCIe):
+
+```
+bits  [31: 0]  metadata
+bits  [47:32]  len
+bits  [63:48]  flags    <-- bit 0 = SOP, bit 1 = EOP  (was zero padding)
+DW1   [63: 0]  src_addr
+```
+
+### Files changed
+
+- `qdma_legacy/qdma_export.h` — add named `flags` field; add
+  `QDMA_H2C_ST_DESC_F_SOP/_EOP` and `_FLAGS_MASK` macros.
+- `qdma_legacy/qdma_export.c` — pack `flags | SOP | EOP` into DW0
+  bits 63:48.
+- `INTEGRATION_NOTES.md` — this section.
+- `TESTING.md` — concrete post-fix expectation: ping succeeds and
+  `stat_tx_total_pkts` increments.
+
+### What we did NOT do
+
+- Did NOT modify libqdma sources — fix is in `qdma_legacy/` only,
+  matching the constraint that libqdma stays vendored verbatim.
+- Did NOT touch sysdma — sysdma uses libqdma's `qdma_request_submit`
+  which goes through `struct qdma_h2c_desc` and already sets SOP/EOP
+  correctly when needed (`libqdma/qdma_descq.c`, ~line 632).
+- Did NOT change the callers in `onic_netdev.c`.  They leave
+  `desc.flags = 0` (default-init); the packer ORs SOP|EOP in.

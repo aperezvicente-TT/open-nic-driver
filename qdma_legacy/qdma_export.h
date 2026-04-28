@@ -59,10 +59,21 @@ enum qdma_wb_intvl {
 #define QDMA_H2C_ST_DESC_SIZE                   16
 #define QDMA_H2C_ST_DESC_DW0_METADATA_MASK      GENMASK_ULL(31, 0)
 #define QDMA_H2C_ST_DESC_DW0_LEN_MASK           GENMASK_ULL(47, 32)
+#define QDMA_H2C_ST_DESC_DW0_FLAGS_MASK         GENMASK_ULL(63, 48)
+
+/* Descriptor flag bits at bytes 6-7 of DW0 (matches libqdma's
+ * struct qdma_h2c_desc.flags layout / S_H2C_DESC_F_* in qdma_regs.h).
+ * EQDMA5 Soft IP requires SOP|EOP on every single-descriptor frame —
+ * without these bits, the IP silently drops the frame between QDMA
+ * and CMAC.
+ */
+#define QDMA_H2C_ST_DESC_F_SOP                  BIT(0)
+#define QDMA_H2C_ST_DESC_F_EOP                  BIT(1)
 
 struct qdma_h2c_st_desc {
 	u32 metadata;
 	u16 len;
+	u16 flags;	/* bytes 6-7: SOP/EOP for EQDMA5 */
 	u64 src_addr;
 };
 

@@ -1,0 +1,246 @@
+# Testing the libqdma-vendored onic.ko (Option 3 BAR ownership)
+
+Built on the dev host; needs to be scp'd to the FPGA host and insmod'd.
+
+This build implements the canonical RecoNIC BAR-ownership pattern:
+**libqdma is the sole owner of the PCIe BAR claims and ioremaps**;
+onic borrows BAR pointers via `qdma_device_get_{config,user}_regs()`.
+This replaces the temporary Option 2 release-the-claim hack.
+
+## 1. Copy artifacts
+
+From the dev host (this worktree):
+
+```bash
+cd /home/alex/mpi-shfs/fpga/open-nic-driver/.claude/worktrees/agent-a94cc7ba
+scp onic.ko <fpga-host>:/tmp/onic.ko
+```
+
+The .ko is large (~14 MB) because libqdma is now linked in.  This is
+expected — RecoNIC's onic.ko is similar.  At runtime libqdma is just
+loaded in memory; nothing is allocated until `qdma_device_open` runs in
+probe.
+
+## 2. Reload the driver
+
+On the FPGA host:
+
+```bash
+sudo rmmod onic           # if currently loaded
+sudo dmesg -C             # clear so the next dmesg is just our boot
+sudo insmod /tmp/onic.ko
+```
+
+## 3. Confirm probe and self-test
+
+```bash
+sudo dmesg | grep -E 'onic|qdma'
+```
+
+What you should see (in order):
+
+```
+onic: OpenNIC Linux Kernel Driver ...
+onic: device is a master PF
+onic: <name>: AXI Master Lite BAR 2 mapped at <ptr> (len=...)   <- new in Option 3
+onic: ...   (other init lines: hardware, interrupt, ernic, register_netdev)
+onic: onic_sysdma: ready via libqdma (h2c=<h> c2h=<c> staging_dma=0x... max_xfer=1048576)
+onic: onic_sysdma: self-test - writing 64 B to DDR4 @ 0x0 (libqdma)
+onic: onic_sysdma: self-test OK - H2C+C2H round-trip verified (libqdma)
+```
+
+What you should NOT see anymore (was an Option 2 artifact):
+
+```
+onic 0000:01:00.0: pci_release_mem_regions: ...   <- absent under Option 3
+```
+
+On rmmod, the Option 2 build emitted a benign warning about a redundant
+`pci_disable_device`; under Option 3 that warning is gone because
+`qdma_device_close` is the sole caller and `onic_remove` no longer makes
+the redundant call.
+
+If the read-back passes, the host->DDR4 path is correct end-to-end.
+This is the regression we were chasing with the hand-rolled MM submit:
+descriptor bytes were correct on readback, but transfers faulted at
+0xff00000000.  Vendoring libqdma replaces the entire MM path with
+AMD's shipping code.
+
+## 4. If it still fails
+
+Capture what dmesg actually shows for the sysdma lines, plus:
+
+```bash
+sudo cat /sys/kernel/debug/qdma-* 2>/dev/null     # libqdma debugfs (if mounted)
+sudo dmesg | grep -E 'DMAR|IOMMU|qdma_descq|qdma_queue' | tail -50
+sudo lspci -vvv -s <bdf> | head -80
+```
+
+Likely failure modes and what they mean:
+
+- `qdma_device_open() failed: -EBUSY/-ENODEV` — libqdma can't claim the
+  PCI function.  Under Option 3 onic should NEVER hold the BAR claim
+  itself.  Verify that no `pci_request_mem_regions` call survived in
+  the source (`grep pci_request onic_main.c` should return nothing).
+  Also: if the kernel module load order ever puts another driver that
+  binds the same BDF first, libqdma's claim will fail here.
+
+- `libqdma reports user BAR N, expected 2 — refusing to bind` — the
+  defensive check at probe step 4 fired.  R1 in the design plan.
+  Inspect the shell's `qdma_get_user_bar` CSR; if the design genuinely
+  uses a different user BAR, update the constant in `onic_setup_primary`
+  (and the `SHELL_START` offset will likely move too).
+
+- `libqdma reports qsets_max=N, need >= 32 for sysdma — refusing to bind`
+  — the defensive check at probe step 5 fired (R8).  Either the shell
+  exposes too few queues, or libqdma's resource manager reduced the
+  available range.  sysdma's self-test uses qid 31; widening to 32 or
+  more is the only way forward.
+
+- `qdma_queue_add(H2C) failed (-EINVAL): ...` — qsets_max in
+  qdma_dev_conf is smaller than ONIC_SYSDMA_REL_QID (31).
+  We set qsets_max from the legacy `qdma_dev->num_queues` — verify the
+  shell exposes >= 32 queues per function.
+
+- `onic_sysdma: self-test WRITE FAILED: -ETIMEDOUT` — libqdma's
+  internal wait_for_cmpl timed out.  This is what the hand-rolled
+  path was failing on too.  Check IOMMU / DMAR messages in dmesg —
+  on the failing run the hint was "DMAR: DMA Read NO_PASID for device
+  ... addr 0xff00000000".  If you see that, try widening the per-PF
+  DMA mask further, disabling IOMMU passthrough, or running with
+  `intel_iommu=off`.
+
+- `onic_sysdma: self-test DATA MISMATCH` — bytes round-trip but
+  contents differ.  Means the descriptor *did* land at DDR4 but at
+  the wrong offset, or our staging memcpy is racing the DMA engine.
+  print_hex_dump is included in the failure path for diagnosis.
+
+## 5. Removing the driver
+
+```bash
+sudo rmmod onic
+```
+
+This now also calls `libqdma_exit()`.  The teardown path closes the
+sysdma queues (qdma_queue_stop + qdma_queue_remove), then closes the
+libqdma device handle, then proceeds with the existing legacy QDMA
+shell teardown.
+
+## 6. Notes for the user
+
+- Netdev path (CMAC0/CMAC1, RX/TX queues) is unchanged.  It still uses
+  the renamed `qdma_legacy/` (formerly `qdma_access/`) hand-rolled
+  helpers.  Vendoring libqdma did **not** migrate the netdev path —
+  only sysdma.
+
+- ERNIC, IB device, PTP, hwmon, ethtool — all unchanged.
+
+- If insmod fails with "Unknown symbol" against the kernel:
+  drop -DMBOX_INTERRUPT_DISABLE from the Makefile and rebuild.  We set
+  that to match RecoNIC because we run libqdma in poll mode; in
+  interrupt mode libqdma also pulls in mailbox handlers.
+
+## 7. ST netdev datapath verification (post-Option 3 ST regression fix)
+
+After the Option 3 BAR ownership refactor, ST-mode TX/RX appeared to
+work at the driver level (driver-side counters incremented) but the
+QDMA→CMAC and CMAC→QDMA datapaths silently dropped traffic.  Driver
+ifconfig counters alone are NOT sufficient to confirm ST is working —
+they count packets the driver pushed/pulled at QDMA, not what the CMAC
+actually transmitted/received on the wire.
+
+The ST-regression fix (delete legacy `onic_qdma_init_csr`, align pool
+tables to libqdma values) restores correct QDMA-core CSR programming.
+Verify it on hardware as follows:
+
+```bash
+# 1. Configure both interfaces
+sudo ip addr add 10.0.0.1/24 dev enp1s0
+sudo ip addr add 10.0.0.2/24 dev enp1s0d1
+sudo ip link set enp1s0 up
+sudo ip link set enp1s0d1 up
+
+# 2. Snapshot CMAC counters BEFORE traffic
+sudo ethtool -S enp1s0 | grep -E 'stat_(tx|rx)_total_pkts'
+
+# 3. Generate traffic (ping, or a short iperf3 burst)
+ping -c 10 10.0.0.2
+
+# 4. Snapshot CMAC counters AFTER traffic
+sudo ethtool -S enp1s0    | grep -E 'stat_(tx|rx)_total_pkts'
+sudo ethtool -S enp1s0d1  | grep -E 'stat_(tx|rx)_total_pkts'
+```
+
+PASS criteria:
+
+- `stat_tx_total_pkts` MUST increment by ~10 on the side that sent the
+  pings (driver pushed → CMAC transmitted on the wire).
+- `stat_rx_total_pkts` MUST increment by ~10 on the side that received
+  them (CMAC pulled from the wire → driver delivered to NAPI).
+- `ifconfig` / `ip -s link show` packet counters MUST also increment
+  on both sides.
+
+FAIL signature (the regression we fixed):
+
+- Driver `ifconfig` TX counter increments but `stat_tx_total_pkts`
+  stays at 0 — packets never crossed the QDMA→CMAC boundary.
+- `stat_rx_total_pkts` increments under cable traffic but driver RX
+  counter stays at 0 — CMAC saw packets but they never crossed
+  CMAC→QDMA→NAPI.
+
+If either FAIL signature appears: re-check that
+`eqdma_set_perf_opt: reg = 0x...` lines appear in `dmesg | grep
+eqdma_set_perf_opt` during probe (libqdma's QDMA5 perf init ran), and
+that no driver code is writing to `0x250 / 0xB08 / 0xE24` after
+that.  `git log -- onic_hardware.c | head` should show the
+"ST datapath fix" commit applied.
+
+## 8. ST H2C SOP/EOP descriptor fix verification (post-`qdma_legacy` patch)
+
+After applying the `qdma_legacy: set SOP|EOP on ST H2C descriptors for
+EQDMA5` commit, both halves of the ST datapath (QDMA-core CSRs from
+section 7, *and* per-descriptor SOP/EOP from this fix) are in place.
+Run the same procedure as section 7 with these stricter pass criteria:
+
+```bash
+sudo ip addr add 10.0.0.1/24 dev enp1s0
+sudo ip addr add 10.0.0.2/24 dev enp1s0d1
+sudo ip link set enp1s0 up
+sudo ip link set enp1s0d1 up
+
+# Snapshot
+sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts
+
+# Generate traffic — ping MUST succeed end-to-end now
+ping -c 10 10.0.0.2
+
+# Snapshot
+sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts
+sudo ethtool -S enp1s0    | grep stat_rx_total_pkts
+```
+
+PASS criteria (concrete, post SOP/EOP fix):
+
+- `ping -c 10` reports 0% packet loss.
+- `sudo ethtool -S enp1s0d1 | grep stat_tx_total_pkts` returns a
+  NONZERO value and increments by ≥10 across the ping run (every TX
+  descriptor now has SOP|EOP, so EQDMA5 forwards each frame to the
+  CMAC instead of dropping it).
+- `sudo ethtool -S enp1s0   | grep stat_rx_total_pkts` increments by
+  ≥10 on the receiving side.
+- Driver `ifconfig enp1s0d1` TX counter and `stat_tx_total_pkts` both
+  increment, and by the same amount.
+
+FAIL signature for THIS fix specifically:
+
+- Driver TX counter increments, `stat_tx_total_pkts` still 0:
+  the SOP/EOP bits aren't reaching the descriptor.  Confirm the
+  packer change with:
+
+  ```bash
+  grep -n "QDMA_H2C_ST_DESC_F_SOP\|QDMA_H2C_ST_DESC_DW0_FLAGS_MASK" \
+      qdma_legacy/qdma_export.c qdma_legacy/qdma_export.h
+  ```
+
+  Both files should reference the macros; `qdma_export.c` should OR
+  `SOP|EOP` and `FIELD_SET` them into DW0.

@@ -20,6 +20,7 @@
 void qdma_pack_h2c_st_desc(u8 *data, struct qdma_h2c_st_desc *desc)
 {
 	u64 *dw0, *dw1;
+	u16 flags;
 
 	if (!data || !desc)
 		return;
@@ -27,9 +28,18 @@ void qdma_pack_h2c_st_desc(u8 *data, struct qdma_h2c_st_desc *desc)
 	dw0 = (u64 *)data;
 	dw1 = (u64 *)data + 1;
 
+	/* Every netdev TX frame is a single descriptor, so SOP|EOP is
+	 * unconditional. EQDMA5 Soft IP requires these bits at bytes
+	 * 6-7 of the descriptor or it silently drops the frame between
+	 * QDMA and CMAC (stat_tx_total_pkts stays 0). Matches libqdma's
+	 * S_H2C_DESC_F_SOP / S_H2C_DESC_F_EOP convention.
+	 */
+	flags = desc->flags | QDMA_H2C_ST_DESC_F_SOP | QDMA_H2C_ST_DESC_F_EOP;
+
 	*dw0 = 0;
 	*dw0 = (FIELD_SET(QDMA_H2C_ST_DESC_DW0_METADATA_MASK, desc->metadata) |
-		FIELD_SET(QDMA_H2C_ST_DESC_DW0_LEN_MASK, desc->len));
+		FIELD_SET(QDMA_H2C_ST_DESC_DW0_LEN_MASK, desc->len) |
+		FIELD_SET(QDMA_H2C_ST_DESC_DW0_FLAGS_MASK, flags));
 	*dw1 = desc->src_addr;
 }
 

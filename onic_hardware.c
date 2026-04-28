@@ -23,29 +23,41 @@
 #include "qdma_register.h"
 #include "qdma_context.h"
 #include "qdma_error_info.h"
-
-/* default CSR values for QDMA */
-#define DEFAULT_MAX_DESC_FETCH			6
-#define DEFAULT_WB_INTVL			QDMA_WB_INTVL_4
-#define DEFAULT_PFCH_STOP_THRES			256
-#define DEFAULT_PFCH_NUM_ENTRIES_PER_Q		8
-#define DEFAULT_PFCH_MAX_Q_CNT			16
-#define DEFAULT_C2H_INTR_TIMER_TICK		25
-#define DEFAULT_CMPL_COAL_TIMER_CNT		5
-#define DEFAULT_CMPL_COAL_TIMER_TICK		25
-#define DEFAULT_CMPL_COAL_MAX_BUFSZ		32
-#define DEFAULT_H2C_THROT_DATA_THRES		0x4000
-#define DEFAULT_THROT_EN_DATA			1
-#define DEFAULT_THROT_EN_REQ			0
-#define DEFAULT_H2C_THROT_REQ_THRES		0x60
+#include "libqdma/libqdma_export.h"
 
 #define RX_ALIGN_TIMEOUT_MS			1000
 #define CMAC_RESET_WAIT_MS			1
 #define SHELL_RST_TIMEOUT_MS			200
 
+/*
+ * Per-index pool tables MUST agree with what libqdma programs into the QDMA
+ * core's global CSR pool registers (GLBL_RNG_SZ/C2H_BUF_SZ/C2H_TIMER_CNT/
+ * C2H_CNT_TH).  When ST netdev sets sw_ctxt.rngsz_idx / pfch_ctxt.bufsz_idx
+ * etc., the hardware reads its pool table at that index and the driver
+ * allocates a DMA ring of `onic_ring_count(idx)` entries — both sides MUST
+ * see the same value.
+ *
+ * libqdma's eqdma_set_default_global_csr() (called from qdma_device_open
+ * before onic_init_hardware runs) programs:
+ *   rng_sz  = {2049, 65, 129, 193, 257, 385, 513, 769,
+ *              1025, 1537, 3073, 4097, 6145, 8193, 12289, 16385}
+ *   buf_sz  = {4096, 256, 512, 1024, 2048, 3968, 4096, 4096,
+ *              4096, 4096, 4096, 4096, 4096, 8192, 9018, 16384}
+ *   tmr_cnt = {1, 2, 4, 5, 8, 10, 15, 20, 25,
+ *              30, 50, 75, 100, 125, 150, 200}
+ *   cnt_th  = {2, 4, 8, 16, 24, 32, 48, 64,
+ *              80, 96, 112, 128, 144, 160, 176, 192}
+ *
+ * Previously this driver had its own onic_qdma_init_csr() that re-programmed
+ * the same pool registers with QDMA4-style values AND clobbered three EQDMA5
+ * perf_opt registers (0x250, 0xB08, 0xE24).  That caused ST-mode TX/RX to
+ * silently drop on the QDMA<->CMAC datapath.  The CSR init was deleted; the
+ * tables here are the QDMA5 values libqdma programs, so the queue-context
+ * indices the ST datapath uses now address the correct hardware sizes.
+ */
 static const u16 rngcnt_pool[QDMA_NUM_DESC_RNGCNT] = {
-	4096, 64, 128, 192, 256, 384, 512, 768,
-	1024, 1536, 3072, 4096, 6144, 8192, 12288, 16384
+	2049, 65, 129, 193, 257, 385, 513, 769,
+	1025, 1537, 3073, 4097, 6145, 8193, 12289, 16385
 };
 
 static const u16 c2h_bufsz_pool[QDMA_NUM_C2H_BUFSZ] = {
@@ -54,13 +66,13 @@ static const u16 c2h_bufsz_pool[QDMA_NUM_C2H_BUFSZ] = {
 };
 
 static const u16 c2h_timer_pool[QDMA_NUM_C2H_TIMERS] = {
-	10, 2, 4, 5, 8, 10, 15, 20, 25,
+	1, 2, 4, 5, 8, 10, 15, 20, 25,
 	30, 50, 75, 100, 125, 150, 200
 };
 
 static const u16 c2h_thres_pool[QDMA_NUM_C2H_COUNTERS] = {
-	1, 2, 4, 8, 16, 24, 32, 48,
-	64, 96, 112, 128, 144, 160, 176, 192
+	2, 4, 8, 16, 24, 32, 48, 64,
+	80, 96, 112, 128, 144, 160, 176, 192
 };
 
 u16 onic_ring_count(u8 idx)
@@ -69,115 +81,17 @@ u16 onic_ring_count(u8 idx)
 }
 
 /**
- * onic_qdma_init_csr - initialize QDMA config/status registers
- * @qdev: pointer to QDMA device
+ * onic_reset_cmac_shell - shell-level CMAC reset WITHOUT enabling RX
  *
- * This function writes to various H2C and C2H registers, getting QDMA ready for
- * queue operations.  Values of these registers are hard-coded.
- **/
-static void onic_qdma_init_csr(struct qdma_dev *qdev)
-{
-	u32 offset, val;
-	int i;
-
-	/* initialize descriptor ring size registers */
-	for (i = 0; i < QDMA_NUM_DESC_RNGCNT; ++i) {
-		offset = QDMA_OFFSET_GLBL_RNG_SZ + (i * 4);
-		val = rngcnt_pool[i];
-		qdma_write_reg(qdev, offset, val);
-	}
-
-	/* initialize C2H buffer size registers */
-	for (i = 0; i < QDMA_NUM_C2H_BUFSZ; ++i) {
-		offset = QDMA_OFFSET_C2H_BUF_SZ + (i * 4);
-		val = c2h_bufsz_pool[i];
-		qdma_write_reg(qdev, offset, val);
-	}
-
-	/* set QDMA_C2H_INT_TIMER_TICK (0xB0C) register to 25, which corresponds
-	 * to 100ns (1 tick = 4ns for 250MHz user clock)
-	 */
-	offset = QDMA_OFFSET_C2H_INT_TIMER_TICK;
-	val = DEFAULT_C2H_INTR_TIMER_TICK;
-	qdma_write_reg(qdev, offset, val);
-
-	/* initialize C2H timer counter registers. */
-	for (i = 0; i < QDMA_NUM_C2H_TIMERS; ++i) {
-		offset = QDMA_OFFSET_C2H_TIMER_CNT + (i * 4);
-		val = c2h_timer_pool[i];
-		qdma_write_reg(qdev, offset, val);
-	}
-
-	/* initialize C2H counter threshold registers */
-	for (i = 0; i < QDMA_NUM_C2H_COUNTERS; ++i) {
-		offset = QDMA_OFFSET_C2H_CNT_TH + (i * 4);
-		val = c2h_thres_pool[i];
-		qdma_write_reg(qdev, offset, val);
-	}
-
-	/* set QDMA_GLBL_DSC_CFG (0x250) register for max descriptor fetch and
-	 * writeback interval
-	 */
-	offset = QDMA_OFFSET_GLBL_DSC_CFG;
-	val = (FIELD_SET(QDMA_GLBL_DSC_CFG_MAX_DSC_FETCH_MASK,
-			 DEFAULT_MAX_DESC_FETCH) |
-	       FIELD_SET(QDMA_GLBL_DSC_CFG_WB_ACC_INT_MASK,
-			 DEFAULT_WB_INTVL));
-	qdma_write_reg(qdev, offset, val);
-
-	/* read QDMA_C2H_PFCH_CACHE_DEPTH (0xBE0) register and set
-	 * QDMA_C2H_PFCH_CFG (0xB08) register accordingly
-	 */
-	val = qdma_read_reg(qdev, QDMA_OFFSET_C2H_PFCH_CACHE_DEPTH);
-	offset = QDMA_OFFSET_C2H_PFCH_CFG;
-	val = (FIELD_SET(QDMA_C2H_PFCH_FL_TH_MASK,
-			 DEFAULT_PFCH_STOP_THRES) |
-	       FIELD_SET(QDMA_C2H_NUM_PFCH_MASK,
-			 DEFAULT_PFCH_NUM_ENTRIES_PER_Q) |
-	       FIELD_SET(QDMA_C2H_PFCH_QCNT_MASK,
-			 (val >> 1)) |
-	       FIELD_SET(QDMA_C2H_EVT_QCNT_TH_MASK,
-			 ((val >> 1) - 2)));
-	qdma_write_reg(qdev, offset, val);
-
-	/* read QDMA_C2H_CMPL_COAL_BUF_DEPTH (0xBE4) register and set
-	 * QDMA_C2H_WB_COAL_CFG (0xB50) register accordingly
-	 *
-	 * Note that the tick field is set to 25, which corresponds to 100ns (1
-	 * tick = 4ns for 250MHz user clock).
-	 *
-	 * TODO: verify the value for C2H_MAX_BUF_SZ.  QDMA document says that
-	 * this should be set to QDMA_C2H_CMPL_COAL_BUF_DEPTH.buf_depth - 2; but
-	 * the libqdma code ignores the minus 2 part.
-	 */
-	val = qdma_read_reg(qdev, QDMA_OFFSET_C2H_CMPL_COAL_BUF_DEPTH);
-	offset = QDMA_OFFSET_C2H_WB_COAL_CFG;
-	val = (FIELD_SET(QDMA_C2H_TICK_CNT_MASK,
-			 DEFAULT_CMPL_COAL_TIMER_CNT) |
-	       FIELD_SET(QDMA_C2H_TICK_VAL_MASK,
-			 DEFAULT_CMPL_COAL_TIMER_TICK) |
-	       FIELD_SET(QDMA_C2H_MAX_BUF_SZ_MASK, val));
-	qdma_write_reg(qdev, offset, val);
-
-	/* set QDMA_H2C_REQ_THROT (0xE24) register.
-	 *
-	 * Data and request-based throttle are enabled only if the respective
-	 * threshold is set to a nonzero value.
-	 */
-	offset = QDMA_OFFSET_H2C_REQ_THROT;
-	val = (FIELD_SET(QDMA_H2C_DATA_THRESH_MASK,
-			 DEFAULT_H2C_THROT_DATA_THRES) |
-	       FIELD_SET(QDMA_H2C_REQ_THROT_EN_DATA_MASK,
-			 DEFAULT_THROT_EN_DATA) |
-	       FIELD_SET(QDMA_H2C_REQ_THRESH_MASK,
-			 DEFAULT_H2C_THROT_REQ_THRES) |
-	       FIELD_SET(QDMA_H2C_REQ_THROT_EN_REQ_MASK,
-			 DEFAULT_THROT_EN_REQ));
-	qdma_write_reg(qdev, offset, val);
-}
-
-
-int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset)
+ * Used at probe time to put CMAC in a clean default state (RX disabled)
+ * before the netdev is opened and queue contexts are programmed.  Without
+ * this split, onic_enable_cmac(reset=true) at probe would leave RX enabled
+ * with no queue consumer — packets arriving on the wire before the first
+ * `ip link set ... up` would hit qids with no sw_ctxt, triggering QDMA
+ * CMPT_INV_Q_ERR / pipeline stalls.  The open path calls onic_enable_cmac
+ * with reset=false to turn RX on once queues are ready.
+ */
+int onic_reset_cmac_shell(struct onic_hardware *hw, u8 cmac_id)
 {
 	u32 mask;
 	int i;
@@ -185,17 +99,25 @@ int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset)
 	if (cmac_id != 0 && cmac_id != 1)
 		return -EINVAL;
 
-	if (reset) {
-		mask = (cmac_id == 0) ? 0x10 : 0x100;
-		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, mask);
-		for (i = 0; i < SHELL_RST_TIMEOUT_MS; i++) {
-			if ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & mask) == mask)
-				break;
-			mdelay(CMAC_RESET_WAIT_MS);
-		}
-		if (i == SHELL_RST_TIMEOUT_MS)
-			pr_warn("onic: CMAC%d shell reset timed out, continuing\n", cmac_id);
+	mask = (cmac_id == 0) ? 0x10 : 0x100;
+	onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, mask);
+	for (i = 0; i < SHELL_RST_TIMEOUT_MS; i++) {
+		if ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & mask) == mask)
+			break;
+		mdelay(CMAC_RESET_WAIT_MS);
 	}
+	if (i == SHELL_RST_TIMEOUT_MS)
+		pr_warn("onic: CMAC%d shell reset timed out, continuing\n", cmac_id);
+	return 0;
+}
+
+int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset)
+{
+	if (cmac_id != 0 && cmac_id != 1)
+		return -EINVAL;
+
+	if (reset)
+		onic_reset_cmac_shell(hw, cmac_id);
 
     if (hw->RS_FEC) {
 		/* Enable RS-FEC for CMACs with RS-FEC implemented */
@@ -228,44 +150,87 @@ int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset)
 	return 0;
 }
 
-int onic_init_hardware(struct onic_private *priv)
+/**
+ * onic_init_hardware_master - primary (MASTER_PF) hardware init
+ *
+ * Owns the BAR2 iomap and the one real qdma_dev.  Single-PF shell carves the
+ * queue namespace across all CMACs via a single fmap[0] entry covering the
+ * full range [0, num_cmacs * N).  Secondaries get child qdma_devs that share
+ * this iomap and func_id with distinct q_base offsets.
+ */
+static int onic_init_hardware_master(struct onic_private *priv)
 {
 	struct onic_hardware *hw = &priv->hw;
 	struct pci_dev *pdev = priv->pdev;
 	struct qdma_dev *qdev;
 	struct qdma_fmap_ctxt fmap_ctxt;
-	u16 qbase, qmax, func_id;
+	void __iomem *bar0_regs;
+	void __iomem *bar2_regs;
+	u16 qmax, total_qmax;
 	u32 val;
-	u8 master_pf = test_bit(ONIC_FLAG_MASTER_PF, priv->flags);
 	int i, rv;
 
-    priv->hw.RS_FEC = priv->RS_FEC;
-
-	/* shell registers uses BAR-2 */
-	hw->addr = pci_iomap_range(pdev, 2, SHELL_START, SHELL_MAXLEN);
-	if (!hw->addr)
+	/* Option 3: libqdma owns the BAR claims and ioremaps.  We must run
+	 * after qdma_device_open so priv->qdma_dev_handle is valid, and we
+	 * borrow both BAR pointers from libqdma instead of ioremaping them
+	 * ourselves.  Anything else would re-introduce the BAR conflict. */
+	if (!priv->qdma_dev_handle) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: qdma_dev_handle not set — qdma_device_open must run first");
 		return -EINVAL;
+	}
 
-	/* QDMA IP registers uses BAR-0 */
-	qdev = qdma_create_dev(pdev, 0);
-	if (!qdev)
-		return -ENOMEM;
+	bar2_regs = qdma_device_get_user_regs(priv->qdma_dev_handle);
+	if (!bar2_regs) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: libqdma did not map user (BAR2) — design must expose it");
+		return -EINVAL;
+	}
+	/* hw->addr is the shell-register window, which lives at SHELL_START
+	 * inside BAR 2.  libqdma maps the whole BAR; we offset into it. */
+	hw->addr = bar2_regs + SHELL_START;
 
-	/* Set hw->qdma immediately so onic_clear_hardware() is safe if any
-	 * subsequent step fails and jumps to the clear_hardware error path. */
+	bar0_regs = qdma_device_get_config_regs(priv->qdma_dev_handle);
+	if (!bar0_regs) {
+		dev_err(&pdev->dev,
+			"onic_init_hardware_master: libqdma did not map config (BAR0)");
+		hw->addr = NULL;
+		return -EINVAL;
+	}
+
+	/* QDMA IP registers use BAR-0 — borrow libqdma's mapping */
+	qdev = qdma_create_dev(pdev, bar0_regs);
+	if (!qdev) {
+		rv = -ENOMEM;
+		hw->addr = NULL;
+		return rv;
+	}
 	hw->qdma = (unsigned long)qdev;
 
-	func_id = priv->cmac_id;
-	qbase = func_id * ONIC_MAX_QUEUES;
-	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
+	/* Detect CMAC count before fmap write — total queue range depends on it */
+	for (i = 0; i < ONIC_MAX_CMACS; ++i) {
+		val = onic_read_reg(hw, CMAC_OFFSET_CORE_VERSION(i));
+		if (val != ONIC_CMAC_CORE_VERSION)
+			break;
+	}
+	hw->num_cmacs = i;
+	dev_info(&pdev->dev, "Number of CMAC instances = %d", hw->num_cmacs);
 
-	/* Fmap must cover primary queues [0, qmax) AND secondary queues
-	 * [ONIC_MAX_QUEUES, ONIC_MAX_QUEUES+qmax).  With qmax=15 and
-	 * ONIC_MAX_QUEUES=64 this gives 0..78.  Using 2*qmax (=30) was wrong:
-	 * it left secondary queues outside the fmap, causing CMPT_INV_Q_ERR. */
+	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
+	/* fmap must cover the ABSOLUTE qid namespace the shell plugin tags, not
+	 * the per-CMAC dynamic queue count.  CMAC i places its queues at
+	 * [i * ONIC_PER_CMAC_QUEUES, i * ONIC_PER_CMAC_QUEUES + N).  So fmap
+	 * qmax = num_cmacs * ONIC_PER_CMAC_QUEUES covers all CMACs' ranges even
+	 * when N is smaller than ONIC_PER_CMAC_QUEUES (MSI-X-constrained builds).
+	 * Driver-shell contract: ONIC_PER_CMAC_QUEUES must equal the plugin's
+	 * PER_CMAC_QUEUES constant (both 64). */
+	total_qmax = hw->num_cmacs * ONIC_PER_CMAC_QUEUES;
+
+	/* Single-PF: one fmap entry for the entire queue range shared across
+	 * all CMACs.  Children use the same func_id with distinct q_base. */
 	memset(&fmap_ctxt, 0, sizeof(struct qdma_fmap_ctxt));
-	fmap_ctxt.qbase = qbase;
-	fmap_ctxt.qmax = ONIC_MAX_QUEUES + qmax;
+	fmap_ctxt.qbase = 0;
+	fmap_ctxt.qmax = total_qmax;
 	rv = qdma_clear_fmap_ctxt(qdev);
 	if (rv < 0)
 		goto clear_hardware;
@@ -273,38 +238,92 @@ int onic_init_hardware(struct onic_private *priv)
 	if (rv < 0)
 		goto clear_hardware;
 
-	/* inform shell about the function map for CMAC0 (function 0) */
-	val = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, qbase) |
-	       FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, qmax));
-	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), val);
+	/* Single shell function slot for all CMACs.  The RDMA plugin arbitrates
+	 * CMAC0+CMAC1 non-RoCE streams into slot 0 and encodes CMAC identity
+	 * into the queue ID (CMAC0 → [0, N), CMAC1 → [N, 2N)).  QCONF(0) must
+	 * cover the full combined range so QDMA accepts writes across [0, 2N).
+	 * Secondary does not touch shell-slot registers — see
+	 * agent/reconic_integration/dual_netdev_plan.md. */
+	val = FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, 0) |
+	      FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, total_qmax);
+	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(0), val);
 
-	/* initialize indirection table for function 0 */
+	/* RSS indirection table spans the full combined range.  Hash-selected
+	 * queues within a CMAC's share stay in that CMAC's range because the
+	 * plugin's direct qid tagging happens before QDMA indir lookup. */
 	for (i = 0; i < 128; ++i) {
-		u32 val = (i % qmax) & 0x0000FFFF;
-		u32 offset = QDMA_FUNC_OFFSET_INDIR_TABLE(func_id, i);
-		onic_write_reg(hw, offset, val);
+		u32 v = (i % total_qmax) & 0x0000FFFF;
+		u32 offset = QDMA_FUNC_OFFSET_INDIR_TABLE(0, i);
+		onic_write_reg(hw, offset, v);
 	}
 
-	/* initialize global registers if device is a master PF */
-	if (master_pf)
-		onic_qdma_init_csr(qdev);
+	/* QDMA core CSRs (ring/buffer/timer/counter pools, GLBL_DSC_CFG,
+	 * C2H_PFCH_CFG, C2H_WB_COAL_CFG, H2C_REQ_THROT, plus EQDMA5
+	 * perf_opt registers) are owned by libqdma — qdma_device_open
+	 * already invoked eqdma_set_default_global_csr → eqdma_set_perf_opt
+	 * before we got here.  Re-programming them from the legacy
+	 * QDMA4-style table broke ST-mode TX/RX (TX dropped at QDMA→CMAC,
+	 * RX dropped at CMAC→QDMA) while leaving MM-mode sysdma working;
+	 * see INTEGRATION_NOTES.md "ST datapath regression". */
 
-	/* get the number of CMAC instances */
-	for (i = 0; i < ONIC_MAX_CMACS; ++i) {
-		val = onic_read_reg(hw, CMAC_OFFSET_CORE_VERSION(i));
-		if (val != ONIC_CMAC_CORE_VERSION)
-			break;
-		if (master_pf && i == priv->cmac_id)
-			onic_enable_cmac(hw, i, true);
-	}
-	hw->num_cmacs = i;
-	dev_info(&pdev->dev, "Number of CMAC instances = %d", hw->num_cmacs);
+	/* Shell-reset this netdev's CMAC to known clean state WITHOUT enabling
+	 * RX.  RX is enabled in onic_open_netdev once queue contexts exist. */
+	onic_reset_cmac_shell(hw, priv->cmac_id);
 
 	return 0;
 
 clear_hardware:
 	onic_clear_hardware(priv);
 	return rv;
+}
+
+/**
+ * onic_init_hardware_slave - secondary (non-master) hardware init
+ *
+ * Shares the primary's BAR2 iomap and wraps its qdma_dev in a child with an
+ * offset q_base so this netdev's queues land in [q_base, q_base + N) of the
+ * shared QDMA queue namespace.  Does not touch fmap/CSR/QCONF (primary owns).
+ */
+static int onic_init_hardware_slave(struct onic_private *priv)
+{
+	struct onic_private *primary = priv->peer;
+	struct onic_hardware *hw = &priv->hw;
+	struct qdma_dev *parent_qdev, *child_qdev;
+
+	if (!primary || !primary->hw.addr || !primary->hw.qdma) {
+		pr_err("onic: slave priv missing primary hw context\n");
+		return -EINVAL;
+	}
+
+	/* Share BAR2 iomap and topology info with primary */
+	hw->addr = primary->hw.addr;
+	hw->num_cmacs = primary->hw.num_cmacs;
+
+	/* Child qdev routes relative qids to absolute via q_base.  The plugin
+	 * arbiter in the shell tags CMAC1 packets with absolute qid∈[qid_base,
+	 * qid_base + N), so secondary's per-queue contexts land at the right
+	 * addresses without any shell-slot register writes here.  Primary owns
+	 * the single QCONF(0) / INDIR_TABLE(0) pair covering the full range. */
+	parent_qdev = (struct qdma_dev *)primary->hw.qdma;
+	child_qdev = qdma_create_child_dev(parent_qdev, priv->qid_base);
+	if (!child_qdev)
+		return -ENOMEM;
+	hw->qdma = (unsigned long)child_qdev;
+
+	/* Shell-reset this netdev's CMAC; open path enables RX when ready. */
+	onic_reset_cmac_shell(hw, priv->cmac_id);
+
+	return 0;
+}
+
+int onic_init_hardware(struct onic_private *priv)
+{
+	priv->hw.RS_FEC = priv->RS_FEC;
+
+	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags))
+		return onic_init_hardware_master(priv);
+	else
+		return onic_init_hardware_slave(priv);
 }
 
 static int onic_shell_qdma_reset(struct onic_hardware *hw)
@@ -344,30 +363,34 @@ void onic_clear_hardware(struct onic_private *priv)
 	struct onic_hardware *hw = &priv->hw;
 	struct pci_dev *pdev = priv->pdev;
 	struct qdma_dev *qdev = (struct qdma_dev *)hw->qdma;
-	u16 func_id = priv->cmac_id;
+	u8 master_pf = test_bit(ONIC_FLAG_MASTER_PF, priv->flags);
 	int rv;
 
-	/* Soft-reset the shared QDMA DMA engine to ensure a clean slate for
-	 * the subsequent fmap invalidation and for a following insmod.
-	 * Only the master performs this reset — it runs last, after secondary. */
-	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
+	if (!qdev) {
+		memset(hw, 0, sizeof(struct onic_hardware));
+		return;
+	}
+
+	if (master_pf) {
+		/* Runs after all secondaries have torn down.  Reset the QDMA
+		 * DMA engine and clear the single fmap entry.  BAR0 / BAR2
+		 * mappings are owned by libqdma (Option 3) — qdma_destroy_dev
+		 * frees only the legacy wrapper, qdma_device_close in the
+		 * caller will iounmap. */
 		rv = onic_shell_qdma_reset(hw);
 		if (rv)
 			dev_warn(&pdev->dev,
 				 "QDMA shell reset timed out, continuing teardown\n");
-	}
 
-	/* clear this function's queue config in shell */
-	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), 0);
-
-	if (func_id == 0) {
-		/* Primary owns the QDMA fmap and the BAR2 mapping */
+		onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(0), 0);
 		qdma_invalidate_fmap_ctxt(qdev);
-		pci_iounmap(pdev, hw->addr);
+		qdma_destroy_dev(qdev); /* borrowed BAR0 — no iounmap here */
+	} else {
+		/* Slave: free the child qdma_dev wrapper only.  Parent iomap
+		 * is still owned by primary, and the shell-slot registers
+		 * were never touched by the slave (primary owns QCONF(0)). */
+		qdma_destroy_dev(qdev);
 	}
-	/* Secondary: skip fmap invalidate and BAR2 unmap — owned by primary */
-
-	qdma_destroy_dev(qdev); /* each net_device has its own qdma_dev object */
 
 	memset(hw, 0, sizeof(struct onic_hardware));
 }
@@ -491,10 +514,15 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	if (qid < 0)
 		return qid;
 
-	/* initialize software context */
+	/* initialize software context — written in two phases.
+	 * Phase 1: configure ring addresses/sizes with qen=0 so the QDMA
+	 * descriptor and credit engines are idle while we set up HW/CR/PFCH/CMPT
+	 * contexts.  Writing qen=1 (phase 2, after CMPT is valid) prevents the
+	 * QDMA from issuing a credit-update completion to an uninitialized CMPT
+	 * ring, which would otherwise fire CMPT_INV_Q_ERR immediately. */
 	memset(&sw_ctxt, 0, sizeof(struct qdma_sw_ctxt));
 	sw_ctxt.func_id = qdev->func_id;
-	sw_ctxt.qen = 1;
+	sw_ctxt.qen = 0;  /* will be set to 1 after CMPT context is ready */
 	sw_ctxt.wbk_en = 1;
 	sw_ctxt.is_mm = 0;
 	sw_ctxt.desc_sz = 0; /* 0: 8B for C2H stream */
@@ -517,22 +545,13 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	if (rv < 0)
 		goto clear_rx_queue;
 
-	/* initialize prefetch and completion contexts */
-	memset(&pfch_ctxt, 0, sizeof(struct qdma_pfch_ctxt));
-	pfch_ctxt.bufsz_idx = param->bufsz_idx;
-	pfch_ctxt.pfch_en = 1;
-	pfch_ctxt.valid = 1;
-
-	rv = qdma_clear_pfch_ctxt(qdev, qid);
-	if (rv < 0)
-		goto clear_rx_queue;
-	rv = qdma_write_pfch_ctxt(qdev, qid, &pfch_ctxt);
-	if (rv < 0)
-		goto clear_rx_queue;
-
+	/* Write completion context BEFORE prefetch context so that when
+	 * pfch_en=1 activates the prefetch engine, CMPT_CTXT.valid is
+	 * already set.  Writing PFCH first (even with qen=0) can still
+	 * trigger CMPT_INV_Q_ERR if the prefetch engine wakes and finds
+	 * a stale non-zero PIDX with no valid CMPT ring. */
 	memset(&cmpl_ctxt, 0, sizeof(struct qdma_cmpl_ctxt));
 	cmpl_ctxt.stat_en = 1;
-	//cmpl_ctxt.stat_en = 0;
 	cmpl_ctxt.intr_en = 1;
 	cmpl_ctxt.trig_mode = 0x5;
 	cmpl_ctxt.func_id = qdev->func_id;
@@ -552,6 +571,25 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	if (rv < 0)
 		goto clear_rx_queue;
 	rv = qdma_write_cmpl_ctxt(qdev, qid, &cmpl_ctxt);
+	if (rv < 0)
+		goto clear_rx_queue;
+
+	/* Prefetch context — CMPT is now valid so pfch_en=1 is safe. */
+	memset(&pfch_ctxt, 0, sizeof(struct qdma_pfch_ctxt));
+	pfch_ctxt.bufsz_idx = param->bufsz_idx;
+	pfch_ctxt.pfch_en = 1;
+	pfch_ctxt.valid = 1;
+
+	rv = qdma_clear_pfch_ctxt(qdev, qid);
+	if (rv < 0)
+		goto clear_rx_queue;
+	rv = qdma_write_pfch_ctxt(qdev, qid, &pfch_ctxt);
+	if (rv < 0)
+		goto clear_rx_queue;
+
+	/* Phase 2: all contexts valid — enable the queue. */
+	sw_ctxt.qen = 1;
+	rv = qdma_write_sw_ctxt(qdev, qid, dir, &sw_ctxt);
 	if (rv < 0)
 		goto clear_rx_queue;
 
@@ -611,10 +649,12 @@ static void onic_qdma_set_q_pidx(unsigned long qdma, u16 qid,
 	if (qid < 0)
 		return;
 
+	/* DMAP registers are indexed by the ABSOLUTE queue ID (q_base + qid),
+	 * not by the relative qid local to this qdma_dev. */
 	if (dir == QDMA_C2H)
-		offset = QDMA_OFFSET_DMAP_SEL_C2H_DESC_PIDX + (qid * 16);
+		offset = QDMA_OFFSET_DMAP_SEL_C2H_DESC_PIDX + ((qdev->q_base + qid) * 16);
 	else
-		offset = QDMA_OFFSET_DMAP_SEL_H2C_DESC_PIDX + (qid * 16);
+		offset = QDMA_OFFSET_DMAP_SEL_H2C_DESC_PIDX + ((qdev->q_base + qid) * 16);
 
 	val = (FIELD_SET(QDMA_DMAP_SEL_DESC_PIDX_MASK, pidx) |
 	       FIELD_SET(QDMA_DMAP_SEL_DESC_IRQ_ARM_MASK, irq_arm));
@@ -656,7 +696,8 @@ static void onic_qdma_set_cmpl_cidx(unsigned long qdma, u16 qid, u16 cidx,
 	if (qid < 0)
 		return;
 
-	offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + (qid * 16);
+	/* DMAP uses absolute queue ID. */
+	offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + ((qdev->q_base + qid) * 16);
 
 	val = (FIELD_SET(QDMA_DMAP_SEL_CMPL_CIDX_MASK, cidx) |
 	       FIELD_SET(QDMA_DMAP_SEL_CMPL_COUNTER_IDX_MASK, counter_idx) |
@@ -684,8 +725,9 @@ void onic_qdma_dump_error_regs(unsigned long qdma)
 	dev_err(&qdev->pdev->dev,
 		"QDMA err: GLBL=0x%08x DSC=0x%08x TRQ=0x%08x "
 		"C2H=0x%08x C2H_FATAL=0x%08x H2C=0x%08x "
-		"SBE=0x%08x DBE=0x%08x\n",
-		glbl, dsc, trq, c2h, c2h_fatal, h2c, sbe, dbe);
+		"SBE=0x%08x DBE=0x%08x C2H_FIRST_ERR_QID=0x%08x\n",
+		glbl, dsc, trq, c2h, c2h_fatal, h2c, sbe, dbe,
+		qdma_read_reg(qdev, QDMA_OFFSET_C2H_FIRST_ERR_QID));
 }
 
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
@@ -701,7 +743,7 @@ void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
 	onic_qdma_set_cmpl_cidx(qdma, qid, tail, 0, 0, trig_mode, stat_en, irq_arm);
 
 	if (irq_arm) {
-		offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + (qid * 16);
+		offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + ((qdev->q_base + qid) * 16);
 		(void)qdma_read_reg(qdev, offset);
 	}
 }

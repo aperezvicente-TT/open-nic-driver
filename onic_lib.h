@@ -28,6 +28,18 @@
 int onic_init_capacity(struct onic_private *priv);
 
 /**
+ * onic_init_capacity_slave - mirror primary's capacity to a slave netdev
+ * @slave: secondary (CMAC1) priv, shares MSI-X pool with @primary
+ * @primary: primary (CMAC0) priv that already allocated MSI-X vectors
+ *
+ * The master PF's MSI-X allocation reserves twice the per-CMAC vectors so the
+ * slave can claim the upper half via vec_base.  This helper propagates the
+ * vector and queue counts without re-calling pci_alloc_irq_vectors.
+ **/
+void onic_init_capacity_slave(struct onic_private *slave,
+			      struct onic_private *primary);
+
+/**
  * onic_clear_capacity - reset the number of vectors and queues to zero
  * @priv: pointer to driver private data
  **/

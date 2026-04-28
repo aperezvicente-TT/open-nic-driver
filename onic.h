@@ -30,6 +30,7 @@
 #include "onic_ptp.h"
 #include "onic_ernic_irq.h"
 #include "onic_ib.h"
+#include "libqdma/libqdma_export.h"
 
 /* Debug levels controlled by module param debug_level at insmod time.
  *   0 = silent  (no debug output)
@@ -266,6 +267,13 @@ struct onic_private {
 	 * path to stage WQEs and MR payloads into ERNIC's DDR4-resident
 	 * rings.  See onic_sysdma.{h,c}. */
 	struct onic_sysdma_state *sysdma;
+
+	/* B7-libqdma: AMD libqdma device handle.  Nonzero only on the
+	 * master PF (qdma_device_open is called once per PCI function;
+	 * we currently only do it on the primary).  qdma_dev_conf is
+	 * filled in at probe and lives for the duration of the device. */
+	unsigned long              qdma_dev_handle;
+	struct qdma_dev_conf       qdma_dev_conf;
 };
 
 #endif

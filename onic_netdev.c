@@ -37,7 +37,7 @@
 #include "onic_hardware.h"
 #include "onic_lib.h"
 #include "onic_register.h"
-#include "qdma_access/qdma_register.h"
+#include "qdma_legacy/qdma_register.h"
 #include "onic.h"
 #include "onic_ptp.h"
 
@@ -229,7 +229,9 @@ static int onic_xmit_xdp_ring(struct onic_private *priv,struct  onic_tx_queue  *
 	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
 	desc.len = xdpf->len;
 	desc.src_addr = dma_addr;
-	desc.metadata = xdpf->len;
+	/* metadata=0 → cdh_flags=0, pld_len=0 (no Custom Data Header). EQDMA5
+	 * silently drops packets where cdh_flags is set without matching CDH. */
+	desc.metadata = 0;
 	qdma_pack_h2c_st_desc(desc_ptr, &desc);
 
 	tx_queue->buffer[ring->next_to_use].xdpf = xdpf;
@@ -1175,7 +1177,10 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
 	desc.len = skb->len;
 	desc.src_addr = dma_addr;
-	desc.metadata = skb->len;
+	/* metadata=0 → cdh_flags=0, pld_len=0 (no Custom Data Header). EQDMA5
+	 * silently drops packets where cdh_flags is set without matching CDH.
+	 * PTP path below overrides this with its tag encoding. */
+	desc.metadata = 0;
 
 	/* TX PTP hardware timestamp: embed the PTP tag into desc.metadata */
 	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
