@@ -507,6 +507,13 @@ int onic_qdma_init_tx_queue(unsigned long qdma, u16 qid,
 	sw_ctxt.desc_base = param->dma_addr;
 	sw_ctxt.vec = param->vid;
 	sw_ctxt.intr_aggr = 0;
+	/* Route H2C packets to the correct CMAC. The shell's qdma_subsystem
+	 * arbiter uses the SW context port_id (W1 bits 24:22) to select
+	 * CMAC0 vs CMAC1. q_base is 0 for primary (CMAC0) and 64 for the
+	 * secondary child qdev (CMAC1) per ONIC_PER_CMAC_QUEUES. Without
+	 * this, secondary's packets are routed to CMAC0 and silently dropped
+	 * at the SerDes when CMAC0 has no link. */
+	sw_ctxt.port_id = qdev->q_base / ONIC_PER_CMAC_QUEUES;
 
 	rv = qdma_clear_sw_ctxt(qdev, qid, dir);
 	if (rv < 0)
@@ -558,6 +565,8 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	sw_ctxt.fcrd_en = 1;
 	sw_ctxt.rngsz_idx = param->desc_rngcnt_idx;
 	sw_ctxt.desc_base = param->desc_dma_addr;
+	/* Route C2H descriptors per CMAC — same rationale as H2C above. */
+	sw_ctxt.port_id = qdev->q_base / ONIC_PER_CMAC_QUEUES;
 
 	rv = qdma_clear_sw_ctxt(qdev, qid, dir);
 	if (rv < 0)
@@ -608,6 +617,9 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	pfch_ctxt.bufsz_idx = param->bufsz_idx;
 	pfch_ctxt.pfch_en = 1;
 	pfch_ctxt.valid = 1;
+	/* Same per-CMAC routing as the SW context port_id, in case the
+	 * prefetch path also consults port_id for arbitration. */
+	pfch_ctxt.port_id = qdev->q_base / ONIC_PER_CMAC_QUEUES;
 
 	rv = qdma_clear_pfch_ctxt(qdev, qid);
 	if (rv < 0)
