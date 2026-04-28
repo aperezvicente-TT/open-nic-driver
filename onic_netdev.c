@@ -1080,6 +1080,30 @@ int onic_open_netdev(struct net_device *dev)
 			raw[3], raw[2],
 			raw[0] & 0xFFFF,
 			(raw[0] >> 17) & 0xFF);
+
+		/* [SEC_DIAG] Companion HW context readback.  cidx is the
+		 * load-bearing field: if cidx == 0 after a real ping attempt
+		 * the QDMA engine never fetched a descriptor from this queue
+		 * (so the bug is queue programming / QDMA-side gating).  If
+		 * cidx advances, the engine emitted packets and the bug is
+		 * downstream (shell, plugin RTL, CMAC).  Bit positions per
+		 * qdma_legacy/qdma_context.h:208-216 (struct qdma_hw_ctxt). */
+		{
+			u16 rel_qid = 0;
+			enum qdma_dir dir = QDMA_H2C;
+			u32 hw_raw[2] = {0};
+			int rv2 = qdma_read_hw_ctxt_raw(qdev, rel_qid, dir,
+							hw_raw, 2);
+			pr_info("[SEC_DIAG] HW_CTXT abs_qid=%u dir=%d (q_base=%u rel_qid=%u rv=%d): W0=0x%08x W1=0x%08x cidx=%u crd_use=%u idl_stp_b=%u dsc_pnd=%u evt_pnd=%u\n",
+				qdev->q_base + rel_qid, dir, qdev->q_base,
+				rel_qid, rv2,
+				hw_raw[0], hw_raw[1],
+				hw_raw[0] & 0xFFFF,           /* cidx */
+				(hw_raw[0] >> 16) & 0xFFFF,   /* crd_use */
+				(hw_raw[1] >> 9) & 0x1,       /* idl_stp_b */
+				(hw_raw[1] >> 8) & 0x1,       /* dsc_pnd */
+				(hw_raw[1] >> 10) & 0x1);     /* evt_pnd */
+		}
 	}
 
 	netif_tx_start_all_queues(dev);
@@ -1126,6 +1150,52 @@ int onic_stop_netdev(struct net_device *dev)
 	struct onic_private *priv = netdev_priv(dev);
 	struct onic_hardware *hw = &priv->hw;
 	int qid;
+
+	/* [SEC_DIAG_FINAL] Snapshot HW context for every queue on this netdev
+	 * BEFORE we touch anything (queue stop, ring teardown, doorbell
+	 * silencing).  The cidx field tells us whether the QDMA engine
+	 * actually consumed any descriptors from this queue.  Compare CMAC0
+	 * (q_base=0) values vs CMAC1 (q_base=64) values:
+	 *   - both H2C cidx > 0  => QDMA fetches fine on both; CMAC1 bug is
+	 *                           shell-side / plugin RTL / CMAC.
+	 *   - CMAC0 H2C cidx > 0, CMAC1 H2C cidx == 0
+	 *                        => QDMA engine never advanced past PIDX=0
+	 *                           on the secondary queues; bug is in queue
+	 *                           programming or QDMA-side gating.
+	 *   - both H2C cidx == 0 => no TX traffic was actually pushed (test
+	 *                           setup issue; rerun with real ping).
+	 * Tagged separately from open-time SEC_DIAG so it greps clean. */
+	{
+		struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
+		int q;
+
+		if (qdev) {
+			for (q = 0; q < priv->num_tx_queues; ++q) {
+				u32 hw_raw[2] = {0};
+				int rv2 = qdma_read_hw_ctxt_raw(qdev, q,
+								QDMA_H2C,
+								hw_raw, 2);
+				pr_info("[SEC_DIAG_FINAL] %s abs_qid=%u dir=0 cidx=%u dsc_pnd=%u (rv=%d W0=0x%08x W1=0x%08x)\n",
+					netdev_name(dev),
+					qdev->q_base + q,
+					hw_raw[0] & 0xFFFF,
+					(hw_raw[1] >> 8) & 0x1,
+					rv2, hw_raw[0], hw_raw[1]);
+			}
+			for (q = 0; q < priv->num_rx_queues; ++q) {
+				u32 hw_raw[2] = {0};
+				int rv2 = qdma_read_hw_ctxt_raw(qdev, q,
+								QDMA_C2H,
+								hw_raw, 2);
+				pr_info("[SEC_DIAG_FINAL] %s abs_qid=%u dir=1 cidx=%u dsc_pnd=%u (rv=%d W0=0x%08x W1=0x%08x)\n",
+					netdev_name(dev),
+					qdev->q_base + q,
+					hw_raw[0] & 0xFFFF,
+					(hw_raw[1] >> 8) & 0x1,
+					rv2, hw_raw[0], hw_raw[1]);
+			}
+		}
+	}
 
 	onic_stop_link_watchdog(priv);
 
