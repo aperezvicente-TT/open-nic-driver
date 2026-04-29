@@ -30,6 +30,48 @@ enum ernic_qp_state {
 
 #define ONIC_IB_MAX_PD 256
 
+/* B7 — RQBUFSZ field value for 512-B RQE slots (libreconic RQE_SIZE = 512).
+ * QPCONFi[31:16] is RQE size in 256-B units, so 512 / 256 = 2.
+ * The earlier B5 code packed `rq_depth` here by mistake. */
+#define ERNIC_RQE_SIZE_FIELD 2u
+
+/* B7 — packed ERNIC SQ WQE, 64 bytes.  Layout per
+ * reference_ernic_wqe_spec.md §2 / libreconic/rdma_api.h:138-158. */
+struct ernic_sq_wqe {
+	__le16  wrid;                  /* 0x00 — echoed in CQE.wqe_idx */
+	__le16  reserved;              /* 0x02 */
+	__le32  laddr_low;             /* 0x04 */
+	__le32  laddr_high;            /* 0x08 */
+	__le32  length;                /* 0x0C */
+	__le32  opcode;                /* 0x10 — only [7:0] honoured */
+	__le32  remote_offset_low;     /* 0x14 — WRITE/READ only */
+	__le32  remote_offset_high;    /* 0x18 — WRITE/READ only */
+	__le32  r_key;                 /* 0x1C — only [7:0] honoured */
+	u8      send_small_payload[16];/* 0x20 — inline SEND data ≤16 B */
+	__le32  immdt_data;            /* 0x30 — *_IMMDT only */
+	__le32  reserved0;             /* 0x34 */
+	__le32  reserved1;             /* 0x38 */
+	__le32  reserved2;             /* 0x3C */
+} __packed;
+
+/* B7 — packed ERNIC CQE, 4 bytes.  Layout per spec §4 / PG332 Table 10. */
+struct ernic_cqe {
+	__le16  wqe_idx;               /* 0x00 — echo of SQ slot completed */
+	u8      opcode_echo;           /* 0x02 */
+	u8      status;                /* 0x03 — 0=ok */
+} __packed;
+
+/* B7 — driver-side shadow tables. */
+struct ernic_sq_shadow {
+	u64                  wr_id;
+	enum ib_wc_opcode    ib_opcode;
+	u32                  length;
+};
+
+struct ernic_rq_shadow {
+	u64                  wr_id;
+};
+
 struct onic_ib_dev {
 	struct ib_device      ibdev;    /* MUST be first — to_onic_ib_dev casts */
 	struct onic_private  *priv;
@@ -64,6 +106,8 @@ struct onic_mr {
 	u32              rkey;
 };
 
+struct onic_qp;
+
 struct onic_cq {
 	struct ib_cq     ibcq;
 	u32              cq_id;         /* == bound QP index once bound */
@@ -73,6 +117,12 @@ struct onic_cq {
 	u32              tail;
 	bool             bound;         /* false until create_qp binds it */
 	spinlock_t       lock;
+
+	/* B7 — back-pointer to the QP bound to this CQ. Populated by
+	 * create_qp; cleared by destroy_qp. ERNIC v4.2 has a 1:1 mapping
+	 * between QP and CQ, so this is unambiguous. Used by poll_cq to
+	 * find the QCSR doorbell, sq_shadow and DDR4 CQ ring offset. */
+	struct onic_qp  *qp_back;
 };
 
 struct onic_qp {
@@ -101,6 +151,25 @@ struct onic_qp {
 	union ib_gid            dgid;
 
 	spinlock_t              state_lock;
+
+	/* B7 — DDR4 byte offsets of the per-QP rings (already programmed
+	 * into SQBAi/RQBAi/CQBAi during create_qp). Captured here so
+	 * post_send / poll_cq can stage WQEs and read CQEs via
+	 * onic_ddr4_{write,read}.  Includes pool->base_off for ERNIC1. */
+	u64                     sq_ddr_off;
+	u64                     rq_ddr_off;
+	u64                     cq_ddr_off;
+
+	/* B7 — driver-side shadow rings, allocated in create_qp,
+	 * freed in destroy_qp.  Indexed by (pidx % depth) for SQ/RQ. */
+	struct ernic_sq_shadow *sq_shadow;
+	struct ernic_rq_shadow *rq_shadow;
+
+	/* B7 — monotonic 32-bit producer/consumer counters.  Engine sees
+	 * them via QCSR doorbells; host computes slot = pidx % depth. */
+	u32                     sq_pidb;
+	u32                     rq_pidb;
+	u32                     cq_consumer_idx;
 };
 
 struct onic_ucontext {

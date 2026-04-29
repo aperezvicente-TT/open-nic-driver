@@ -18,7 +18,9 @@
 
 #include "onic.h"
 #include "onic_ib.h"
+#include "onic_sysdma.h"
 #include "../libreconic/reconic_reg.h"
+
 
 /* ----- query_* ----------------------------------------------------------- */
 
@@ -417,6 +419,29 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->state      = ERNIC_QP_RESET;
 	spin_lock_init(&qp->state_lock);
 
+	/* B7 — capture DDR4 byte offsets for the verb path.
+	 * Includes pool->base_off so onic_ddr4_write/read get the right
+	 * crossbar AXI offset on both ERNIC0 (base_off=0) and ERNIC1. */
+	qp->sq_ddr_off = dev->ddr.base_off + sq_off;
+	qp->rq_ddr_off = dev->ddr.base_off + rq_off;
+	qp->cq_ddr_off = dev->ddr.base_off + cq_off;
+	qp->sq_pidb         = 0;
+	qp->rq_pidb         = 0;
+	qp->cq_consumer_idx = 0;
+
+	qp->sq_shadow = kcalloc(qp->sq_depth, sizeof(*qp->sq_shadow),
+				GFP_KERNEL);
+	qp->rq_shadow = kcalloc(qp->rq_depth, sizeof(*qp->rq_shadow),
+				GFP_KERNEL);
+	if (!qp->sq_shadow || !qp->rq_shadow) {
+		kfree(qp->sq_shadow);
+		kfree(qp->rq_shadow);
+		qp->sq_shadow = NULL;
+		qp->rq_shadow = NULL;
+		onic_ddr_qp_slot_free(&dev->ddr, qp_idx);
+		return -ENOMEM;
+	}
+
 	/* QPCONFi: QPEN=0 (B6 turns it on), RQINTEN+CQINTEN, HWHSHKDIS,
 	 * PATHMTU=4096, RQBUFSZ = rq_depth in 256-B units (PG332). */
 	qpconfi  = 0;
@@ -424,7 +449,11 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qpconfi |= (1u << 3);                      /* CQINTEN */
 	qpconfi |= (1u << 5);                      /* HWHSHKDIS */
 	qpconfi |= ((u32)qp->path_mtu & 0x7) << 8;
-	qpconfi |= ((u32)qp->rq_depth & 0xffffu) << 16;
+	/* B7 fix: QPCONFi[31:16] is RQE size in 256-B units (= 2 for 512-B
+	 * libreconic RQEs), NOT rq_depth.  The B5 code packed rq_depth here
+	 * by mistake — without this fix post_recv simply will not work
+	 * because the engine writes RQEs at the wrong stride. */
+	qpconfi |= ((u32)ERNIC_RQE_SIZE_FIELD & 0xffffu) << 16;
 
 	qpadvconfi  = 0;
 	qpadvconfi |= (0u    << 0);                /* TC */
@@ -461,6 +490,7 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	scq->cq_id   = qp_idx;
 	scq->ddr_off = cq_off;
 	scq->bound   = true;
+	scq->qp_back = qp;        /* B7: poll_cq needs it */
 
 	/* B6: leave state at RESET — ibverbs sends an explicit RESET→INIT
 	 * modify_qp right after create_qp and that call is what advances
@@ -490,12 +520,23 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	iowrite32(0, mmio + q + 0xB0);
 	(void)ioread32(mmio + q);
 
-	if (qp->send_cq)
-		qp->send_cq->bound = false;
-	if (qp->recv_cq && qp->recv_cq != qp->send_cq)
-		qp->recv_cq->bound = false;
+	if (qp->send_cq) {
+		qp->send_cq->bound   = false;
+		qp->send_cq->qp_back = NULL;
+	}
+	if (qp->recv_cq && qp->recv_cq != qp->send_cq) {
+		qp->recv_cq->bound   = false;
+		qp->recv_cq->qp_back = NULL;
+	}
 
 	onic_ddr_qp_slot_free(&dev->ddr, qp->qp_num);
+
+	/* B7 — release shadow rings allocated in create_qp. */
+	kfree(qp->sq_shadow);
+	kfree(qp->rq_shadow);
+	qp->sq_shadow = NULL;
+	qp->rq_shadow = NULL;
+
 	qp->state = ERNIC_QP_CLOSED;
 	return 0;
 }
@@ -751,14 +792,330 @@ static int onic_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	}
 	return 0;
 }
-static int onic_stub_post_send(struct ib_qp *qp, const struct ib_send_wr *w,
-			       const struct ib_send_wr **bad)    { STUB_BODY("post_send"); }
-static int onic_stub_post_recv(struct ib_qp *qp, const struct ib_recv_wr *w,
-			       const struct ib_recv_wr **bad)    { STUB_BODY("post_recv"); }
-static int onic_stub_poll_cq(struct ib_cq *cq, int n, struct ib_wc *wc)
-								  { STUB_BODY("poll_cq"); }
-static int onic_stub_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags f)
-								  { STUB_BODY("req_notify_cq"); }
+/* ====================================================================
+ * B7 — real verb path: post_send / post_recv / poll_cq
+ *
+ * Layout of per-QP rings in DDR4 (already programmed via SQBAi/RQBAi/
+ * CQBAi during create_qp; offsets captured in qp->{sq,rq,cq}_ddr_off):
+ *   SQ slot s : qp->sq_ddr_off + s * sizeof(struct ernic_sq_wqe)   (64 B)
+ *   RQ slot s : qp->rq_ddr_off + s * 512                           (256-B field == 2)
+ *   CQ slot s : qp->cq_ddr_off + s * sizeof(struct ernic_cqe)      ( 4 B)
+ *
+ * Counters in qp->{sq_pidb, rq_pidb, cq_consumer_idx} are MONOTONIC
+ * 32-bit (the engine never wraps them either) — slot index is
+ * (counter % depth).
+ *
+ * Doorbells (per-QP QCSR offsets):
+ *   SQPIi    0x38   host writes after wmb()
+ *   RQCIi    0x34   host writes after consuming an RQ slot
+ *   CQHEADi  0x30   engine writes; host reads to find ready CQEs
+ *
+ * Restrictions of this first cut:
+ *   - num_sge == 1 only (B5 already capped at 1 in create_qp)
+ *   - SEND payload must be ≤16 bytes inline (no DDR4 staging path yet)
+ *   - RDMA_WRITE source must already live in a registered MR
+ *   - IBV_WR_RDMA_READ is not implemented (separate work item)
+ * ==================================================================== */
+
+/* Translate a libibverbs send opcode into an ERNIC WQE opcode and the
+ * `enum ib_wc_opcode` we'll echo back via poll_cq. */
+static int ernic_xlate_opcode(enum ib_wr_opcode wr_op,
+			      u32 *out_ernic_op,
+			      enum ib_wc_opcode *out_wc_op)
+{
+	switch (wr_op) {
+	case IB_WR_SEND:
+		*out_ernic_op = RNIC_OP_SEND;
+		*out_wc_op    = IB_WC_SEND;
+		return 0;
+	case IB_WR_RDMA_WRITE:
+		*out_ernic_op = RNIC_OP_WRITE;
+		*out_wc_op    = IB_WC_RDMA_WRITE;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+/* Compose one SQ WQE in DDR4 and update the SQ shadow. Does NOT ring
+ * the doorbell — caller does that once at the end of a chain. */
+static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
+{
+	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
+	struct onic_pd     *pd   = qp->pd;
+	struct ernic_sq_wqe wqe;
+	u32                 ernic_op;
+	enum ib_wc_opcode   wc_op;
+	u32                 slot;
+	u32                 length;
+	u64                 laddr;
+	int                 rv;
+
+	if (wr->num_sge > 1)
+		return -EOPNOTSUPP;
+	if (wr->next != NULL && wr->num_sge == 0) {
+		/* Allowed at IB level (zero-length SEND) — fall through. */
+	}
+
+	rv = ernic_xlate_opcode(wr->opcode, &ernic_op, &wc_op);
+	if (rv) {
+		dev_info(&dev->priv->pdev->dev,
+			 "onic_ib: post_send unsupported opcode=%d\n",
+			 (int)wr->opcode);
+		return rv;
+	}
+
+	length = (wr->num_sge == 1) ? wr->sg_list[0].length : 0;
+	laddr  = (wr->num_sge == 1) ? wr->sg_list[0].addr   : 0;
+
+	/* B7 first cut: payload comes from a registered MR. We don't have a
+	 * generic "stage host buffer in DDR4" path yet, so for SEND we only
+	 * accept inline payload ≤16 B (carried in the WQE itself). For
+	 * RDMA_WRITE the engine reads `laddr` from DDR4 directly, so the
+	 * caller must have registered the MR and `addr` is the DDR4 byte
+	 * offset of the source — same convention as libreconic. */
+	if (wr->opcode == IB_WR_SEND && length > 16) {
+		dev_info(&dev->priv->pdev->dev,
+			 "onic_ib: post_send SEND len=%u > 16 not yet supported\n",
+			 length);
+		return -EOPNOTSUPP;
+	}
+
+	memset(&wqe, 0, sizeof(wqe));
+	slot = qp->sq_pidb % qp->sq_depth;
+
+	wqe.wrid       = cpu_to_le16((u16)slot);
+	wqe.length     = cpu_to_le32(length);
+	wqe.opcode     = cpu_to_le32(ernic_op & 0xff);
+
+	if (wr->opcode == IB_WR_SEND) {
+		/* Inline payload path: the WQE itself carries the bytes; the
+		 * laddr/laddr_high fields are unused for inline SEND. */
+		if (length > 0 && wr->sg_list[0].addr) {
+			/* `addr` here is a kernel virtual address from the
+			 * post_send caller (in-kernel ULPs only — userspace
+			 * verbs have not been wired through ucontext yet).
+			 * Direct memcpy is the safe path for ≤16 B inline. */
+			memcpy(wqe.send_small_payload,
+			       (const void *)(uintptr_t)wr->sg_list[0].addr,
+			       length);
+		}
+	} else {
+		/* RDMA_WRITE: laddr = DDR4 byte offset of source (within the
+		 * caller's registered MR). The engine resolves this through
+		 * the PDT row indexed by qp->pd->mr->lkey. */
+		wqe.laddr_low  = cpu_to_le32((u32)(laddr & 0xffffffffu));
+		wqe.laddr_high = cpu_to_le32((u32)(laddr >> 32));
+		wqe.remote_offset_low  =
+			cpu_to_le32((u32)(rdma_wr(wr)->remote_addr & 0xffffffffu));
+		wqe.remote_offset_high =
+			cpu_to_le32((u32)(rdma_wr(wr)->remote_addr >> 32));
+		/* r_key — only [7:0] honoured per spec. */
+		wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey & 0xffu);
+	}
+
+	(void)pd;  /* future use: per-PD WQE bookkeeping */
+
+	/* Land the 64 bytes in DDR4 at qp->sq_ddr_off + slot * 64. */
+	rv = onic_ddr4_write(dev->priv,
+			     qp->sq_ddr_off + (u64)slot * sizeof(wqe),
+			     &wqe, sizeof(wqe));
+	if (rv) {
+		dev_info(&dev->priv->pdev->dev,
+			 "onic_ib: post_send sysdma WRITE failed qp=%u slot=%u rv=%d\n",
+			 qp->qp_num, slot, rv);
+		return rv;
+	}
+
+	/* Update the SQ shadow so poll_cq can recover the full wr_id. */
+	qp->sq_shadow[slot].wr_id     = wr->wr_id;
+	qp->sq_shadow[slot].ib_opcode = wc_op;
+	qp->sq_shadow[slot].length    = length;
+
+	qp->sq_pidb++;
+	return 0;
+}
+
+/* Ring the SQ doorbell after one or more WQEs have landed in DDR4. */
+static void ernic_sq_doorbell(struct onic_qp *qp)
+{
+	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
+	void __iomem       *mmio = dev->priv->hw.addr;
+
+	wmb();                                  /* WQE bytes visible first */
+	iowrite32(qp->sq_pidb,
+		  mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x38));
+	(void)ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x38));
+}
+
+static int onic_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+			  const struct ib_send_wr **bad_wr)
+{
+	struct onic_qp     *qp  = to_onic_qp(ibqp);
+	struct onic_ib_dev *dev = to_onic_ib_dev(ibqp->device);
+	const struct ib_send_wr *cur = wr;
+	int posted = 0;
+	int rv = 0;
+
+	if (!wr)
+		return -EINVAL;
+
+	spin_lock(&qp->state_lock);
+	if (qp->state != ERNIC_QP_RTS) {
+		spin_unlock(&qp->state_lock);
+		dev_info_ratelimited(&dev->priv->pdev->dev,
+				     "onic_ib: post_send qp[%u] not RTS (state=%d)\n",
+				     qp->qp_num, (int)qp->state);
+		*bad_wr = wr;
+		return -EINVAL;
+	}
+
+	dev_info_ratelimited(&dev->priv->pdev->dev,
+			     "onic_ib: post_send qp[%u] start chain\n",
+			     qp->qp_num);
+
+	while (cur) {
+		rv = ernic_sq_post_one(qp, cur);
+		if (rv) {
+			*bad_wr = cur;
+			break;
+		}
+		posted++;
+		cur = cur->next;
+	}
+
+	if (posted)
+		ernic_sq_doorbell(qp);
+
+	spin_unlock(&qp->state_lock);
+	return rv;
+}
+
+static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+			  const struct ib_recv_wr **bad_wr)
+{
+	struct onic_qp     *qp   = to_onic_qp(ibqp);
+	struct onic_ib_dev *dev  = to_onic_ib_dev(ibqp->device);
+	void __iomem       *mmio = dev->priv->hw.addr;
+	const struct ib_recv_wr *cur = wr;
+	int posted = 0;
+
+	if (!wr)
+		return -EINVAL;
+
+	spin_lock(&qp->state_lock);
+	if (qp->state == ERNIC_QP_RESET) {
+		spin_unlock(&qp->state_lock);
+		*bad_wr = wr;
+		return -EINVAL;
+	}
+
+	dev_info_ratelimited(&dev->priv->pdev->dev,
+			     "onic_ib: post_recv qp[%u] start chain\n",
+			     qp->qp_num);
+
+	while (cur) {
+		u32 slot;
+
+		if (cur->num_sge > 1) {
+			*bad_wr = cur;
+			spin_unlock(&qp->state_lock);
+			return -EOPNOTSUPP;
+		}
+
+		slot = qp->rq_pidb % qp->rq_depth;
+		qp->rq_shadow[slot].wr_id = cur->wr_id;
+		qp->rq_pidb++;
+		posted++;
+		cur = cur->next;
+	}
+
+	if (posted) {
+		/* Host does NOT compose RQE bytes — engine fills the slot
+		 * when an RQPKT lands.  We just bump the consumer-side
+		 * counter so the engine knows how many slots are armed.
+		 * RQCIi is the "RQ consumer index"; in v4.2 the host writes
+		 * the *expected* tail (== monotonic count of armed slots). */
+		wmb();
+		iowrite32(qp->rq_pidb,
+			  mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x34));
+		(void)ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x34));
+	}
+
+	spin_unlock(&qp->state_lock);
+	return 0;
+}
+
+static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
+{
+	struct onic_cq      *cq   = to_onic_cq(ibcq);
+	struct onic_ib_dev  *dev  = to_onic_ib_dev(ibcq->device);
+	void __iomem        *mmio = dev->priv->hw.addr;
+	struct onic_private *priv = dev->priv;
+	struct onic_qp      *qp;
+	u32                  cqhead;
+	int                  polled = 0;
+
+	if (num_entries <= 0)
+		return 0;
+	if (!cq->bound)
+		return 0;
+
+	/* ERNIC v4.2 has a strict 1:1 QP↔CQ mapping; create_qp stashes the
+	 * back-pointer on the CQ. Without it we can't find the doorbell. */
+	qp = cq->qp_back;
+	if (!qp)
+		return 0;
+
+	cqhead = ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x30));
+
+	spin_lock(&qp->state_lock);
+
+	while (polled < num_entries && qp->cq_consumer_idx != cqhead) {
+		u32                slot = qp->cq_consumer_idx % qp->cq_depth;
+		struct ernic_cqe   cqe_raw = {0};
+		u32                wqe_slot;
+		int                rv;
+
+		rv = onic_ddr4_read(priv, &cqe_raw,
+				    qp->cq_ddr_off + (u64)slot * sizeof(cqe_raw),
+				    sizeof(cqe_raw));
+		if (rv) {
+			dev_info_ratelimited(&priv->pdev->dev,
+					     "onic_ib: poll_cq sysdma READ failed qp=%u slot=%u rv=%d\n",
+					     qp->qp_num, slot, rv);
+			break;
+		}
+
+		wqe_slot = le16_to_cpu(cqe_raw.wqe_idx) % qp->sq_depth;
+
+		memset(&wc[polled], 0, sizeof(wc[polled]));
+		wc[polled].qp        = &qp->ibqp;
+		wc[polled].wr_id     = qp->sq_shadow[wqe_slot].wr_id;
+		wc[polled].opcode    = qp->sq_shadow[wqe_slot].ib_opcode;
+		wc[polled].byte_len  = qp->sq_shadow[wqe_slot].length;
+		wc[polled].status    = (cqe_raw.status == 0) ?
+					IB_WC_SUCCESS : IB_WC_GENERAL_ERR;
+		wc[polled].vendor_err = cqe_raw.status;
+
+		qp->cq_consumer_idx++;
+		polled++;
+	}
+
+	spin_unlock(&qp->state_lock);
+	return polled;
+}
+
+/* Polling-mode req_notify_cq: arming an IRQ-driven completion is B8
+ * work.  Returning 0 means "no missed events" — ULPs that explicitly
+ * want IRQ-mode wakeups will fall back to polling, which is what we
+ * want for now. */
+static int onic_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags f)
+{
+	(void)cq;
+	(void)f;
+	return 0;
+}
 static int onic_stub_create_ah(struct ib_ah *ah, struct rdma_ah_init_attr *a,
 			       struct ib_udata *u)               { STUB_BODY("create_ah"); }
 static int onic_stub_destroy_ah(struct ib_ah *ah, u32 flags)     { STUB_BODY("destroy_ah"); }
@@ -799,10 +1156,10 @@ static const struct ib_device_ops onic_ib_ops = {
 
 	.modify_qp                   = onic_modify_qp,
 	.query_qp                    = onic_query_qp,
-	.post_send                   = onic_stub_post_send,
-	.post_recv                   = onic_stub_post_recv,
-	.poll_cq                     = onic_stub_poll_cq,
-	.req_notify_cq               = onic_stub_req_notify_cq,
+	.post_send                   = onic_post_send,
+	.post_recv                   = onic_post_recv,
+	.poll_cq                     = onic_poll_cq,
+	.req_notify_cq               = onic_req_notify_cq,
 	.create_ah                   = onic_stub_create_ah,
 	.destroy_ah                  = onic_stub_destroy_ah,
 	.alloc_mr                    = onic_stub_alloc_mr,
@@ -821,6 +1178,10 @@ int onic_ib_register(struct onic_private *priv)
 	struct onic_ib_dev *dev;
 	char  name[IB_DEVICE_NAME_MAX];
 	int   rv;
+
+	/* B7 — compile-time guards on packed ERNIC wire structs. */
+	BUILD_BUG_ON(sizeof(struct ernic_sq_wqe) != 64);
+	BUILD_BUG_ON(sizeof(struct ernic_cqe)    != 4);
 
 	if (!test_bit(ONIC_FLAG_MASTER_PF, priv->flags))
 		return 0;
