@@ -21,6 +21,55 @@
 #include "onic_sysdma.h"
 #include "../libreconic/reconic_reg.h"
 
+/* ====================================================================
+ * Dual-ERNIC helpers — verb-path register access.
+ *
+ * The bitstream carries TWO ERNIC instances:
+ *   ERNIC0 at BAR2 offset RN_RDMA_BASE_ADDRESS    (0x800000) -> port 1
+ *   ERNIC1 at BAR2 offset RN_RDMA_1_BASE_ADDRESS  (0xA00000) -> port 2
+ *
+ * libreconic/reconic_reg.h's RN_RDMA_QCSR_REG() macro hard-codes
+ * RN_RDMA_BASE_ADDRESS, so it can only address ERNIC0.  For port-2 QPs
+ * we compute the QCSR offset against qp->ernic_base, which is set at
+ * RESET->INIT once port_num is known.
+ *
+ * libreconic uses one rdma_dev_t per port, with rdma_dev->axil_ctl
+ * already offset by port_offset, and qpid is per-ERNIC inside that
+ * device.  Our driver maintains a SINGLE qp_num namespace at the
+ * ib_device level (required by IB — ibqp.qp_num must be unique inside
+ * an ib_device), so we use the same qp_num as the ERNIC slot index in
+ * each ERNIC's QCSR addressing.  qp_num collisions across ports are
+ * impossible because the slot bitmap is shared (one onic_ddr_pool per
+ * ib_device); two QPs with the same ibqp.qp_num cannot exist.
+ *
+ * DDR4 isolation: F4 §2.2 splits DDR4 into disjoint halves, ERNIC0 in
+ * 0..2_0000_0000 and ERNIC1 in 0x2_0000_0000+.  We don't need separate
+ * onic_ddr_pool instances for that — the slot byte offset is just
+ * (port-1)*0x2_0000_0000 + slot_off.  Slot N on port 1 and slot M on
+ * port 2 (with M==N never happening anyway) can never collide.
+ * ==================================================================== */
+
+/* Per-QP QCSR address in BAR2.  qp->ernic_base must have been set
+ * (i.e. QP must be past RESET) before calling this. */
+static inline u32 onic_qcsr(const struct onic_qp *qp, u32 off)
+{
+	return qp->ernic_base + 0x00180000u +
+	       (qp->qp_num - 1u) * RN_RDMA_QCSR_STRIDE + off;
+}
+
+/* Per-port DDR4 byte offset.  port_num is 1-based as in IB. */
+static inline u64 onic_port_ddr_off(u8 port_num)
+{
+	return ((u64)port_num - 1ULL) * 0x200000000ULL;
+}
+
+/* Map IB port_num -> ERNIC BAR2 base. */
+static inline u32 onic_ernic_base_for_port(u8 port_num)
+{
+	return (port_num == 2) ? RN_RDMA_1_BASE_ADDRESS
+			       : RN_RDMA_BASE_ADDRESS;
+}
+
 
 /* ----- query_* ----------------------------------------------------------- */
 
@@ -281,18 +330,31 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 	buf_addr = ((u64)ONIC_DDR4_MSB << 32) |
 		   (dev->ddr.base_off + ddr_off);
 
-	/* Program the 8 PDT registers (F1 §5.1.2, stride 0x100). */
-	row_base = RN_RDMA_BASE_ADDRESS + pd->pdn * 0x100;
-	iowrite32(pd->pdn,                         mmio + row_base + 0x00);
-	iowrite32((u32)(virt_addr & 0xffffffffu),  mmio + row_base + 0x04);
-	iowrite32((u32)(virt_addr >> 32),          mmio + row_base + 0x08);
-	iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x0C);
-	iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x10);
-	iowrite32(mr->rkey & 0xffu,                mmio + row_base + 0x14);
-	iowrite32((u32)(length & 0xffffffffu),     mmio + row_base + 0x18);
-	iowrite32(((u32)(length >> 16) & 0xffff0000u) |
-		  ((u32)mr->access & 0x3),         mmio + row_base + 0x1C);
-	(void)ioread32(mmio + row_base + 0x00);   /* posted-write flush */
+	/* Program the 8 PDT registers (F1 §5.1.2, stride 0x100).
+	 * Mirrored into BOTH ERNICs so the same PD/MR is usable from a QP
+	 * bound to either port — port_num is not known at MR-registration
+	 * time.  Each ERNIC has its own 2048-entry PDT bank; the mirrored
+	 * writes go to identical slots in each. */
+	{
+		const u32 ernic_bases[2] = {
+			RN_RDMA_BASE_ADDRESS,    /* ERNIC0 (port 1) */
+			RN_RDMA_1_BASE_ADDRESS,  /* ERNIC1 (port 2) */
+		};
+		int e;
+		for (e = 0; e < 2; e++) {
+			row_base = ernic_bases[e] + pd->pdn * 0x100;
+			iowrite32(pd->pdn,                         mmio + row_base + 0x00);
+			iowrite32((u32)(virt_addr & 0xffffffffu),  mmio + row_base + 0x04);
+			iowrite32((u32)(virt_addr >> 32),          mmio + row_base + 0x08);
+			iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x0C);
+			iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x10);
+			iowrite32(mr->rkey & 0xffu,                mmio + row_base + 0x14);
+			iowrite32((u32)(length & 0xffffffffu),     mmio + row_base + 0x18);
+			iowrite32(((u32)(length >> 16) & 0xffff0000u) |
+				  ((u32)mr->access & 0x3),         mmio + row_base + 0x1C);
+			(void)ioread32(mmio + row_base + 0x00);   /* posted-write flush */
+		}
+	}
 
 	mr->ibmr.lkey = mr->lkey;
 	mr->ibmr.rkey = mr->rkey;
@@ -310,13 +372,20 @@ static int onic_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 	struct onic_pd     *pd   = mr->pd;
 	struct onic_ib_dev *dev  = to_onic_ib_dev(ibmr->device);
 	void __iomem       *mmio = dev->priv->hw.addr;
-	u32                 row_base = RN_RDMA_BASE_ADDRESS + pd->pdn * 0x100;
-	int                 i;
+	const u32           ernic_bases[2] = {
+		RN_RDMA_BASE_ADDRESS, RN_RDMA_1_BASE_ADDRESS,
+	};
+	u32                 row_base;
+	int                 e, i;
 	(void)udata;
 
-	for (i = 0; i < 8; i++)
-		iowrite32(0, mmio + row_base + i * 4);
-	(void)ioread32(mmio + row_base + 0);
+	/* Clear the mirrored PDT row in both ERNICs. */
+	for (e = 0; e < 2; e++) {
+		row_base = ernic_bases[e] + pd->pdn * 0x100;
+		for (i = 0; i < 8; i++)
+			iowrite32(0, mmio + row_base + i * 4);
+		(void)ioread32(mmio + row_base + 0);
+	}
 
 	onic_ddr_mr_free(&dev->ddr, mr->ddr_off);
 
@@ -368,10 +437,8 @@ static int onic_create_qp(struct ib_qp *ibqp,
 				   to_onic_cq(init_attr->send_cq) : NULL;
 	struct onic_cq     *rcq  = init_attr->recv_cq ?
 				   to_onic_cq(init_attr->recv_cq) : NULL;
-	void __iomem       *mmio = dev->priv->hw.addr;
 	u32                 qp_idx;
 	u64                 slot_off, sq_off, rq_off, cq_off;
-	u32                 qpconfi, qpadvconfi, qdepthi, q;
 	int                 rv;
 	(void)udata;
 
@@ -419,12 +486,15 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->state      = ERNIC_QP_RESET;
 	spin_lock_init(&qp->state_lock);
 
-	/* B7 — capture DDR4 byte offsets for the verb path.
-	 * Includes pool->base_off so onic_ddr4_write/read get the right
-	 * crossbar AXI offset on both ERNIC0 (base_off=0) and ERNIC1. */
-	qp->sq_ddr_off = dev->ddr.base_off + sq_off;
-	qp->rq_ddr_off = dev->ddr.base_off + rq_off;
-	qp->cq_ddr_off = dev->ddr.base_off + cq_off;
+	/* DDR4 byte offsets and ernic_base are deferred to RESET->INIT —
+	 * we don't know which ERNIC (port 1 = ERNIC0, port 2 = ERNIC1) the
+	 * QP is bound to until that transition.  Both QCSR programming
+	 * (SQBA/RQBA/CQBA/QPCONF/etc.) and post_send/poll_cq DDR4 byte
+	 * offsets are computed there. */
+	qp->ernic_base      = 0;
+	qp->sq_ddr_off      = 0;
+	qp->rq_ddr_off      = 0;
+	qp->cq_ddr_off      = 0;
 	qp->sq_pidb         = 0;
 	qp->rq_pidb         = 0;
 	qp->cq_consumer_idx = 0;
@@ -442,51 +512,9 @@ static int onic_create_qp(struct ib_qp *ibqp,
 		return -ENOMEM;
 	}
 
-	/* QPCONFi: QPEN=0 (B6 turns it on), RQINTEN+CQINTEN, HWHSHKDIS,
-	 * PATHMTU=4096, RQBUFSZ = rq_depth in 256-B units (PG332). */
-	qpconfi  = 0;
-	qpconfi |= (1u << 2);                      /* RQINTEN */
-	qpconfi |= (1u << 3);                      /* CQINTEN */
-	qpconfi |= (1u << 5);                      /* HWHSHKDIS */
-	qpconfi |= ((u32)qp->path_mtu & 0x7) << 8;
-	/* B7 fix: QPCONFi[31:16] is RQE size in 256-B units (= 2 for 512-B
-	 * libreconic RQEs), NOT rq_depth.  The B5 code packed rq_depth here
-	 * by mistake — without this fix post_recv simply will not work
-	 * because the engine writes RQEs at the wrong stride. */
-	qpconfi |= ((u32)ERNIC_RQE_SIZE_FIELD & 0xffffu) << 16;
-
-	qpadvconfi  = 0;
-	qpadvconfi |= (0u    << 0);                /* TC */
-	qpadvconfi |= (64u   << 8);                /* TTL */
-	qpadvconfi |= (0xFFFFu << 16);             /* PKEY */
-
-	qdepthi  = ((u32)qp->rq_depth << 16) | (u32)qp->sq_depth;
-
-	q = RN_RDMA_QCSR_REG(qp_idx, 0x00);
-	iowrite32(qpconfi,     mmio + q);                         /* QPCONFi   */
-	iowrite32(qpadvconfi,  mmio + q + 0x04);                  /* QPADVCONFi*/
-	iowrite32(onic_ddr_addr_lsb(&dev->ddr, rq_off),
-		  mmio + q + 0x08);                               /* RQBAi     */
-	iowrite32(onic_ddr_addr_msb(&dev->ddr, rq_off),
-		  mmio + q + 0xC0);                               /* RQBAMSBi  */
-	iowrite32(onic_ddr_addr_lsb(&dev->ddr, sq_off),
-		  mmio + q + 0x10);                               /* SQBAi     */
-	iowrite32(onic_ddr_addr_msb(&dev->ddr, sq_off),
-		  mmio + q + 0xC8);                               /* SQBAMSBi  */
-	iowrite32(onic_ddr_addr_lsb(&dev->ddr, cq_off),
-		  mmio + q + 0x18);                               /* CQBAi     */
-	iowrite32(onic_ddr_addr_msb(&dev->ddr, cq_off),
-		  mmio + q + 0xD0);                               /* CQBAMSBi  */
-	iowrite32(qdepthi,     mmio + q + 0x3C);                  /* QDEPTHi   */
-	iowrite32(pd->pdn,     mmio + q + 0xB0);                  /* PDi       */
-	/* We don't use host-DMA doorbells in B5. */
-	iowrite32(0,           mmio + q + 0x20);                  /* RQWPTRDBADDi  */
-	iowrite32(0,           mmio + q + 0x24);                  /* RQWPTRDBADDMSBi*/
-	iowrite32(0,           mmio + q + 0x28);                  /* CQDBADDi  */
-	iowrite32(0,           mmio + q + 0x2C);                  /* CQDBADDMSBi*/
-	(void)ioread32(mmio + q + 0x00);                          /* flush     */
-
-	/* Bind the CQ to this slot. */
+	/* Bind the CQ to this slot.  cq->ddr_off is rebased at RESET->INIT
+	 * once the port (and therefore the DDR4 half) is known; for now we
+	 * record the in-half offset so destroy_qp can clear bookkeeping. */
 	scq->cq_id   = qp_idx;
 	scq->ddr_off = cq_off;
 	scq->bound   = true;
@@ -505,20 +533,24 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	struct onic_qp     *qp   = to_onic_qp(ibqp);
 	struct onic_ib_dev *dev  = to_onic_ib_dev(ibqp->device);
 	void __iomem       *mmio = dev->priv->hw.addr;
-	u32                 q    = RN_RDMA_QCSR_REG(qp->qp_num, 0x00);
 	(void)udata;
 
-	iowrite32(0, mmio + q);
-	iowrite32(0, mmio + q + 0x04);
-	iowrite32(0, mmio + q + 0x08);
-	iowrite32(0, mmio + q + 0xC0);
-	iowrite32(0, mmio + q + 0x10);
-	iowrite32(0, mmio + q + 0xC8);
-	iowrite32(0, mmio + q + 0x18);
-	iowrite32(0, mmio + q + 0xD0);
-	iowrite32(0, mmio + q + 0x3C);
-	iowrite32(0, mmio + q + 0xB0);
-	(void)ioread32(mmio + q);
+	/* QCSR teardown only if the QP made it past RESET — before
+	 * RESET->INIT the QCSR window was never programmed. */
+	if (qp->ernic_base) {
+		u32 q = onic_qcsr(qp, 0x00);
+		iowrite32(0, mmio + q);
+		iowrite32(0, mmio + q + 0x04);
+		iowrite32(0, mmio + q + 0x08);
+		iowrite32(0, mmio + q + 0xC0);
+		iowrite32(0, mmio + q + 0x10);
+		iowrite32(0, mmio + q + 0xC8);
+		iowrite32(0, mmio + q + 0x18);
+		iowrite32(0, mmio + q + 0xD0);
+		iowrite32(0, mmio + q + 0x3C);
+		iowrite32(0, mmio + q + 0xB0);
+		(void)ioread32(mmio + q);
+	}
 
 	if (qp->send_cq) {
 		qp->send_cq->bound   = false;
@@ -554,26 +586,104 @@ static bool gid_is_ipv4(const union ib_gid *g)
 static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
 					struct ib_qp_attr *attr, int mask)
 {
+	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
+	struct onic_pd     *pd   = qp->pd;
+	void __iomem       *mmio = dev->priv->hw.addr;
 	const int required = IB_QP_STATE | IB_QP_PKEY_INDEX |
 			     IB_QP_PORT  | IB_QP_ACCESS_FLAGS;
+	u64 port_off, sq_off, rq_off, cq_off;
+	u32 qpconfi, qpadvconfi, qdepthi, q;
+	u32 sq_lsb, sq_msb, rq_lsb, rq_msb, cq_lsb, cq_msb;
 
 	if ((mask & required) != required) {
 		pr_info_ratelimited("onic_ib: R->I missing mask have=0x%x need=0x%x\n",
 				    mask, required);
 		return -EINVAL;
 	}
-	if (attr->port_num != 1) {
-		pr_info_ratelimited("onic_ib: R->I port_num=%u, only 1 supported\n",
+	if (attr->port_num != 1 && attr->port_num != 2) {
+		pr_info_ratelimited("onic_ib: R->I port_num=%u, only 1 or 2 supported\n",
 				    attr->port_num);
 		return -EOPNOTSUPP;
 	}
 	if (attr->pkey_index != 0)
 		return -EINVAL;
 
+	/* Bind QP to the chosen ERNIC.  All subsequent QCSR accesses (this
+	 * function plus INIT->RTR, RTR->RTS, post_send doorbell, post_recv
+	 * doorbell, poll_cq CQHEAD read, destroy_qp teardown) go through
+	 * onic_qcsr(qp, off) and resolve to qp->ernic_base. */
+	qp->ernic_base = onic_ernic_base_for_port(attr->port_num);
+	qp->port_num   = attr->port_num;
+
+	/* DDR4 byte offsets — F4 §2.2 disjoint halves, port 1 in 0..2G,
+	 * port 2 in 0x2_0000_0000.. .  Slot itself lives at slot_off
+	 * inside the half. */
+	port_off = onic_port_ddr_off(attr->port_num);
+	sq_off = qp->slot_off + ONIC_DDR_QUEUE_SQ_OFF;
+	rq_off = qp->slot_off + ONIC_DDR_QUEUE_RQ_OFF;
+	cq_off = qp->slot_off + ONIC_DDR_QUEUE_CQ_OFF;
+
+	qp->sq_ddr_off = port_off + sq_off;
+	qp->rq_ddr_off = port_off + rq_off;
+	qp->cq_ddr_off = port_off + cq_off;
+	if (qp->send_cq)
+		qp->send_cq->ddr_off = qp->cq_ddr_off;
+
+	/* The 64b DDR4 address presented to the ERNIC is
+	 *   (ONIC_DDR4_MSB << 32) | (port_off + slot_off)
+	 * — same composition as onic_ddr_addr_lsb/msb but with port_off
+	 * substituted for pool->base_off. */
+	{
+		u64 sq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + sq_off);
+		u64 rq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + rq_off);
+		u64 cq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + cq_off);
+		sq_lsb = (u32)(sq_addr & 0xffffffffu);
+		sq_msb = (u32)(sq_addr >> 32);
+		rq_lsb = (u32)(rq_addr & 0xffffffffu);
+		rq_msb = (u32)(rq_addr >> 32);
+		cq_lsb = (u32)(cq_addr & 0xffffffffu);
+		cq_msb = (u32)(cq_addr >> 32);
+	}
+
+	/* QPCONFi: QPEN=0 (RTR->RTS turns it on), RQINTEN+CQINTEN, HWHSHKDIS,
+	 * PATHMTU=4096, RQBUFSZ in 256-B units (= 2 for 512-B libreconic RQEs). */
+	qpconfi  = 0;
+	qpconfi |= (1u << 2);                      /* RQINTEN */
+	qpconfi |= (1u << 3);                      /* CQINTEN */
+	qpconfi |= (1u << 5);                      /* HWHSHKDIS */
+	qpconfi |= ((u32)qp->path_mtu & 0x7) << 8;
+	qpconfi |= ((u32)ERNIC_RQE_SIZE_FIELD & 0xffffu) << 16;
+
+	qpadvconfi  = 0;
+	qpadvconfi |= (0u    << 0);                /* TC */
+	qpadvconfi |= (64u   << 8);                /* TTL */
+	qpadvconfi |= (0xFFFFu << 16);             /* PKEY */
+
+	qdepthi  = ((u32)qp->rq_depth << 16) | (u32)qp->sq_depth;
+
+	q = onic_qcsr(qp, 0x00);
+	iowrite32(qpconfi,     mmio + q);                         /* QPCONFi   */
+	iowrite32(qpadvconfi,  mmio + q + 0x04);                  /* QPADVCONFi*/
+	iowrite32(rq_lsb,      mmio + q + 0x08);                  /* RQBAi     */
+	iowrite32(rq_msb,      mmio + q + 0xC0);                  /* RQBAMSBi  */
+	iowrite32(sq_lsb,      mmio + q + 0x10);                  /* SQBAi     */
+	iowrite32(sq_msb,      mmio + q + 0xC8);                  /* SQBAMSBi  */
+	iowrite32(cq_lsb,      mmio + q + 0x18);                  /* CQBAi     */
+	iowrite32(cq_msb,      mmio + q + 0xD0);                  /* CQBAMSBi  */
+	iowrite32(qdepthi,     mmio + q + 0x3C);                  /* QDEPTHi   */
+	iowrite32(pd->pdn,     mmio + q + 0xB0);                  /* PDi       */
+	/* No host-DMA doorbells. */
+	iowrite32(0,           mmio + q + 0x20);                  /* RQWPTRDBADDi  */
+	iowrite32(0,           mmio + q + 0x24);                  /* RQWPTRDBADDMSBi*/
+	iowrite32(0,           mmio + q + 0x28);                  /* CQDBADDi  */
+	iowrite32(0,           mmio + q + 0x2C);                  /* CQDBADDMSBi*/
+	(void)ioread32(mmio + q + 0x00);                          /* flush     */
+
 	qp->state = ERNIC_QP_INIT;
-	qp->port_num = attr->port_num;
-	pr_info("onic_ib: qp[%u] RESET -> INIT (port=%u pkey_idx=%u)\n",
-		qp->qp_num, attr->port_num, attr->pkey_index);
+	pr_info("onic_ib: qp[%u] RESET -> INIT (port=%u pkey_idx=%u, ERNIC%u base=0x%08x ddr_off=0x%llx)\n",
+		qp->qp_num, attr->port_num, attr->pkey_index,
+		(attr->port_num == 1) ? 0u : 1u,
+		qp->ernic_base, (unsigned long long)qp->sq_ddr_off);
 	return 0;
 }
 
@@ -584,7 +694,7 @@ static int onic_modify_qp_init_to_rtr(struct onic_qp *qp,
 	void __iomem       *mmio = dev->priv->hw.addr;
 	const int required = IB_QP_STATE | IB_QP_AV | IB_QP_PATH_MTU |
 			     IB_QP_DEST_QPN | IB_QP_RQ_PSN;
-	u32 q       = RN_RDMA_QCSR_REG(qp->qp_num, 0x00);
+	u32 q       = onic_qcsr(qp, 0x00);
 	u32 destqp, mac_lsb, mac_msb;
 	u32 ip1 = 0, ip2 = 0, ip3 = 0, ip4 = 0;
 	u32 timeoutconf, qpconfi;
@@ -678,8 +788,11 @@ static int onic_modify_qp_rtr_to_rts(struct onic_qp *qp,
 {
 	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
 	void __iomem       *mmio = dev->priv->hw.addr;
-	u32 q       = RN_RDMA_QCSR_REG(qp->qp_num, 0x00);
+	u32 q       = onic_qcsr(qp, 0x00);
 	u32 qpen_ct, new_ct, qpconfi;
+	/* XRNIC_CONF_QP_EN lives in this QP's ERNIC GCSR window (offset
+	 * 0x100044 inside the ERNIC slice). */
+	u32 qpen_addr = qp->ernic_base + 0x00100044u;
 	const int required = IB_QP_STATE | IB_QP_SQ_PSN;
 
 	if ((mask & required) != required) {
@@ -691,16 +804,13 @@ static int onic_modify_qp_rtr_to_rts(struct onic_qp *qp,
 	iowrite32(attr->sq_psn & 0x00FFFFFFu, mmio + q + 0x40);
 	qp->sq_psn = attr->sq_psn;
 
-	/* XRNIC_CONF_QP_EN is global GCSR.  VERIFY: count vs mask — using
+	/* XRNIC_CONF_QP_EN is per-ERNIC GCSR.  VERIFY: count vs mask — using
 	 * COUNT semantics (F7 §5.4, F1 audit §6.2). */
-	qpen_ct = ioread32(mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
-				   RN_RDMA_BASE_ADDRESS)) & 0xFFFu;
+	qpen_ct = ioread32(mmio + qpen_addr) & 0xFFFu;
 	new_ct  = qp->qp_num + 1;
 	if (new_ct > qpen_ct) {
-		iowrite32(new_ct, mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
-					  RN_RDMA_BASE_ADDRESS));
-		(void)ioread32(mmio + (RN_RDMA_GCSR_XRNIC_CONF_QP_EN -
-				       RN_RDMA_BASE_ADDRESS));
+		iowrite32(new_ct, mmio + qpen_addr);
+		(void)ioread32(mmio + qpen_addr);
 	}
 
 	/* Set QPEN=1 without trashing other bits. */
@@ -943,9 +1053,8 @@ static void ernic_sq_doorbell(struct onic_qp *qp)
 	void __iomem       *mmio = dev->priv->hw.addr;
 
 	wmb();                                  /* WQE bytes visible first */
-	iowrite32(qp->sq_pidb,
-		  mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x38));
-	(void)ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x38));
+	iowrite32(qp->sq_pidb, mmio + onic_qcsr(qp, 0x38));
+	(void)ioread32(mmio + onic_qcsr(qp, 0x38));
 }
 
 static int onic_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
@@ -1037,9 +1146,8 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 		 * RQCIi is the "RQ consumer index"; in v4.2 the host writes
 		 * the *expected* tail (== monotonic count of armed slots). */
 		wmb();
-		iowrite32(qp->rq_pidb,
-			  mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x34));
-		(void)ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x34));
+		iowrite32(qp->rq_pidb, mmio + onic_qcsr(qp, 0x34));
+		(void)ioread32(mmio + onic_qcsr(qp, 0x34));
 	}
 
 	spin_unlock(&qp->state_lock);
@@ -1067,7 +1175,11 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 	if (!qp)
 		return 0;
 
-	cqhead = ioread32(mmio + RN_RDMA_QCSR_REG(qp->qp_num, 0x30));
+	/* If QP never advanced past RESET, ernic_base is 0 and there are
+	 * no completions to poll. */
+	if (!qp->ernic_base)
+		return 0;
+	cqhead = ioread32(mmio + onic_qcsr(qp, 0x30));
 
 	spin_lock(&qp->state_lock);
 

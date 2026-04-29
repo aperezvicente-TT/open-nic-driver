@@ -152,13 +152,23 @@ struct onic_qp {
 
 	spinlock_t              state_lock;
 
-	/* B7 — DDR4 byte offsets of the per-QP rings (already programmed
-	 * into SQBAi/RQBAi/CQBAi during create_qp). Captured here so
-	 * post_send / poll_cq can stage WQEs and read CQEs via
-	 * onic_ddr4_{write,read}.  Includes pool->base_off for ERNIC1. */
+	/* B7 — DDR4 byte offsets of the per-QP rings.  Final values are
+	 * resolved at RESET->INIT once port_num (and therefore the ERNIC
+	 * binding) is known: ddr_off = (port-1)*0x2_0000_0000 + slot_off.
+	 * post_send / poll_cq use these to stage WQEs and read CQEs via
+	 * onic_ddr4_{write,read}. */
 	u64                     sq_ddr_off;
 	u64                     rq_ddr_off;
 	u64                     cq_ddr_off;
+
+	/* Dual-ERNIC plumbing — set at RESET->INIT once port_num is known.
+	 *   ernic_base = RN_RDMA_BASE_ADDRESS   (0x800000) for port 1
+	 *   ernic_base = RN_RDMA_1_BASE_ADDRESS (0xA00000) for port 2
+	 * Used as the QCSR window base for every per-QP register access on
+	 * the verb path (post_send doorbell, post_recv doorbell, poll_cq
+	 * CQHEAD read, modify_qp QCSR writes, destroy_qp QCSR teardown).
+	 * Zero before RESET->INIT — guard accordingly. */
+	u32                     ernic_base;
 
 	/* B7 — driver-side shadow rings, allocated in create_qp,
 	 * freed in destroy_qp.  Indexed by (pidx % depth) for SQ/RQ. */
