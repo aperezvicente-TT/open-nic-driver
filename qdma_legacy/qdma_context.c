@@ -116,10 +116,6 @@ int qdma_write_sw_ctxt(struct qdma_dev *qdev, u16 qid, enum qdma_dir dir,
 	u32 data[QDMA_SW_CTXT_NUM_WORDS] = {0};
 	u32 num_words = 0;
 
-	pr_info("[SEC_DIAG] write_sw_ctxt: qdev=%p qdev->q_base=%u relative_qid=%u abs_qid=%u dir=%d desc_base=0x%llx qen=%u func_id=%u\n",
-		qdev, qdev->q_base, qid, qdev->q_base + qid, dir,
-		(unsigned long long)ctxt->desc_base, ctxt->qen, ctxt->func_id);
-
 	cmd.word = 0;
 	cmd.bits.sel = (dir == QDMA_C2H) ?
 		QDMA_CTXT_CMD_SEL_SW_C2H : QDMA_CTXT_CMD_SEL_SW_H2C;
@@ -452,68 +448,4 @@ int qdma_invalidate_fmap_ctxt(struct qdma_dev *qdev)
 	qdev->q_base = 0;
 	qdev->num_queues = 0;
 	return qdma_program_ctxt(qdev, &cmd, NULL, 0);
-}
-
-/* [SEC_DIAG] Raw SW context readback.  Reads QDMA_SW_CTXT_NUM_WORDS (5) words
- * but writes 8 entries (zero-padded) into @raw so callers can dump the full
- * IND_CTXT_DATA window if useful.  @qid is RELATIVE to qdev->q_base, matching
- * the convention of qdma_write_sw_ctxt. */
-int qdma_read_sw_ctxt_raw(struct qdma_dev *qdev, u16 qid, enum qdma_dir dir,
-			  u32 raw[8])
-{
-	union qdma_ctxt_cmd cmd;
-	u32 data[QDMA_SW_CTXT_NUM_WORDS] = {0};
-	int rv, i;
-
-	cmd.word = 0;
-	cmd.bits.sel = (dir == QDMA_C2H) ?
-		QDMA_CTXT_CMD_SEL_SW_C2H : QDMA_CTXT_CMD_SEL_SW_H2C;
-	cmd.bits.op = QDMA_CTXT_CMD_OP_RD;
-	cmd.bits.qid = qdma_get_real_qid(qdev, qid);
-
-	rv = qdma_program_ctxt(qdev, &cmd, data, QDMA_SW_CTXT_NUM_WORDS);
-	if (rv < 0)
-		return rv;
-
-	for (i = 0; i < QDMA_SW_CTXT_NUM_WORDS; ++i)
-		raw[i] = data[i];
-	for (; i < 8; ++i)
-		raw[i] = 0;
-	return 0;
-}
-
-/* [SEC_DIAG] Raw HW context readback.  Reads QDMA_HW_CTXT_NUM_WORDS (2)
- * words via the indirect-context read path.  Caller-supplied @raw buffer
- * may be larger than 2 words; trailing entries are zero-padded.  @qid is
- * RELATIVE to qdev->q_base, matching the convention of qdma_write_sw_ctxt
- * and qdma_read_sw_ctxt_raw.
- *
- * Used by the secondary-CMAC debug path to determine whether the QDMA
- * engine has consumed descriptors from a queue (cidx in W0[15:0] != 0)
- * or has ignored every doorbell ring (cidx == 0). */
-int qdma_read_hw_ctxt_raw(struct qdma_dev *qdev, u16 qid, enum qdma_dir dir,
-			  u32 *raw, int max_words)
-{
-	union qdma_ctxt_cmd cmd;
-	u32 data[QDMA_HW_CTXT_NUM_WORDS] = {0};
-	int rv, i;
-
-	if (!raw || max_words <= 0)
-		return -EINVAL;
-
-	cmd.word = 0;
-	cmd.bits.sel = (dir == QDMA_C2H) ?
-		QDMA_CTXT_CMD_SEL_HW_C2H : QDMA_CTXT_CMD_SEL_HW_H2C;
-	cmd.bits.op = QDMA_CTXT_CMD_OP_RD;
-	cmd.bits.qid = qdma_get_real_qid(qdev, qid);
-
-	rv = qdma_program_ctxt(qdev, &cmd, data, QDMA_HW_CTXT_NUM_WORDS);
-	if (rv < 0)
-		return rv;
-
-	for (i = 0; i < QDMA_HW_CTXT_NUM_WORDS && i < max_words; ++i)
-		raw[i] = data[i];
-	for (; i < max_words; ++i)
-		raw[i] = 0;
-	return 0;
 }

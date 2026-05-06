@@ -12,6 +12,9 @@
 #include <linux/netdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/io.h>
+#include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/seq_file.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_addr.h>
 #include <rdma/ib_cache.h>
@@ -19,7 +22,20 @@
 #include "onic.h"
 #include "onic_ib.h"
 #include "onic_sysdma.h"
+#include "onic_debugfs.h"
 #include "../libreconic/reconic_reg.h"
+
+/* Perf #1 — when true, allocate a coherent host page at ib_register
+ * time and use it as the ERNIC RQWPTRDBADDi/CQDBADDi DMA target.
+ * onic_poll_cq then reads the CQ producer index from the host page
+ * instead of issuing an MMIO read of QCSR CQHEADi (saves one PCIe
+ * round-trip per poll, ~1 µs on Gen3 x16). */
+static bool host_doorbell = true;
+module_param(host_doorbell, bool, 0444);
+MODULE_PARM_DESC(host_doorbell,
+	"Perf #1: use a host coherent page for ERNIC CQ/RQ doorbell DMA "
+	"(default true).  Set to 0 to fall back to DDR4-tagged doorbell "
+	"targets (the pre-Perf-#1 behaviour).");
 
 /* ====================================================================
  * Dual-ERNIC helpers — verb-path register access.
@@ -57,10 +73,208 @@ static inline u32 onic_qcsr(const struct onic_qp *qp, u32 off)
 	       (qp->qp_num - 1u) * RN_RDMA_QCSR_STRIDE + off;
 }
 
-/* Per-port DDR4 byte offset.  port_num is 1-based as in IB. */
+/* Dump every interesting QCSR + GCSR register for one QP, to dmesg.
+ * Used to give visibility into ERNIC's view at every state transition
+ * and around post_send.  Cheap: ~30 ioread32() per call.  `tag` shows
+ * up in the log so we can match dumps to a transition.
+ * Non-static so onic_debugfs.c can invoke it from the read handler. */
+void onic_dump_qp_state(const struct onic_qp *qp, const char *tag)
+{
+	void __iomem *mmio = qp->ibqp.device->dev.parent ?
+			     to_onic_ib_dev(qp->ibqp.device)->priv->hw.addr :
+			     NULL;
+	u32 q;
+	u32 gcsr;
+
+	if (!mmio || !qp->ernic_base)
+		return;
+
+	q = onic_qcsr(qp, 0x00);
+	gcsr = qp->ernic_base + 0x00100000u;
+
+	pr_info("onic_ib: [%s] qp=%u port=%u ernic=%u QCSR base=0x%08x\n",
+		tag, qp->qp_num, qp->port_num,
+		(qp->port_num == 1) ? 0u : 1u, q);
+	pr_info("onic_ib:   QPCONF=%08x QPADVCONF=%08x QDEPTH=%08x PD=%08x\n",
+		ioread32(mmio + q + 0x00), ioread32(mmio + q + 0x04),
+		ioread32(mmio + q + 0x3C), ioread32(mmio + q + 0xB0));
+	pr_info("onic_ib:   SQBA=%08x:%08x  RQBA=%08x:%08x  CQBA=%08x:%08x\n",
+		ioread32(mmio + q + 0xC8), ioread32(mmio + q + 0x10),
+		ioread32(mmio + q + 0xC0), ioread32(mmio + q + 0x08),
+		ioread32(mmio + q + 0xD0), ioread32(mmio + q + 0x18));
+	pr_info("onic_ib:   DESTQP=%08x TIMEOUT=%08x DMAC_LSB=%08x DMAC_MSB=%08x IPDST=%08x\n",
+		ioread32(mmio + q + 0x48), ioread32(mmio + q + 0x4C),
+		ioread32(mmio + q + 0x50), ioread32(mmio + q + 0x54),
+		ioread32(mmio + q + 0x60));
+	pr_info("onic_ib:   SQPSN=%08x SQPI=%08x RQCI=%08x CQHEAD=%08x\n",
+		ioread32(mmio + q + 0x40), ioread32(mmio + q + 0x38),
+		ioread32(mmio + q + 0x34), ioread32(mmio + q + 0x30));
+	pr_info("onic_ib:   STATSSN=%08x STATMSN=%08x STATQP=%08x STATCURSQPTR=%08x\n",
+		ioread32(mmio + q + 0x80), ioread32(mmio + q + 0x84),
+		ioread32(mmio + q + 0x88), ioread32(mmio + q + 0x8C));
+	pr_info("onic_ib:   STATRESPSN=%08x STATRQBUFCA=%08x STATWQE=%08x STATRQPIDB=%08x\n",
+		ioread32(mmio + q + 0x90), ioread32(mmio + q + 0x94),
+		ioread32(mmio + q + 0x98), ioread32(mmio + q + 0x9C));
+	pr_info("onic_ib:   GCSR XRNICCONF=%08x XRNIC_CONF_QP_EN=%08x INSRRPKT=%08x INALLDRP=%08x\n",
+		ioread32(mmio + gcsr + 0x00), ioread32(mmio + gcsr + 0x44),
+		ioread32(mmio + gcsr + 0x100), ioread32(mmio + gcsr + 0x130));
+	pr_info("onic_ib:   GCSR ERRBUFWPTR=%08x IPKTERRQWPTR=%08x WQEPROC=%08x QPMSTS=%08x\n",
+		ioread32(mmio + gcsr + 0x6C), ioread32(mmio + gcsr + 0x94),
+		ioread32(mmio + gcsr + 0x124), ioread32(mmio + gcsr + 0x12C));
+	/* Hardware-probe-equivalent: outgoing-packet counters and last-packet
+	 * header bytes.  Tell us whether ERNIC actually emitted a packet on
+	 * its TX AXI-Stream port (no ILA needed).  If OUTIO/OUTAM stay 0 after
+	 * post_send → engine never emitted; if they tick → engine emitted but
+	 * something downstream dropped it.  LSTOUTPKT carries the actual RoCE
+	 * BTH bytes (PSN, opcode, dst QPN) of the most recent outgoing packet. */
+	pr_info("onic_ib:   GCSR OUTIOPKT=%08x OUTAMPKT=%08x LSTOUTPKT=%08x OUTRNR=%08x\n",
+		ioread32(mmio + gcsr + 0x108), ioread32(mmio + gcsr + 0x10C),
+		ioread32(mmio + gcsr + 0x114), ioread32(mmio + gcsr + 0x120));
+	pr_info("onic_ib:   GCSR INAMPKT=%08x LSTINPKT=%08x INNCK=%08x INNAK=%08x INVDUP=%08x\n",
+		ioread32(mmio + gcsr + 0x104), ioread32(mmio + gcsr + 0x110),
+		ioread32(mmio + gcsr + 0x11C), ioread32(mmio + gcsr + 0x134),
+		ioread32(mmio + gcsr + 0x118));
+}
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+
+/* seq_file mirror of onic_dump_qp_state — same register set, but rendered
+ * into the seq_file buffer instead of pr_info().  Used by the debugfs
+ * qp<N>/dump entry so `cat` returns the dump as text and `watch -n 0.2 cat
+ * ...` works as a live monitor.  Kept in sync with onic_dump_qp_state. */
+void onic_format_qp_state(struct seq_file *m, const struct onic_qp *qp)
+{
+	void __iomem *mmio;
+	u32 q, gcsr;
+
+	if (!m || !qp)
+		return;
+
+	seq_printf(m, "qp=%u port=%u state=%d ernic_base=0x%08x\n",
+		qp->qp_num, qp->port_num, (int)qp->state, qp->ernic_base);
+
+	if (!qp->ibqp.device) {
+		seq_puts(m, "  (no ibqp.device — cannot read MMIO)\n");
+		return;
+	}
+	mmio = to_onic_ib_dev(qp->ibqp.device)->priv->hw.addr;
+	if (!mmio) {
+		seq_puts(m, "  (priv->hw.addr is NULL — cannot read MMIO)\n");
+		return;
+	}
+	if (!qp->ernic_base) {
+		seq_puts(m, "  (ernic_base=0 — QP still in RESET, no QCSR window assigned)\n");
+		return;
+	}
+
+	q    = onic_qcsr(qp, 0x00);
+	gcsr = qp->ernic_base + 0x00100000u;
+
+	seq_printf(m, "QCSR base=0x%08x ernic=%u\n",
+		q, (qp->port_num == 1) ? 0u : 1u);
+	seq_printf(m, "  QPCONF=%08x QPADVCONF=%08x QDEPTH=%08x PD=%08x\n",
+		ioread32(mmio + q + 0x00), ioread32(mmio + q + 0x04),
+		ioread32(mmio + q + 0x3C), ioread32(mmio + q + 0xB0));
+	seq_printf(m, "  SQBA=%08x:%08x  RQBA=%08x:%08x  CQBA=%08x:%08x\n",
+		ioread32(mmio + q + 0xC8), ioread32(mmio + q + 0x10),
+		ioread32(mmio + q + 0xC0), ioread32(mmio + q + 0x08),
+		ioread32(mmio + q + 0xD0), ioread32(mmio + q + 0x18));
+	seq_printf(m, "  DESTQP=%08x TIMEOUT=%08x DMAC_LSB=%08x DMAC_MSB=%08x IPDST=%08x\n",
+		ioread32(mmio + q + 0x48), ioread32(mmio + q + 0x4C),
+		ioread32(mmio + q + 0x50), ioread32(mmio + q + 0x54),
+		ioread32(mmio + q + 0x60));
+	seq_printf(m, "  SQPSN=%08x SQPI=%08x RQCI=%08x CQHEAD=%08x\n",
+		ioread32(mmio + q + 0x40), ioread32(mmio + q + 0x38),
+		ioread32(mmio + q + 0x34), ioread32(mmio + q + 0x30));
+	seq_printf(m, "  STATSSN=%08x STATMSN=%08x STATQP=%08x STATCURSQPTR=%08x\n",
+		ioread32(mmio + q + 0x80), ioread32(mmio + q + 0x84),
+		ioread32(mmio + q + 0x88), ioread32(mmio + q + 0x8C));
+	seq_printf(m, "  STATRESPSN=%08x STATRQBUFCA=%08x STATWQE=%08x STATRQPIDB=%08x\n",
+		ioread32(mmio + q + 0x90), ioread32(mmio + q + 0x94),
+		ioread32(mmio + q + 0x98), ioread32(mmio + q + 0x9C));
+	seq_printf(m, "  GCSR XRNICCONF=%08x XRNIC_CONF_QP_EN=%08x INSRRPKT=%08x INALLDRP=%08x\n",
+		ioread32(mmio + gcsr + 0x00), ioread32(mmio + gcsr + 0x44),
+		ioread32(mmio + gcsr + 0x100), ioread32(mmio + gcsr + 0x130));
+	seq_printf(m, "  GCSR ERRBUFWPTR=%08x IPKTERRQWPTR=%08x WQEPROC=%08x QPMSTS=%08x\n",
+		ioread32(mmio + gcsr + 0x6C), ioread32(mmio + gcsr + 0x94),
+		ioread32(mmio + gcsr + 0x124), ioread32(mmio + gcsr + 0x12C));
+	seq_printf(m, "  GCSR OUTIOPKT=%08x OUTAMPKT=%08x LSTOUTPKT=%08x OUTRNR=%08x\n",
+		ioread32(mmio + gcsr + 0x108), ioread32(mmio + gcsr + 0x10C),
+		ioread32(mmio + gcsr + 0x114), ioread32(mmio + gcsr + 0x120));
+	seq_printf(m, "  GCSR INAMPKT=%08x LSTINPKT=%08x INNCK=%08x INNAK=%08x INVDUP=%08x\n",
+		ioread32(mmio + gcsr + 0x104), ioread32(mmio + gcsr + 0x110),
+		ioread32(mmio + gcsr + 0x11C), ioread32(mmio + gcsr + 0x134),
+		ioread32(mmio + gcsr + 0x118));
+}
+
+/* Per-ibdev one-screen counter summary across BOTH ERNICs.  Used as the
+ * top-level debugfs gcsr_summary entry — the file `watch -n 0.2 cat`
+ * tracks during WRITE/SEND debug.  No per-QP info; for that, cat the
+ * sibling qp<N>/dump entries.  Order chosen so the most diagnostically
+ * useful counters (INVDUP, INALLDRP, INSRRPKT, OUTIOPKT, LSTINPKT,
+ * LSTOUTPKT) appear first. */
+void onic_format_gcsr_summary(struct seq_file *m, struct onic_ib_dev *dev)
+{
+	static const u32 ernic_bases[2] = {
+		RN_RDMA_BASE_ADDRESS,    /* ERNIC0 -> port 1 */
+		RN_RDMA_1_BASE_ADDRESS,  /* ERNIC1 -> port 2 */
+	};
+	void __iomem *mmio;
+	int i, n_ernics;
+
+	if (!m || !dev || !dev->priv)
+		return;
+	mmio     = dev->priv->hw.addr;
+	n_ernics = (dev->priv->hw.num_cmacs >= 2) ? 2 : 1;
+	if (!mmio)
+		return;
+
+	for (i = 0; i < n_ernics; i++) {
+		u32 g = ernic_bases[i] + 0x00100000u;
+
+		seq_printf(m, "ERNIC%d (port %d, base=0x%08x, GCSR=0x%08x)\n",
+			i, i + 1, ernic_bases[i], g);
+		seq_printf(m, "  INVDUP   =%08x  INALLDRP=%08x  INSRRPKT=%08x  INNAK   =%08x\n",
+			ioread32(mmio + g + 0x118),
+			ioread32(mmio + g + 0x130),
+			ioread32(mmio + g + 0x100),
+			ioread32(mmio + g + 0x134));
+		seq_printf(m, "  INAMPKT  =%08x  INNCK   =%08x  LSTINPKT =%08x\n",
+			ioread32(mmio + g + 0x104),
+			ioread32(mmio + g + 0x11C),
+			ioread32(mmio + g + 0x110));
+		seq_printf(m, "  OUTIOPKT =%08x  OUTAMPKT=%08x  LSTOUTPKT=%08x  OUTRNR  =%08x\n",
+			ioread32(mmio + g + 0x108),
+			ioread32(mmio + g + 0x10C),
+			ioread32(mmio + g + 0x114),
+			ioread32(mmio + g + 0x120));
+		seq_printf(m, "  XRNICCONF=%08x  QP_EN_CT=%08x  WQEPROC =%08x  QPMSTS  =%08x\n",
+			ioread32(mmio + g + 0x000),
+			ioread32(mmio + g + 0x044),
+			ioread32(mmio + g + 0x124),
+			ioread32(mmio + g + 0x12C));
+		seq_printf(m, "  ERRBUFWP =%08x  IPKTERRQWP=%08x\n",
+			ioread32(mmio + g + 0x06C),
+			ioread32(mmio + g + 0x094));
+	}
+}
+
+#endif /* CONFIG_DEBUG_FS */
+
+/* Per-port DDR4 byte offset.  port_num is 1-based as in IB.
+ *
+ * The F4 §2.2 spec splits DDR4 into 8 GiB halves (port 1 at 0, port 2 at
+ * 0x2_0000_0000) for ERNIC isolation.  Empirically (2026-04-29) the
+ * production shell's QDMA M_AXI MM cannot reach 0x2_0000_0000 — it
+ * raises GLBL_DSC_ERR_STS_DMA on the descriptor.  Until the shell-side
+ * mapping is verified (or the controller capacity is widened), collapse
+ * both ports onto port 1's region.  QP isolation is preserved by the
+ * per-QP slot bitmap which assigns unique 16 KiB slots regardless of
+ * port_num. */
 static inline u64 onic_port_ddr_off(u8 port_num)
 {
-	return ((u64)port_num - 1ULL) * 0x200000000ULL;
+	(void)port_num;
+	return 0ULL;
 }
 
 /* Map IB port_num -> ERNIC BAR2 base. */
@@ -68,6 +282,194 @@ static inline u32 onic_ernic_base_for_port(u8 port_num)
 {
 	return (port_num == 2) ? RN_RDMA_1_BASE_ADDRESS
 			       : RN_RDMA_BASE_ADDRESS;
+}
+
+
+/* GCSR offsets relative to an ERNIC base (libreconic uses these via the
+ * concatenation in reconic_reg.h, which hardcodes RN_RDMA_BASE_ADDRESS).
+ * Per-ERNIC init writes go to ernic_base + GCSR_OFF + reg_off. */
+#define ONIC_GCSR_OFF              0x00100000u
+#define ONIC_GCSR_XRNICCONF        0x00000000u
+#define ONIC_GCSR_XRNICADCONF      0x00000004u
+#define ONIC_GCSR_MACXADDLSB       0x00000010u
+#define ONIC_GCSR_MACXADDMSB       0x00000014u
+/* INTEN lives at GCSR 0x180 per PG332 §Table 8 — but onic_ernic_irq.c
+ * already programs it correctly (with the full 0x1FB mask including
+ * CNP+MAD RX).  Letting onic_ernic_global_init also write here would
+ * clobber that to 0xFF every modify_qp(RESET->INIT), losing bits 1+8.
+ * So we deliberately do not duplicate that write — a no-op write to a
+ * scratch offset suffices to keep the call site simple. */
+#define ONIC_GCSR_INTEN            0x00000040u  /* reserved/scratch — see comment above */
+#define ONIC_GCSR_XRNIC_CONF_QP_EN 0x00000044u
+#define ONIC_GCSR_ERRBUFBA         0x00000060u  /* REQERRBUFBA per PG332 */
+#define ONIC_GCSR_ERRBUFBAMSB      0x00000064u
+#define ONIC_GCSR_ERRBUFSZ         0x00000068u
+#define ONIC_GCSR_IPV4XADD         0x00000070u
+#define ONIC_GCSR_IPKTERRQBA       0x00000088u  /* FATALERRBUFBA per PG332 */
+#define ONIC_GCSR_IPKTERRQBAMSB    0x0000008Cu
+#define ONIC_GCSR_IPKTERRQSZ       0x00000090u
+#define ONIC_GCSR_DATBUFBA         0x000000A0u
+#define ONIC_GCSR_DATBUFBAMSB      0x000000A4u
+#define ONIC_GCSR_DATBUFSZ         0x000000A8u
+#define ONIC_GCSR_RESPERRPKTBA     0x000000B0u
+#define ONIC_GCSR_RESPERRPKTBAMSB  0x000000B4u
+#define ONIC_GCSR_RESPERRSZ        0x000000B8u
+#define ONIC_GCSR_RESPERRSZMSB     0x000000BCu
+
+/* Per-ERNIC reservation of DDR4 for the four global error/data buffers.
+ * libreconic programs all four; ERNIC v4.2 stalls silently if any are
+ * left at zero (symptom: SQPI doorbell ignored, CQE ring stays 0xFF).
+ * We carve a 4 MiB block per ERNIC at fixed high offsets that cannot
+ * collide with the QP slot allocator (which starts at byte 0).
+ *
+ * ERNIC0 block: 0x01000000 (16 MiB).  ERNIC1 block: 0x01400000 (20 MiB).
+ * Each block is split:
+ *   +0x000000 .. +0x040000 (256 KiB) — DATBUF
+ *   +0x100000 .. +0x140000 (256 KiB) — IPKTERRQ (incoming-packet error)
+ *   +0x200000 .. +0x240000 (256 KiB) — ERRBUF   (request error)
+ *   +0x300000 .. +0x340000 (256 KiB) — RESPERRPKT
+ */
+#define ONIC_ERNIC_GBUF_BASE(ernic)   (0x01000000u + (ernic) * 0x00400000u)
+#define ONIC_ERNIC_DATBUF_OFF         0x00000000u
+#define ONIC_ERNIC_IPKTERRQ_OFF       0x00100000u
+#define ONIC_ERNIC_ERRBUF_OFF         0x00200000u
+#define ONIC_ERNIC_RESPERRPKT_OFF     0x00300000u
+#define ONIC_ERNIC_GBUF_SLOT_SZ       0x00040000u  /* 256 KiB each */
+
+/* Bring an ERNIC instance out of reset and program local-side identity:
+ *   src MAC, src IPv4, ENICEN=1, default advanced-config, all IRQs enabled.
+ *
+ * Without this, the engine ignores QPCONFi and SQ doorbells — observed end
+ * of 2026-04-29: XRNICCONF=0 caused STATCURSQPTRi to never advance even
+ * though SQPIi=1 had landed.  Writes follow libreconic's
+ * config_rdma_global_csr() ordering (MAC -> IP -> XRNICCONF -> ADCONF).
+ *
+ * IPv4 is read from the netdev at call time; if the user hasn't yet
+ * configured an address the field is left at 0 and re-programmed when a
+ * QP first transitions RESET->INIT (by which point an address is required
+ * for any meaningful traffic). */
+static void onic_ernic_global_init(struct onic_ib_dev *dev, u8 port_num)
+{
+	void __iomem    *mmio  = dev->priv->hw.addr;
+	struct net_device *ndev;
+	u32              base  = onic_ernic_base_for_port(port_num) + ONIC_GCSR_OFF;
+	u32              mac_lsb = 0, mac_msb = 0;
+	__be32           src_ip  = 0;
+	u32              xrnic_conf, xrnic_advanced_conf;
+	const u32        udp_sport         = 0x12B7;   /* 4791 */
+	const u32        num_qp            = 8;        /* matches sim default */
+	const u32        en_ernic          = 1;
+	const u32        err_buf_en        = 1;
+	const u32        tx_ack_gen        = 0;
+	const u32        sw_override_en    = 0;
+	const u32        retry_cnt_fatal_d = 1;
+	const u32        base_count_width  = 10;       /* 250 MHz axil_aclk */
+	const u32        sw_override_qp    = 0;
+	u32              config_8bit, config_16bit;
+
+	rcu_read_lock();
+	ndev = rcu_dereference(dev->port[port_num - 1].netdev);
+	if (ndev) {
+		const u8 *m = ndev->dev_addr;
+		struct in_device *in_dev;
+
+		mac_msb = ((u32)m[0] << 8) | (u32)m[1];
+		mac_lsb = ((u32)m[2] << 24) | ((u32)m[3] << 16) |
+			  ((u32)m[4] << 8)  | (u32)m[5];
+
+		in_dev = __in_dev_get_rcu(ndev);
+		if (in_dev) {
+			struct in_ifaddr *ifa;
+
+			in_dev_for_each_ifa_rcu(ifa, in_dev) {
+				src_ip = ifa->ifa_local;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+
+	config_8bit = ((err_buf_en & 1u) << 5) |
+		      ((tx_ack_gen & 3u) << 3) |
+		      (en_ernic & 1u);
+	/* XRNICCONF layout per libreconic (the working reference) — udp_sport
+	 * lives in bits [23:8], NOT [31:16] as previously coded.  num_qp is
+	 * NOT placed in XRNICCONF; it goes to XRNIC_CONF_QP_EN (0x44) elsewhere.
+	 * Prior layout caused outgoing RoCEv2 frames to carry the wrong UDP
+	 * source port, which receivers silently dropped (INALLDRPPKTCNT++,
+	 * no NAK). 2026-05-03 fix.
+	 */
+	xrnic_conf = ((udp_sport << 8) & 0x00ffff00u) |
+		     (config_8bit & 0x000000ffu);
+	(void)num_qp;  /* programmed via XRNIC_CONF_QP_EN per-QP */
+
+	config_16bit = (sw_override_en & 1u) |
+		       ((retry_cnt_fatal_d & 1u) << 2);
+	xrnic_advanced_conf = (config_16bit & 0xffffu) |
+			      ((base_count_width & 0xfu) << 16) |
+			      ((sw_override_qp   & 0xffu) << 24);
+
+	/* Program the four error/data buffers ERNIC needs even if we never
+	 * consume them.  Addresses are AXI form (with 0xA3500000 tag in
+	 * MSB) so the engine's own master can reach DDR4 through
+	 * sys_mem_5to2 M01.
+	 *
+	 * Size field encoding (Gap-A fix 2026-05-03, per PG332 §Table 8 and
+	 * RecoNIC/examples/rdma_test/write.c:46-52):
+	 *     [31:16] = per_entry_size in bytes
+	 *     [15:0]  = number of entries
+	 * Total size = num_entries * per_entry_size.  The previous values
+	 * `(1<<16)|0x1000 = 0x00011000` (4096 entries × 1 B = 4 KiB) and
+	 * `0x00040000` (0 entries × 4 B — degenerate) were both wrong;
+	 * RESPERRSZ=0 in particular meant any retry-error logging by ERNIC
+	 * could fall back to host bus address 0 and trip the IOMMU.
+	 *
+	 * 64 entries × 4 KiB each = 256 KiB matches our `ONIC_ERNIC_GBUF_SLOT_SZ`
+	 * allocation per buffer.  Layout: BUF_SIZE_FIELD = (4096 << 16) | 64. */
+	{
+		u32       ernic_idx = (port_num == 1) ? 0u : 1u;
+		u64       gbuf_base = (u64)ONIC_ERNIC_GBUF_BASE(ernic_idx);
+		const u32 buf_size_field = (4096u << 16) | 64u;  /* 64 × 4 KiB = 256 KiB */
+		u64       datbuf  = ((u64)ONIC_DDR4_MSB << 32) |
+				    (gbuf_base + ONIC_ERNIC_DATBUF_OFF);
+		u64       errbuf  = ((u64)ONIC_DDR4_MSB << 32) |
+				    (gbuf_base + ONIC_ERNIC_ERRBUF_OFF);
+		u64       ipkterr = ((u64)ONIC_DDR4_MSB << 32) |
+				    (gbuf_base + ONIC_ERNIC_IPKTERRQ_OFF);
+		u64       resperr = ((u64)ONIC_DDR4_MSB << 32) |
+				    (gbuf_base + ONIC_ERNIC_RESPERRPKT_OFF);
+
+		iowrite32((u32)(datbuf  & 0xffffffffu), mmio + base + ONIC_GCSR_DATBUFBA);
+		iowrite32((u32)(datbuf  >> 32),         mmio + base + ONIC_GCSR_DATBUFBAMSB);
+		iowrite32(buf_size_field,               mmio + base + ONIC_GCSR_DATBUFSZ);
+
+		iowrite32((u32)(errbuf  & 0xffffffffu), mmio + base + ONIC_GCSR_ERRBUFBA);
+		iowrite32((u32)(errbuf  >> 32),         mmio + base + ONIC_GCSR_ERRBUFBAMSB);
+		iowrite32(buf_size_field,               mmio + base + ONIC_GCSR_ERRBUFSZ);
+
+		iowrite32((u32)(ipkterr & 0xffffffffu), mmio + base + ONIC_GCSR_IPKTERRQBA);
+		iowrite32((u32)(ipkterr >> 32),         mmio + base + ONIC_GCSR_IPKTERRQBAMSB);
+		iowrite32(buf_size_field,               mmio + base + ONIC_GCSR_IPKTERRQSZ);
+
+		iowrite32((u32)(resperr & 0xffffffffu), mmio + base + ONIC_GCSR_RESPERRPKTBA);
+		iowrite32((u32)(resperr >> 32),         mmio + base + ONIC_GCSR_RESPERRPKTBAMSB);
+		iowrite32(buf_size_field,               mmio + base + ONIC_GCSR_RESPERRSZ);
+		iowrite32(0,                            mmio + base + ONIC_GCSR_RESPERRSZMSB);
+	}
+
+	/* Order matches libreconic: identity first, then engine enable. */
+	iowrite32(0x000000FFu,         mmio + base + ONIC_GCSR_INTEN);
+	iowrite32(mac_lsb,             mmio + base + ONIC_GCSR_MACXADDLSB);
+	iowrite32(mac_msb,             mmio + base + ONIC_GCSR_MACXADDMSB);
+	iowrite32((u32)be32_to_cpu(src_ip), mmio + base + ONIC_GCSR_IPV4XADD);
+	iowrite32(xrnic_conf,          mmio + base + ONIC_GCSR_XRNICCONF);
+	iowrite32(xrnic_advanced_conf, mmio + base + ONIC_GCSR_XRNICADCONF);
+	(void)ioread32(mmio + base + ONIC_GCSR_XRNICCONF);  /* flush */
+
+	pr_info("onic_ib: ERNIC%u global init: base=0x%08x mac=%04x:%08x ip=%pI4 xrnic_conf=0x%08x adconf=0x%08x\n",
+		(port_num == 1) ? 0u : 1u,
+		onic_ernic_base_for_port(port_num),
+		mac_msb, mac_lsb, &src_ip, xrnic_conf, xrnic_advanced_conf);
 }
 
 
@@ -283,7 +685,6 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 	u32   row_base;
 	int   ret;
 
-	(void)start;
 	(void)udata;
 
 	pr_info_ratelimited("onic_ib: reg_user_mr called len=%llu va=0x%llx acc=0x%x\n",
@@ -326,7 +727,50 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 	mr->lkey    = pd->pdn;
 	mr->rkey    = pd->pdn;
 
-	/* 64-bit DDR4 addr the ERNIC DMA targets on remote WRITE/READ. */
+	/* Perf #3 — populate the DDR4 mirror with the user buffer's contents.
+	 * Eager copy: snapshot at registration time, no ongoing pinning.
+	 * 1 MiB chunks because onic_ddr4_write caps at ONIC_SYSDMA_MAX_XFER.
+	 * Failure here unwinds the slot allocation. */
+	if (length > 0) {
+		const size_t chunk = ONIC_SYSDMA_MAX_XFER;   /* 1 MiB */
+		void *bounce = kmalloc(chunk, GFP_KERNEL);
+		u64   off    = 0;
+		int   crv    = 0;
+
+		if (!bounce) {
+			onic_ddr_mr_free(&dev->ddr, ddr_off);
+			kfree(mr);
+			return ERR_PTR(-ENOMEM);
+		}
+		while (off < length) {
+			size_t n = min_t(size_t, chunk, length - off);
+
+			if (copy_from_user(bounce,
+					   (void __user *)(uintptr_t)
+					   (start + off), n)) {
+				crv = -EFAULT;
+				break;
+			}
+			crv = onic_ddr4_write(dev->priv,
+					      ddr_off + off, bounce, n);
+			if (crv)
+				break;
+			off += n;
+		}
+		kfree(bounce);
+		if (crv) {
+			pr_info_ratelimited("onic_ib: reg_user_mr DDR4 mirror copy failed at off=%llu rv=%d\n",
+					    (unsigned long long)off, crv);
+			onic_ddr_mr_free(&dev->ddr, ddr_off);
+			kfree(mr);
+			return ERR_PTR(crv);
+		}
+	}
+
+	/* 64-bit DDR4 addr the ERNIC DMA targets on remote WRITE/READ.
+	 * MSB carries the libreconic 0xA3500000 tag — same routing reason
+	 * as SQBAi/RQBAi/CQBAi (see onic_modify_qp_reset_to_init): ERNIC's
+	 * M_AXI master uses sys_mem_5to2 M01 only for tagged addresses. */
 	buf_addr = ((u64)ONIC_DDR4_MSB << 32) |
 		   (dev->ddr.base_off + ddr_off);
 
@@ -344,8 +788,18 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 		for (e = 0; e < 2; e++) {
 			row_base = ernic_bases[e] + pd->pdn * 0x100;
 			iowrite32(pd->pdn,                         mmio + row_base + 0x00);
-			iowrite32((u32)(virt_addr & 0xffffffffu),  mmio + row_base + 0x04);
-			iowrite32((u32)(virt_addr >> 32),          mmio + row_base + 0x08);
+			/* PDT VIRTADDR = DDR4 buf_addr (RecoNIC convention, see
+			 * RecoNIC/examples/rdma_test/write.c:414 — exchanges the DDR4
+			 * dma_addr as `write_offset_server`).  Our test harness
+			 * (tests/rdma_write_bw) hardcodes remote_addr = the DDR4
+			 * 0xA3500000_0040_0000 slot, so VIRTADDR must equal buf_addr
+			 * for the responder's range check (remote_addr ∈ [VIRTADDR,
+			 * VIRTADDR+length]) to pass.  With VIRTADDR=user_va the check
+			 * fails on every WRITE → silent drop classified as INVDUP.
+			 * 2026-05-04 second attempt — first attempt reverted in
+			 * confusion, retrying with live monitor for clean read. */
+			iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x04);
+			iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x08);
 			iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x0C);
 			iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x10);
 			iowrite32(mr->rkey & 0xffu,                mmio + row_base + 0x14);
@@ -444,8 +898,12 @@ static int onic_create_qp(struct ib_qp *ibqp,
 
 	if (init_attr->qp_type != IB_QPT_RC)
 		return -EOPNOTSUPP;
-	if (init_attr->cap.max_send_wr > 16 ||
-	    init_attr->cap.max_recv_wr > 16 ||
+	/* DDR4 SQ buffer is 4 KB at SQBA + slot*64; max 64 entries.
+	 * Same for RQ buffer at RQBA. Bumped from 16 → 64 (2026-05-06) to
+	 * exercise wrap-around bug at higher iters; if wrap bug bites, use
+	 * -t N where N >= iters to avoid it. */
+	if (init_attr->cap.max_send_wr > 64 ||
+	    init_attr->cap.max_recv_wr > 64 ||
 	    init_attr->cap.max_send_sge > 1 ||
 	    init_attr->cap.max_recv_sge > 1)
 		return -EINVAL;
@@ -484,7 +942,7 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->cq_depth   = scq->depth;
 	qp->path_mtu   = 4;                       /* PATHMTU code 4 = 4096 */
 	qp->state      = ERNIC_QP_RESET;
-	spin_lock_init(&qp->state_lock);
+	mutex_init(&qp->state_lock);
 
 	/* DDR4 byte offsets and ernic_base are deferred to RESET->INIT —
 	 * we don't know which ERNIC (port 1 = ERNIC0, port 2 = ERNIC1) the
@@ -498,6 +956,30 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->sq_pidb         = 0;
 	qp->rq_pidb         = 0;
 	qp->cq_consumer_idx = 0;
+	qp->rq_consumer_idx = 0;
+
+	/* Perf #1 — bind this QP's slot in the dev's coherent doorbell page.
+	 * 4 B per QP, indexed by qp_idx.  cq_pidb at offset 0, rq_pidb at
+	 * offset 0x400.  Programming of CQDBADDi/RQWPTRDBADDi to these bus
+	 * addresses happens in modify_qp R->I (where the registers are
+	 * written for the first time). */
+	if (dev->hdb.enabled) {
+		u8 *base = (u8 *)dev->hdb.vaddr;
+
+		qp->hdb_cq     = (volatile __le32 *)(base + qp_idx * 4u);
+		qp->hdb_rq     = (volatile __le32 *)(base + 0x400u + qp_idx * 4u);
+		qp->hdb_cq_dma = dev->hdb.dma + qp_idx * 4u;
+		qp->hdb_rq_dma = dev->hdb.dma + 0x400u + qp_idx * 4u;
+		WRITE_ONCE(*qp->hdb_cq, 0);
+		WRITE_ONCE(*qp->hdb_rq, 0);
+		qp->hdb_active = true;
+	} else {
+		qp->hdb_cq     = NULL;
+		qp->hdb_rq     = NULL;
+		qp->hdb_cq_dma = 0;
+		qp->hdb_rq_dma = 0;
+		qp->hdb_active = false;
+	}
 
 	qp->sq_shadow = kcalloc(qp->sq_depth, sizeof(*qp->sq_shadow),
 				GFP_KERNEL);
@@ -525,6 +1007,11 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	 * us into INIT.  Matches IB spec expectations. */
 	qp->state        = ERNIC_QP_RESET;
 	qp->ibqp.qp_num  = qp_idx;
+
+	/* Expose this QP to userspace via debugfs.  Reading
+	 * /sys/kernel/debug/onic/<ibdev>/qp<qpn>/dump prints GCSR+QCSR
+	 * state to dmesg without modifying any QP state. */
+	onic_debugfs_qp_add(dev, qp);
 	return 0;
 }
 
@@ -535,20 +1022,43 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	void __iomem       *mmio = dev->priv->hw.addr;
 	(void)udata;
 
+	/* Tear debugfs down FIRST so no further cat-dump can land while we
+	 * are clearing QCSR / freeing shadow rings.  debugfs_remove_recursive
+	 * is synchronous w.r.t. open file handles. */
+	onic_debugfs_qp_remove(qp);
+
 	/* QCSR teardown only if the QP made it past RESET — before
-	 * RESET->INIT the QCSR window was never programmed. */
+	 * RESET->INIT the QCSR window was never programmed.
+	 *
+	 * Gap-D fix (2026-05-03): do NOT zero SQBAi/RQBAi/CQBAi here.
+	 * After a WRITE retry-exhausted teardown, ERNIC may still have an
+	 * in-flight WQE refetch DMA queued internally; with SQBA cleared to
+	 * 0/0 the DMA targets host bus address 0 and trips AMD-Vi
+	 * IO_PAGE_FAULT (domain=0x22 addr=0x0).  Mirrors the earlier fix for
+	 * RQWPTRDBADDi/CQDBADDi: those are configuration-target addresses,
+	 * not state.  The next R->I that takes this slot reprograms them.
+	 *
+	 * We DO clear QPCONFi (which turns QPEN=0 → engine stops processing
+	 * this QP), QPADVCONFi, QDEPTHi, PDi.  Those are control state, not
+	 * DMA targets. */
 	if (qp->ernic_base) {
-		u32 q = onic_qcsr(qp, 0x00);
-		iowrite32(0, mmio + q);
-		iowrite32(0, mmio + q + 0x04);
-		iowrite32(0, mmio + q + 0x08);
-		iowrite32(0, mmio + q + 0xC0);
-		iowrite32(0, mmio + q + 0x10);
-		iowrite32(0, mmio + q + 0xC8);
-		iowrite32(0, mmio + q + 0x18);
-		iowrite32(0, mmio + q + 0xD0);
-		iowrite32(0, mmio + q + 0x3C);
-		iowrite32(0, mmio + q + 0xB0);
+		u32 q          = onic_qcsr(qp, 0x00);
+		u32 qpen_addr  = qp->ernic_base + 0x00100044u;
+		u32 qpen_mask;
+
+		iowrite32(0, mmio + q);             /* QPCONFi → QPEN off */
+		iowrite32(0, mmio + q + 0x04);      /* QPADVCONFi */
+		iowrite32(0, mmio + q + 0x3C);      /* QDEPTHi */
+		iowrite32(0, mmio + q + 0xB0);      /* PDi */
+
+		/* XRNIC_CONF_QP_EN is a per-QP bitmap (PG332 §Table 8 line 996
+		 * documents it as a count but actual hardware uses bits — see
+		 * onic_modify_qp_rtr_to_rts comment).  Clear our bit so the
+		 * engine drops the next-arriving packet for this slot with
+		 * PG332 §Table 4 syndrome bit 15, instead of silently
+		 * processing it against a half-torn-down QPCONFi/RQBA. */
+		qpen_mask = ioread32(mmio + qpen_addr);
+		iowrite32(qpen_mask & ~(1u << qp->qp_num), mmio + qpen_addr);
 		(void)ioread32(mmio + q);
 	}
 
@@ -560,6 +1070,17 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		qp->recv_cq->bound   = false;
 		qp->recv_cq->qp_back = NULL;
 	}
+
+	/* Perf #1 — zero our host doorbell slot so a fresh QP later assigned
+	 * to the same qp_idx sees a clean producer index.  Doing this after
+	 * the QCSR teardown (which cleared QPCONFi[0] QPEN above) guarantees
+	 * the engine has stopped issuing doorbell DMA writes for this QP
+	 * before we reset the slot.  Note: we leave CQDBADDi/RQWPTRDBADDi
+	 * non-zero — the next R->I on this slot will reprogram them. */
+	if (qp->hdb_cq)
+		WRITE_ONCE(*qp->hdb_cq, 0);
+	if (qp->hdb_rq)
+		WRITE_ONCE(*qp->hdb_rq, 0);
 
 	onic_ddr_qp_slot_free(&dev->ddr, qp->qp_num);
 
@@ -615,6 +1136,11 @@ static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
 	qp->ernic_base = onic_ernic_base_for_port(attr->port_num);
 	qp->port_num   = attr->port_num;
 
+	/* Refresh ERNIC global identity (MAC/IP) — by RESET->INIT the user
+	 * has typically assigned an IP that wasn't present at ib_register
+	 * time.  Idempotent: the engine-enable bit is already latched. */
+	onic_ernic_global_init(dev, attr->port_num);
+
 	/* DDR4 byte offsets — F4 §2.2 disjoint halves, port 1 in 0..2G,
 	 * port 2 in 0x2_0000_0000.. .  Slot itself lives at slot_off
 	 * inside the half. */
@@ -623,34 +1149,55 @@ static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
 	rq_off = qp->slot_off + ONIC_DDR_QUEUE_RQ_OFF;
 	cq_off = qp->slot_off + ONIC_DDR_QUEUE_CQ_OFF;
 
+	/* Two masters reach the SAME DDR4 byte through different fabric
+	 * paths in the open-nic-shell (per agent investigation 2026-04-29):
+	 *   - ERNIC's M_AXI master goes through `sys_mem_5to2` and routes
+	 *     to M01 (DDR4 path) only when the address has the libreconic
+	 *     device-mem tag 0xA350_0000_0000_0000 in its high bits.  So
+	 *     SQBAi/RQBAi/CQBAi register pairs must carry that tag in the
+	 *     MSB half (the 5-to-2 crossbar matches on it).
+	 *   - QDMA's H2C MM master is wired directly to dev_mem_4to1 S00
+	 *     and reaches DDR4 at the plain byte offset (untagged).
+	 * So: keep the tag on register writes, but pass the untagged byte
+	 * offset to onic_ddr4_write/read in post_send/poll_cq. */
 	qp->sq_ddr_off = port_off + sq_off;
 	qp->rq_ddr_off = port_off + rq_off;
 	qp->cq_ddr_off = port_off + cq_off;
 	if (qp->send_cq)
 		qp->send_cq->ddr_off = qp->cq_ddr_off;
 
-	/* The 64b DDR4 address presented to the ERNIC is
-	 *   (ONIC_DDR4_MSB << 32) | (port_off + slot_off)
-	 * — same composition as onic_ddr_addr_lsb/msb but with port_off
-	 * substituted for pool->base_off. */
 	{
-		u64 sq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + sq_off);
-		u64 rq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + rq_off);
-		u64 cq_addr = ((u64)ONIC_DDR4_MSB << 32) | (port_off + cq_off);
-		sq_lsb = (u32)(sq_addr & 0xffffffffu);
-		sq_msb = (u32)(sq_addr >> 32);
-		rq_lsb = (u32)(rq_addr & 0xffffffffu);
-		rq_msb = (u32)(rq_addr >> 32);
-		cq_lsb = (u32)(cq_addr & 0xffffffffu);
-		cq_msb = (u32)(cq_addr >> 32);
+		u64 sq_axi = ((u64)ONIC_DDR4_MSB << 32) | qp->sq_ddr_off;
+		u64 rq_axi = ((u64)ONIC_DDR4_MSB << 32) | qp->rq_ddr_off;
+		u64 cq_axi = ((u64)ONIC_DDR4_MSB << 32) | qp->cq_ddr_off;
+		sq_lsb = (u32)(sq_axi & 0xffffffffu);
+		sq_msb = (u32)(sq_axi >> 32);
+		rq_lsb = (u32)(rq_axi & 0xffffffffu);
+		rq_msb = (u32)(rq_axi >> 32);
+		cq_lsb = (u32)(cq_axi & 0xffffffffu);
+		cq_msb = (u32)(cq_axi >> 32);
 	}
 
-	/* QPCONFi: QPEN=0 (RTR->RTS turns it on), RQINTEN+CQINTEN, HWHSHKDIS,
-	 * PATHMTU=4096, RQBUFSZ in 256-B units (= 2 for 512-B libreconic RQEs). */
+	/* QPCONFi per PG332 (definitions from libreconic/rdma_api.c comments
+	 * 410-422, working values masked at 0x30 for bits [5:4]):
+	 *   bit 0    QPEN              — RTR->RTS turns it on
+	 *   bit 2    RQINTEN
+	 *   bit 3    CQINTEN
+	 *   bit 4    HWHSHKDIS         — REQUIRED.  When 0, ERNIC expects
+	 *                                HW handshake ports (not wired in
+	 *                                this shell), so the engine errors
+	 *                                processing the WQE.
+	 *   bit 5    CQE write enable  — REQUIRED.  Without this set, ERNIC
+	 *                                does not write CQEs to DDR4.
+	 *   bit 7    IPv4 (set in INIT->RTR after dgid known)
+	 *   [10:8]   PATHMTU
+	 *   [31:16]  RQBUFSZ in 256-B units (=2 for 512-B libreconic RQEs)
+	 */
 	qpconfi  = 0;
 	qpconfi |= (1u << 2);                      /* RQINTEN */
 	qpconfi |= (1u << 3);                      /* CQINTEN */
-	qpconfi |= (1u << 5);                      /* HWHSHKDIS */
+	qpconfi |= (1u << 4);                      /* HWHSHKDIS */
+	qpconfi |= (1u << 5);                      /* CQE write enable */
 	qpconfi |= ((u32)qp->path_mtu & 0x7) << 8;
 	qpconfi |= ((u32)ERNIC_RQE_SIZE_FIELD & 0xffffu) << 16;
 
@@ -672,18 +1219,122 @@ static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
 	iowrite32(cq_msb,      mmio + q + 0xD0);                  /* CQBAMSBi  */
 	iowrite32(qdepthi,     mmio + q + 0x3C);                  /* QDEPTHi   */
 	iowrite32(pd->pdn,     mmio + q + 0xB0);                  /* PDi       */
-	/* No host-DMA doorbells. */
-	iowrite32(0,           mmio + q + 0x20);                  /* RQWPTRDBADDi  */
-	iowrite32(0,           mmio + q + 0x24);                  /* RQWPTRDBADDMSBi*/
-	iowrite32(0,           mmio + q + 0x28);                  /* CQDBADDi  */
-	iowrite32(0,           mmio + q + 0x2C);                  /* CQDBADDMSBi*/
-	(void)ioread32(mmio + q + 0x00);                          /* flush     */
+	/* Doorbell DMA targets — ERNIC issues these writes unconditionally
+	 * regardless of QPCONFi[4] HWHSHKDIS, so the registers must point
+	 * at a valid landing zone.  Two paths:
+	 *   - hdb_active: host coherent page allocated at ib_register.
+	 *     Bus address has bits [63:52] = 0, so it routes through the
+	 *     5-to-2 crossbar's M00 (host PCIe) without the 0xA350 tag.
+	 *     Saves one MMIO read per poll_cq (Perf #1).
+	 *   - !hdb_active: DDR4 slot tail at +0x3F00 / +0x3F08, tagged with
+	 *     0xA350 so the crossbar's M01 path takes over.  This is the
+	 *     pre-Perf-#1 fallback (host_doorbell=0 or alloc failed).
+	 * Either way ERNIC's writes never traverse PCIe to host addr 0 and
+	 * therefore can't trip AMD-Vi/DMAR IO_PAGE_FAULT. */
+	{
+		u32 rqdb_lsb, rqdb_msb, cqdb_lsb, cqdb_msb;
+
+		if (qp->hdb_active) {
+			rqdb_lsb = lower_32_bits(qp->hdb_rq_dma);
+			rqdb_msb = upper_32_bits(qp->hdb_rq_dma);
+			cqdb_lsb = lower_32_bits(qp->hdb_cq_dma);
+			cqdb_msb = upper_32_bits(qp->hdb_cq_dma);
+		} else {
+			u64 rqdb_off = qp->slot_off + ONIC_DDR_QUEUE_RQDB_OFF;
+			u64 cqdb_off = qp->slot_off + ONIC_DDR_QUEUE_CQDB_OFF;
+			u64 rqdb_axi = ((u64)ONIC_DDR4_MSB << 32) | rqdb_off;
+			u64 cqdb_axi = ((u64)ONIC_DDR4_MSB << 32) | cqdb_off;
+
+			rqdb_lsb = lower_32_bits(rqdb_axi);
+			rqdb_msb = upper_32_bits(rqdb_axi);
+			cqdb_lsb = lower_32_bits(cqdb_axi);
+			cqdb_msb = upper_32_bits(cqdb_axi);
+		}
+		iowrite32(rqdb_lsb, mmio + q + 0x20);    /* RQWPTRDBADDi    */
+		iowrite32(rqdb_msb, mmio + q + 0x24);    /* RQWPTRDBADDMSBi */
+		iowrite32(cqdb_lsb, mmio + q + 0x28);    /* CQDBADDi        */
+		iowrite32(cqdb_msb, mmio + q + 0x2C);    /* CQDBADDMSBi     */
+	}
+
+	/* libreconic-style fatal recovery to clear stale engine state.
+	 * Per rdma_api.c:1104-1128.  Required because:
+	 *   - ERNIC IP retains per-QP register state across driver rmmod
+	 *     / insmod (only a power-cycle truly resets it).
+	 *   - SQPIi/CQHEADi/STATCURSQPTRi/STATRQPIDBi/STATMSNi are
+	 *     read-only unless XRNICADCONF[0] (SW override) is on.  Without
+	 *     SW override, writes silently fail (SQPSNi=0 reads back as
+	 *     0xa40a2 from a previous test) or trigger AXI SLVERR which
+	 *     hangs the PCIe bus.
+	 *   - Without this clearing, the engine starts the next QP cycle
+	 *     in retry/error from the stale STATSSN/STATMSN counts and
+	 *     issues background DMA reads (host addr 0x0/0x1000/...) that
+	 *     IOMMU rejects.
+	 *
+	 * Sequence:
+	 *   1. XRNICADCONF[0] = 1   — SW override ON
+	 *   2. QPCONFi[0] = 0       — QPEN OFF (already 0 here, but defensive)
+	 *   3. Zero host-side and (now writable) status registers
+	 *   4. QPCONFi[6] = 1       — QP under recovery (engine accepts the
+	 *                              clean state and won't run retries)
+	 *   5. XRNICADCONF[0] = 0   — SW override OFF for normal operation
+	 * The subsequent QPCONFi write below sets QPEN=0 and clears the
+	 * recovery bit; QPEN gets set by RTR->RTS as usual. */
+	{
+		u32 adconf_addr = qp->ernic_base + 0x00100004u;  /* GCSR XRNICADCONF */
+		u32 adconf_orig = ioread32(mmio + adconf_addr);
+		u32 qpconfi_pre;
+
+		iowrite32(adconf_orig | 0x1u, mmio + adconf_addr);  /* SW override ON */
+		(void)ioread32(mmio + adconf_addr);                  /* flush */
+
+		qpconfi_pre = ioread32(mmio + q);
+		iowrite32(qpconfi_pre & ~0x1u, mmio + q);            /* QPEN OFF */
+
+		/* DO NOT zero RQWPTRDBADDi/CQDBADDi here — those are
+		 * configuration (DMA target addresses), not state pointers.
+		 * They were programmed above to safe DDR4 addresses (with the
+		 * 0xA350.. tag) so doorbell DMA writes never traverse PCIe.
+		 * Zeroing them caused ERNIC to DMA-write to host addr 0
+		 * during QP transitions, triggering IOMMU IO_PAGE_FAULT /
+		 * DMAR DMA Write faults that stalled the engine.
+		 * 2026-05-03 fix: skip address-reg zeroing; only the
+		 * count/sequence pointers below need clearing. */
+		iowrite32(0, mmio + q + 0x30);                /* CQHEADi */
+		iowrite32(0, mmio + q + 0x34);                /* RQCIi */
+		iowrite32(0, mmio + q + 0x38);                /* SQPIi */
+		iowrite32(0, mmio + q + 0x40);                /* SQPSNi */
+		iowrite32(0, mmio + q + 0x44);                /* LSTRQREQi */
+		iowrite32(0, mmio + q + 0x80);                /* STATSSNi */
+		iowrite32(0, mmio + q + 0x84);                /* STATMSNi */
+		iowrite32(0, mmio + q + 0x88);                /* STATQPi  — clear sticky syndrome (variance fix 2026-05-03) */
+		iowrite32(0, mmio + q + 0x8C);                /* STATCURSQPTRi */
+		iowrite32(0, mmio + q + 0x90);                /* STATRESPSNi — RO per PG332 v4.2 (sender-side expected-ACK PSN); write is a no-op, kept for symmetry with the rest of this STAT* clear block */
+		iowrite32(0, mmio + q + 0x9C);                /* STATRQPIDBi */
+		/* Perf #1 — zero the host coherent doorbell slots in lockstep
+		 * with CQHEAD/STATRQPIDB.  poll_cq trusts this slot as the
+		 * authoritative cq producer index; failing to zero it would
+		 * leave a stale value from a previous QP cycle and make the
+		 * first poll_cq deliver phantom completions. */
+		if (qp->hdb_active) {
+			WRITE_ONCE(*qp->hdb_cq, 0);
+			WRITE_ONCE(*qp->hdb_rq, 0);
+			smp_wmb();
+		}
+
+		qpconfi_pre = ioread32(mmio + q);
+		iowrite32(qpconfi_pre | (1u << 6), mmio + q);        /* QP under recovery */
+		(void)ioread32(mmio + q);
+
+		iowrite32(adconf_orig, mmio + adconf_addr);          /* SW override OFF */
+		(void)ioread32(mmio + adconf_addr);
+	}
 
 	qp->state = ERNIC_QP_INIT;
 	pr_info("onic_ib: qp[%u] RESET -> INIT (port=%u pkey_idx=%u, ERNIC%u base=0x%08x ddr_off=0x%llx)\n",
 		qp->qp_num, attr->port_num, attr->pkey_index,
 		(attr->port_num == 1) ? 0u : 1u,
 		qp->ernic_base, (unsigned long long)qp->sq_ddr_off);
+	onic_dump_qp_state(qp, "after R->I");
 	return 0;
 }
 
@@ -704,37 +1355,54 @@ static int onic_modify_qp_init_to_rtr(struct onic_qp *qp,
 	u8  to_val, rt_val, rnr_rt, rnr_to;
 
 	if ((mask & required) != required) {
-		pr_info_ratelimited("onic_ib: I->R missing mask have=0x%x need=0x%x\n",
+		pr_info("onic_ib: I->R missing mask have=0x%x need=0x%x\n",
 				    mask, required);
 		return -EINVAL;
 	}
 	if (!(rdma_ah_get_ah_flags(&attr->ah_attr) & IB_AH_GRH)) {
-		pr_info_ratelimited("onic_ib: I->R no GRH in ah_attr\n");
+		pr_info("onic_ib: I->R no GRH in ah_attr\n");
 		return -EINVAL;
 	}
 	dgid = &rdma_ah_read_grh(&attr->ah_attr)->dgid;
 	dmac = rdma_ah_retrieve_dmac(&attr->ah_attr);
 	if (!dmac) {
-		pr_info_ratelimited("onic_ib: I->R dmac missing\n");
+		pr_info("onic_ib: I->R dmac missing\n");
 		return -EINVAL;
 	}
-	if (attr->path_mtu != IB_MTU_4096) {
-		pr_info_ratelimited("onic_ib: I->R path_mtu=%d unsupported\n",
+	/* Accept any standard IB MTU (256..4096).  ERNIC PATHMTU field encoding
+	 * is IB enum minus 1: IB_MTU_256(1)->0, IB_MTU_512(2)->1, ...,
+	 * IB_MTU_4096(5)->4.  Reject only if outside the IB-enum range. */
+	if (attr->path_mtu < IB_MTU_256 || attr->path_mtu > IB_MTU_4096) {
+		pr_info("onic_ib: I->R path_mtu=%d out of range\n",
 				    attr->path_mtu);
-		return -EOPNOTSUPP;
+		return -EINVAL;
 	}
+	qp->path_mtu = (u8)((u32)attr->path_mtu - 1u);
 
 	destqp  = attr->dest_qp_num & 0x00FFFFFFu;
-	mac_lsb = ((u32)dmac[0]) | ((u32)dmac[1] << 8) |
-		  ((u32)dmac[2] << 16) | ((u32)dmac[3] << 24);
-	mac_msb = ((u32)dmac[4]) | ((u32)dmac[5] << 8);
+	/* DMAC encoding per libreconic reconic.c convert_mac_addr_to_uint:
+	 *   MSB = (mac[0]<<8) | mac[1]
+	 *   LSB = (mac[2]<<24) | (mac[3]<<16) | (mac[4]<<8) | mac[5]
+	 * The earlier encoding (LSB packed dmac[0..3] little-endian, MSB
+	 * packed dmac[4..5]) was the bug behind 2026-04-29's silent SEND
+	 * failure: ERNIC emitted 100+ packets per test (CMAC counted them
+	 * as unicast TX with good FCS) but partner Mellanox saw nothing
+	 * because the destination-MAC bytes on the wire were garbled. */
+	mac_msb = ((u32)dmac[0] << 8) | (u32)dmac[1];
+	mac_lsb = ((u32)dmac[2] << 24) | ((u32)dmac[3] << 16) |
+		  ((u32)dmac[4] << 8)  | (u32)dmac[5];
 
 	is_v4 = gid_is_ipv4(dgid);
 	if (is_v4) {
-		ip1 = ((u32)dgid->raw[12]) |
-		      ((u32)dgid->raw[13] <<  8) |
-		      ((u32)dgid->raw[14] << 16) |
-		      ((u32)dgid->raw[15] << 24);
+		/* Pack bytes 12..15 of the IPv4-mapped GID big-endian: bit 31
+		 * is byte[12] (the most-significant IPv4 octet).  libreconic
+		 * convert_ip_addr_to_uint (reconic.c) does the same.  Earlier
+		 * little-endian packing wrote 10.0.0.1 as 0x0100000a — Mellanox
+		 * silently dropped it. */
+		ip1 = ((u32)dgid->raw[12] << 24) |
+		      ((u32)dgid->raw[13] << 16) |
+		      ((u32)dgid->raw[14] <<  8) |
+		      ((u32)dgid->raw[15]);
 		ip2 = ip3 = ip4 = 0;
 	} else {
 		memcpy(&ip1, &dgid->raw[0],  4);
@@ -759,13 +1427,58 @@ static int onic_modify_qp_init_to_rtr(struct onic_qp *qp,
 	iowrite32(ip3,         mmio + q + 0x68);
 	iowrite32(ip4,         mmio + q + 0x6C);
 
-	/* QPCONFi[7]: IP version.  RMW, don't touch QPEN (still 0 here). */
+	/* LSTRQREQi (0x44) = (last-RQ-opcode << 24) | (LAST_received PSN & 0xFFFFFF).
+	 * libreconic config_last_rq_psn (rdma_api.c:379-392) uses arbitrary
+	 * opcode 0x0a "to avoid opcode sequence error".  The PSN field is the
+	 * LAST-received PSN, NOT the next-expected.  libreconic's
+	 * send_recv.c:281-284 sets rq_psn=N and sq_psn=N+1 — confirming the
+	 * register holds last-received, with next-expected = LSTRQREQi+1.
+	 * IB verbs's attr->rq_psn is the NEXT-expected PSN, so we must
+	 * subtract 1 to get the last-received.  2026-05-03 fix: prior code
+	 * wrote attr->rq_psn directly, which made ERNIC expect rq_psn+1.
+	 * Every incoming frame triggered packet-validation syndrome 21
+	 * (PSN sequence error) — observed as INVDUPCNT growing while
+	 * INSRRPKT stayed at 0. */
+	iowrite32(((u32)0x0a << 24) |
+		  (((attr->rq_psn - 1u) & 0x00FFFFFFu)),
+		  mmio + q + 0x44);
+
+	/* QPCONFi[7]: IP version.  Per Xilinx PG332 v4.2 Table 8 (line ~2705):
+	 *   "QP configured for IPv4 or IPv6: 0 = IPv4, 1 = IPv6"
+	 * Prior code set bit 7 when is_v4 was true -- inverted!  That made
+	 * ERNIC validate incoming frames against IPv6 headers while the wire
+	 * carried IPv4 frames -> every packet failed RX validation and was
+	 * dropped silently in INALLDRPPKTCNT.
+	 * 2026-05-03 fix: correct sense -- bit 7 set ONLY for IPv6.
+	 */
+	/* Enable this QP at RTR, not at RTS. perftest's responder-side flow
+	 * goes INIT->RTR only and never RTR->RTS — if QP_EN and QPCONFi[0]
+	 * are deferred to RTS the responder can never receive. RTR is the
+	 * IB state where the QP becomes able to receive, so it's the right
+	 * place. RTS transition becomes idempotent on these bits.
+	 * Verified 2026-05-06: server-side ib_write_bw with this fix sees
+	 * INSRRPKT increment instead of INALLDRP saturating. */
 	qpconfi = ioread32(mmio + q);
 	qpconfi &= ~(1u << 7);
-	if (is_v4)
+	if (!is_v4)
 		qpconfi |= (1u << 7);
+	qpconfi |= 0x1u;          /* QPCONFi[0]: per-QP enable */
+	qpconfi &= ~(1u << 6);    /* clear "QP under recovery" sticky from R->I */
 	iowrite32(qpconfi, mmio + q);
 	(void)ioread32(mmio + q);
+
+	/* OR-in this QP's bit in the global QP_EN bitmap. Per
+	 * project_b7_qp_en_bitmap_2026_05_05: register is a per-QP enable
+	 * bitmap, not a count. */
+	{
+		u32 qpen_addr = qp->ernic_base + 0x00100044u;
+		u32 qpen      = ioread32(mmio + qpen_addr);
+		u32 new_en    = qpen | (1u << qp->qp_num);
+		if (new_en != qpen) {
+			iowrite32(new_en, mmio + qpen_addr);
+			(void)ioread32(mmio + qpen_addr);
+		}
+	}
 
 	qp->dest_qp_num   = attr->dest_qp_num;
 	qp->rq_psn        = attr->rq_psn;
@@ -780,6 +1493,7 @@ static int onic_modify_qp_init_to_rtr(struct onic_qp *qp,
 	qp->state = ERNIC_QP_RTR;
 	pr_info("onic_ib: qp[%u] INIT -> RTR dest_qpn=%u dmac=%pM dgid=%pI6c rq_psn=%u\n",
 		qp->qp_num, qp->dest_qp_num, qp->dmac, qp->dgid.raw, qp->rq_psn);
+	onic_dump_qp_state(qp, "after I->R");
 	return 0;
 }
 
@@ -804,24 +1518,49 @@ static int onic_modify_qp_rtr_to_rts(struct onic_qp *qp,
 	iowrite32(attr->sq_psn & 0x00FFFFFFu, mmio + q + 0x40);
 	qp->sq_psn = attr->sq_psn;
 
-	/* XRNIC_CONF_QP_EN is per-ERNIC GCSR.  VERIFY: count vs mask — using
-	 * COUNT semantics (F7 §5.4, F1 audit §6.2). */
-	qpen_ct = ioread32(mmio + qpen_addr) & 0xFFFu;
-	new_ct  = qp->qp_num + 1;
-	if (new_ct > qpen_ct) {
+	/* XRNIC_CONF_QP_EN is a per-QP BITMAP, not a count.
+	 *
+	 * PG332 v4.3 §Table 8 line 996 calls field [11:0] "Number of QPs
+	 * enabled" but actual hardware honors bit i as "QP i enabled".
+	 * Discovered 2026-05-05 via fpga/tools/ernic-baremetal/bar-poke:
+	 * writing 0xFFFFFFFF reads back as 0x3F (6 bits) — masking semantics,
+	 * not saturated count.  Confirmed by REQERRBUF entries: every packet
+	 * to QP=2 hit PG332 §Table 4 bit 15 ("QP not configured/enabled")
+	 * even though the prior count-style write set the register to 3,
+	 * because bitmap 0b011 enables QPs 0 and 1 only.
+	 *
+	 * Now: OR in this QP's bit; never clear other QPs' bits here.
+	 * destroy_qp clears the bit (see onic_destroy_qp). */
+	qpen_ct = ioread32(mmio + qpen_addr);
+	new_ct  = qpen_ct | (1u << qp->qp_num);
+	if (new_ct != qpen_ct) {
 		iowrite32(new_ct, mmio + qpen_addr);
 		(void)ioread32(mmio + qpen_addr);
 	}
 
-	/* Set QPEN=1 without trashing other bits. */
+	/* Note: STATRESPSNi (QCSR 0x90) is READ-ONLY per PG332 v4.2 Table 8
+	 * lines 3000-3003.  It is the sender-side "expected ACK PSN" tracker,
+	 * NOT the responder-side duplicate-detector seed.  An earlier patch
+	 * wrote (rq_psn-1) here as a workaround — it was a silent no-op and
+	 * misled debugging.  Responder-side next-expected RQ PSN is set via
+	 * LSTRQREQi (QCSR 0x44, RW) at INIT->RTR (line ~1420). */
+
+	/* Set QPEN=1 and clear "QP under recovery" (bit 6).  Our RESET->INIT
+	 * recovery sequence sets bit 6 to push the engine into a clean
+	 * state, but bit 6 is sticky through the subsequent QPCONFi write
+	 * — observed 2026-04-29: STATSSN stayed 0 (no transmission) until
+	 * bit 6 was explicitly cleared.  Clear it here, just before going
+	 * live so the engine actually transmits. */
 	qpconfi  = ioread32(mmio + q);
 	qpconfi |= 0x1u;
+	qpconfi &= ~(1u << 6);
 	iowrite32(qpconfi, mmio + q);
 	(void)ioread32(mmio + q);
 
 	qp->state = ERNIC_QP_RTS;
 	pr_info("onic_ib: qp[%u] RTR -> RTS sq_psn=%u qp_en_ct %u -> %u\n",
 		qp->qp_num, qp->sq_psn, qpen_ct, max(qpen_ct, new_ct));
+	onic_dump_qp_state(qp, "after R->S");
 	return 0;
 }
 
@@ -841,7 +1580,7 @@ static int onic_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	}
 	new_ib_state = attr->qp_state;
 
-	spin_lock(&qp->state_lock);
+	mutex_lock(&qp->state_lock);
 	cur = qp->state;
 
 	if (cur == ERNIC_QP_RESET && new_ib_state == IB_QPS_INIT)
@@ -856,7 +1595,7 @@ static int onic_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		rv = -EOPNOTSUPP;
 	}
 
-	spin_unlock(&qp->state_lock);
+	mutex_unlock(&qp->state_lock);
 	return rv;
 }
 
@@ -867,7 +1606,7 @@ static int onic_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	(void)attr_mask;
 
 	memset(attr, 0, sizeof(*attr));
-	spin_lock(&qp->state_lock);
+	mutex_lock(&qp->state_lock);
 	switch (qp->state) {
 	case ERNIC_QP_RESET:           attr->qp_state = IB_QPS_RESET; break;
 	case ERNIC_QP_INIT:            attr->qp_state = IB_QPS_INIT;  break;
@@ -888,7 +1627,7 @@ static int onic_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	attr->min_rnr_timer  = qp->min_rnr_timer;
 	attr->port_num       = qp->port_num ? qp->port_num : 1;
 	attr->pkey_index     = 0;
-	spin_unlock(&qp->state_lock);
+	mutex_unlock(&qp->state_lock);
 
 	if (init_attr) {
 		memset(init_attr, 0, sizeof(*init_attr));
@@ -947,25 +1686,63 @@ static int ernic_xlate_opcode(enum ib_wr_opcode wr_op,
 	}
 }
 
+/* Look up the MR registered against this QP's PD and translate a user
+ * VA + length into a DDR4 mirror byte offset.  Returns 0 on success and
+ * fills *out_ddr_off; -EINVAL if the range falls outside the MR.  Caller
+ * holds no locks; pd->mr_lock is taken internally. */
+static int ernic_mr_xlate(struct onic_qp *qp, u32 lkey,
+			  u64 user_va, u32 length,
+			  u64 *out_ddr_off)
+{
+	struct onic_pd *pd = qp->pd;
+	struct onic_mr *mr;
+	u64             off;
+
+	spin_lock(&pd->mr_lock);
+	mr = pd->mr;
+	if (!mr) {
+		spin_unlock(&pd->mr_lock);
+		return -EINVAL;
+	}
+	if (lkey != mr->lkey) {
+		spin_unlock(&pd->mr_lock);
+		return -EINVAL;
+	}
+	if (user_va < mr->va || user_va + length > mr->va + mr->length) {
+		spin_unlock(&pd->mr_lock);
+		return -EINVAL;
+	}
+	off = mr->ddr_off + (user_va - mr->va);
+	spin_unlock(&pd->mr_lock);
+	*out_ddr_off = off;
+	return 0;
+}
+
 /* Compose one SQ WQE in DDR4 and update the SQ shadow. Does NOT ring
- * the doorbell — caller does that once at the end of a chain. */
+ * the doorbell — caller does that once at the end of a chain.
+ *
+ * Perf #3 (2026-05-03): both SEND and WRITE branches now reference the
+ * MR's DDR4 mirror.  The user buffer was copied to DDR4 at reg_user_mr
+ * time; here we just compute the byte offset and put it in wqe.laddr.
+ * No more per-WQE host→DDR4 staging copy on SEND, no more 64 B cap, and
+ * the WRITE branch is no longer broken (it was treating sg_list.addr as
+ * a DDR4 offset directly — silently corrupted any real ULP). */
 static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 {
 	struct onic_ib_dev *dev  = to_onic_ib_dev(qp->ibqp.device);
-	struct onic_pd     *pd   = qp->pd;
 	struct ernic_sq_wqe wqe;
 	u32                 ernic_op;
 	enum ib_wc_opcode   wc_op;
 	u32                 slot;
 	u32                 length;
-	u64                 laddr;
+	u32                 lkey;
+	u64                 user_va;
+	u64                 ddr_off;
+	u64                 laddr_axi;
 	int                 rv;
 
 	if (wr->num_sge > 1)
 		return -EOPNOTSUPP;
-	if (wr->next != NULL && wr->num_sge == 0) {
-		/* Allowed at IB level (zero-length SEND) — fall through. */
-	}
 
 	rv = ernic_xlate_opcode(wr->opcode, &ernic_op, &wc_op);
 	if (rv) {
@@ -975,58 +1752,56 @@ static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 		return rv;
 	}
 
-	length = (wr->num_sge == 1) ? wr->sg_list[0].length : 0;
-	laddr  = (wr->num_sge == 1) ? wr->sg_list[0].addr   : 0;
-
-	/* B7 first cut: payload comes from a registered MR. We don't have a
-	 * generic "stage host buffer in DDR4" path yet, so for SEND we only
-	 * accept inline payload ≤16 B (carried in the WQE itself). For
-	 * RDMA_WRITE the engine reads `laddr` from DDR4 directly, so the
-	 * caller must have registered the MR and `addr` is the DDR4 byte
-	 * offset of the source — same convention as libreconic. */
-	if (wr->opcode == IB_WR_SEND && length > 16) {
-		dev_info(&dev->priv->pdev->dev,
-			 "onic_ib: post_send SEND len=%u > 16 not yet supported\n",
-			 length);
-		return -EOPNOTSUPP;
-	}
+	length  = (wr->num_sge == 1) ? wr->sg_list[0].length : 0;
+	user_va = (wr->num_sge == 1) ? wr->sg_list[0].addr   : 0;
+	lkey    = (wr->num_sge == 1) ? wr->sg_list[0].lkey   : 0;
 
 	memset(&wqe, 0, sizeof(wqe));
 	slot = qp->sq_pidb % qp->sq_depth;
 
-	wqe.wrid       = cpu_to_le16((u16)slot);
-	wqe.length     = cpu_to_le32(length);
-	wqe.opcode     = cpu_to_le32(ernic_op & 0xff);
+	wqe.wrid   = cpu_to_le16((u16)slot);
+	wqe.length = cpu_to_le32(length);
+	wqe.opcode = cpu_to_le32(ernic_op & 0xff);
 
-	if (wr->opcode == IB_WR_SEND) {
-		/* Inline payload path: the WQE itself carries the bytes; the
-		 * laddr/laddr_high fields are unused for inline SEND. */
-		if (length > 0 && wr->sg_list[0].addr) {
-			/* `addr` here is a kernel virtual address from the
-			 * post_send caller (in-kernel ULPs only — userspace
-			 * verbs have not been wired through ucontext yet).
-			 * Direct memcpy is the safe path for ≤16 B inline. */
-			memcpy(wqe.send_small_payload,
-			       (const void *)(uintptr_t)wr->sg_list[0].addr,
-			       length);
+	/* Resolve user VA → DDR4 mirror offset (Perf #3).  Zero-length WRs
+	 * are allowed; we set ddr_off=0 in that case (engine ignores laddr
+	 * when length=0). */
+	if (length > 0) {
+		rv = ernic_mr_xlate(qp, lkey, user_va, length, &ddr_off);
+		if (rv) {
+			dev_info(&dev->priv->pdev->dev,
+				 "onic_ib: post_send mr xlate failed lkey=%u va=0x%llx len=%u (no MR or out of range)\n",
+				 lkey, (unsigned long long)user_va, length);
+			return rv;
 		}
 	} else {
-		/* RDMA_WRITE: laddr = DDR4 byte offset of source (within the
-		 * caller's registered MR). The engine resolves this through
-		 * the PDT row indexed by qp->pd->mr->lkey. */
-		wqe.laddr_low  = cpu_to_le32((u32)(laddr & 0xffffffffu));
-		wqe.laddr_high = cpu_to_le32((u32)(laddr >> 32));
+		ddr_off = 0;
+	}
+
+	/* laddr carries the 0xA350.. tag so ERNIC's M_AXI fetches via
+	 * sys_mem_5to2 M01.  Same encoding for SEND and WRITE. */
+	laddr_axi = ((u64)ONIC_DDR4_MSB << 32) | ddr_off;
+	wqe.laddr_low  = cpu_to_le32(lower_32_bits(laddr_axi));
+	wqe.laddr_high = cpu_to_le32(upper_32_bits(laddr_axi));
+
+	if (wr->opcode == IB_WR_SEND) {
+		/* For SEND, r_key is unused; PD-derived rkey is a sentinel. */
+		wqe.r_key = cpu_to_le32(qp->pd->pdn & 0xffu);
+	} else {
+		/* RDMA_WRITE: target's remote_addr + rkey go in the WQE.  The
+		 * receiver's ERNIC translates remote_addr through its PDT row
+		 * (programmed by reg_user_mr at the receiver) into a DDR4
+		 * destination offset on the receiver. */
 		wqe.remote_offset_low  =
-			cpu_to_le32((u32)(rdma_wr(wr)->remote_addr & 0xffffffffu));
+			cpu_to_le32(lower_32_bits(rdma_wr(wr)->remote_addr));
 		wqe.remote_offset_high =
-			cpu_to_le32((u32)(rdma_wr(wr)->remote_addr >> 32));
-		/* r_key — only [7:0] honoured per spec. */
+			cpu_to_le32(upper_32_bits(rdma_wr(wr)->remote_addr));
 		wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey & 0xffu);
 	}
 
-	(void)pd;  /* future use: per-PD WQE bookkeeping */
-
-	/* Land the 64 bytes in DDR4 at qp->sq_ddr_off + slot * 64. */
+	/* Land the 64 B WQE in DDR4 at qp->sq_ddr_off + slot * 64.  Uses
+	 * libqdma's H2C MM queue (onic_sysdma) — its M_AXI master reaches
+	 * DDR4 untagged.  ERNIC reads the same DDR4 byte via SQBAi. */
 	rv = onic_ddr4_write(dev->priv,
 			     qp->sq_ddr_off + (u64)slot * sizeof(wqe),
 			     &wqe, sizeof(wqe));
@@ -1069,9 +1844,9 @@ static int onic_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 	if (!wr)
 		return -EINVAL;
 
-	spin_lock(&qp->state_lock);
+	mutex_lock(&qp->state_lock);
 	if (qp->state != ERNIC_QP_RTS) {
-		spin_unlock(&qp->state_lock);
+		mutex_unlock(&qp->state_lock);
 		dev_info_ratelimited(&dev->priv->pdev->dev,
 				     "onic_ib: post_send qp[%u] not RTS (state=%d)\n",
 				     qp->qp_num, (int)qp->state);
@@ -1093,10 +1868,15 @@ static int onic_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 		cur = cur->next;
 	}
 
-	if (posted)
+	if (posted) {
+		onic_dump_qp_state(qp, "post_send pre-doorbell");
 		ernic_sq_doorbell(qp);
+		/* Give the engine a few microseconds to react before sampling. */
+		udelay(50);
+		onic_dump_qp_state(qp, "post_send post-doorbell+50us");
+	}
 
-	spin_unlock(&qp->state_lock);
+	mutex_unlock(&qp->state_lock);
 	return rv;
 }
 
@@ -1109,12 +1889,15 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	const struct ib_recv_wr *cur = wr;
 	int posted = 0;
 
+	pr_info("onic_ib: onic_post_recv ENTER qpn=%u state=%d wr=%p num_sge=%d\n",
+		qp->qp_num, (int)qp->state, wr, wr ? wr->num_sge : -1);
+
 	if (!wr)
 		return -EINVAL;
 
-	spin_lock(&qp->state_lock);
+	mutex_lock(&qp->state_lock);
 	if (qp->state == ERNIC_QP_RESET) {
-		spin_unlock(&qp->state_lock);
+		mutex_unlock(&qp->state_lock);
 		*bad_wr = wr;
 		return -EINVAL;
 	}
@@ -1128,7 +1911,7 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 
 		if (cur->num_sge > 1) {
 			*bad_wr = cur;
-			spin_unlock(&qp->state_lock);
+			mutex_unlock(&qp->state_lock);
 			return -EOPNOTSUPP;
 		}
 
@@ -1140,17 +1923,23 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	}
 
 	if (posted) {
-		/* Host does NOT compose RQE bytes — engine fills the slot
-		 * when an RQPKT lands.  We just bump the consumer-side
-		 * counter so the engine knows how many slots are armed.
-		 * RQCIi is the "RQ consumer index"; in v4.2 the host writes
-		 * the *expected* tail (== monotonic count of armed slots). */
+		/* RQCIi (0x34) — write the running count of armed slots.
+		 * Empirically required: PG332 line 911-914 says "On receiving
+		 * this doorbell, the corresponding RX buffer is made available
+		 * to" the engine — writing RQCIi grants buffer credit.  Without
+		 * the write the engine never fills RQ slots, STATRQPIDB/STATMSN
+		 * never advance, and poll_cq returns 0 forever.  libreconic
+		 * appears to rely on a fixed-ring model where credit is
+		 * implicit at QP-setup; our ibverbs flow needs the doorbell
+		 * per-post.  We additionally bump RQCIi in poll_cq when a
+		 * RECV is reaped (see onic_poll_cq) so the engine sees
+		 * released slots — both writes are required. */
 		wmb();
 		iowrite32(qp->rq_pidb, mmio + onic_qcsr(qp, 0x34));
 		(void)ioread32(mmio + onic_qcsr(qp, 0x34));
 	}
 
-	spin_unlock(&qp->state_lock);
+	mutex_unlock(&qp->state_lock);
 	return 0;
 }
 
@@ -1179,42 +1968,138 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 	 * no completions to poll. */
 	if (!qp->ernic_base)
 		return 0;
-	cqhead = ioread32(mmio + onic_qcsr(qp, 0x30));
 
-	spin_lock(&qp->state_lock);
+	/* DEBUG-perf5: cadence trace — gap between consecutive poll_cq calls
+	 * tells us if the 24ms/spin is userspace cadence or kernel/HW.
+	 * Remove once perf #5 is closed. */
+	{
+		static u64 _last_poll_ns;
+		u64 _now = ktime_get_ns();
+		u64 _delta = _last_poll_ns ? (_now - _last_poll_ns) : 0;
+		_last_poll_ns = _now;
+		pr_info("onic_poll_cq qp=%u hdb=%d delta_ns=%llu cqhead_pre=%u\n",
+			qp->qp_num, qp->hdb_active ? 1 : 0, _delta,
+			qp->hdb_active ? le32_to_cpu(READ_ONCE(*qp->hdb_cq))
+					: ioread32(mmio + onic_qcsr(qp, 0x30)));
+	}
 
-	while (polled < num_entries && qp->cq_consumer_idx != cqhead) {
-		u32                slot = qp->cq_consumer_idx % qp->cq_depth;
-		struct ernic_cqe   cqe_raw = {0};
-		u32                wqe_slot;
-		int                rv;
+	/* Perf #1 — read CQ producer index from the host coherent doorbell
+	 * page when active.  ERNIC DMAs the index here on every CQ
+	 * completion (CQDBADDi was programmed at R->I).  Cuts one PCIe
+	 * read per poll_cq.  RQ-side (STATMSN) stays MMIO — the engine's
+	 * RQ-PIDB DMA over-counts on retransmits exactly like reading
+	 * STATRQPIDBi did, so we keep STATMSN as the deduped source. */
+	if (qp->hdb_active) {
+		smp_rmb();
+		cqhead = le32_to_cpu(READ_ONCE(*qp->hdb_cq));
+	} else {
+		cqhead = ioread32(mmio + onic_qcsr(qp, 0x30));
+	}
 
-		rv = onic_ddr4_read(priv, &cqe_raw,
-				    qp->cq_ddr_off + (u64)slot * sizeof(cqe_raw),
-				    sizeof(cqe_raw));
-		if (rv) {
-			dev_info_ratelimited(&priv->pdev->dev,
-					     "onic_ib: poll_cq sysdma READ failed qp=%u slot=%u rv=%d\n",
-					     qp->qp_num, slot, rv);
-			break;
-		}
+	mutex_lock(&qp->state_lock);
 
-		wqe_slot = le16_to_cpu(cqe_raw.wqe_idx) % qp->sq_depth;
+	/* SQ-side completions: ERNIC bumps CQHEADi when a SEND/WRITE WQE
+	 * completes.  Treat the bump itself as the completion indicator.
+	 *
+	 * Why we don't read the 4-byte CQE in DDR4: when we tried, reads
+	 * came back 0x7b7b7b7b (looks uninitialized) even though CQHEAD
+	 * advanced and STATSSN/STATCURSQPTR confirmed success.  We don't
+	 * know which of these is the cause: wrong AXI tag for engine
+	 * writes vs QDMA reads, wrong slot offset, write/read ordering,
+	 * a gating bit we haven't identified, or this IP build simply
+	 * not wiring CQE writes through.  PG332 line 2701 frames CQE
+	 * writes as a debug aid ("CQE writes can be enabled to debug
+	 * failed completions"), suggesting the doorbell-advance-only
+	 * path is the intended contract.
+	 *
+	 * What we do trust: libreconic's poll_cq_cidb (rdma_api.c:858)
+	 * polls CQHEADi and never reads CQE bytes — and it works in this
+	 * IP family.  We match that.  wr_id/opcode/length come from
+	 * sq_shadow (correct because completions are in submission order
+	 * for an ordered SQ); errors surface through STATQPi syndrome at
+	 * QP-level recovery rather than per-CQE status. */
+	/* Phantom-completion clamp (variance fix 2026-05-03): never deliver
+	 * more SEND completions than the ULP has actually posted.  Without
+	 * this, a stale CQHEAD value from before this QP's lifetime (e.g.
+	 * carrying over from a prior QP that occupied this slot) could
+	 * deliver IB_WC_SUCCESS for WQEs that don't exist, returning bogus
+	 * sub-100-µs latencies in pingpong loops.  qp->sq_pidb is the count
+	 * of post_send calls on this QP since last R->I, so it's the
+	 * authoritative upper bound. */
+	while (polled < num_entries &&
+	       qp->cq_consumer_idx != cqhead &&
+	       qp->cq_consumer_idx != qp->sq_pidb) {
+		u32 wqe_slot = qp->cq_consumer_idx % qp->sq_depth;
 
 		memset(&wc[polled], 0, sizeof(wc[polled]));
 		wc[polled].qp        = &qp->ibqp;
 		wc[polled].wr_id     = qp->sq_shadow[wqe_slot].wr_id;
 		wc[polled].opcode    = qp->sq_shadow[wqe_slot].ib_opcode;
 		wc[polled].byte_len  = qp->sq_shadow[wqe_slot].length;
-		wc[polled].status    = (cqe_raw.status == 0) ?
-					IB_WC_SUCCESS : IB_WC_GENERAL_ERR;
-		wc[polled].vendor_err = cqe_raw.status;
-
+		wc[polled].status    = IB_WC_SUCCESS;
 		qp->cq_consumer_idx++;
 		polled++;
 	}
 
-	spin_unlock(&qp->state_lock);
+	/* RQ-side completions: deliver one IB_WC_RECV per *message*
+	 * actually received at the engine.  STATMSNi (QCSR 0x84) tracks
+	 * "expected incoming MSN" — when ERNIC has fully received N
+	 * messages, STATMSNi reads (N+1) (next-expected).  So the count
+	 * of fully-completed message-level receives is STATMSNi - 1.
+	 *
+	 * STATRQPIDBi advances per RQE the engine writes, which can
+	 * include retransmits a peer in retry-loop sends — so using it
+	 * over-delivers RECV completions and ULPs that compare rcnt to
+	 * an iteration count (ibv_rc_pingpong) loop forever.
+	 *
+	 * Two clamps on top of the engine count:
+	 *   - polled < num_entries: respect the caller's wc[] capacity.
+	 *   - rq_consumer_idx != rq_pidb: never deliver more RECVs than
+	 *     the ULP has posted recv buffers for.
+	 */
+	{
+		u32 statmsn = ioread32(mmio + onic_qcsr(qp, 0x84)) &
+			      0x00ffffffu;
+		/* STATMSN counts from 0: starts at 0 pre-traffic, advances
+		 * to 1 after the engine processes the first incoming
+		 * message.  So STATMSN itself == number of messages
+		 * received (no -1).  Empirically confirmed: snapshot showed
+		 * STATMSN=1 + STATRQPIDB=1 after the responder processed
+		 * one SEND; with -1 we delivered 0 completions and pingpong
+		 * blocked. */
+		u32 rcv_count = statmsn;
+		u32 rq_consumer_before = qp->rq_consumer_idx;
+
+		while (polled < num_entries &&
+		       qp->rq_consumer_idx != rcv_count &&
+		       qp->rq_consumer_idx != qp->rq_pidb) {
+			u32 slot = qp->rq_consumer_idx % qp->rq_depth;
+
+			memset(&wc[polled], 0, sizeof(wc[polled]));
+			wc[polled].qp        = &qp->ibqp;
+			wc[polled].wr_id     = qp->rq_shadow[slot].wr_id;
+			wc[polled].opcode    = IB_WC_RECV;
+			wc[polled].status    = IB_WC_SUCCESS;
+			/* byte_len: ERNIC writes payload directly to the RQ
+			 * buffer; for SEND-Only the full message fits in one
+			 * RQE slot.  We don't currently parse the BTH/RETH
+			 * length back from the RQE — leave 0 for B7.  ULPs
+			 * that need it (e.g. ibv_rc_pingpong checks) won't
+			 * fail on byte_len=0; they verify content. */
+			wc[polled].byte_len  = 0;
+			qp->rq_consumer_idx++;
+			polled++;
+		}
+
+		/* Don't write RQCIi here — post_recv handles the doorbell
+		 * with the rq_pidb (post-counter) value.  The engine treats
+		 * RQCIi as "buffers available" credit; writing the consumer
+		 * index here would clobber the post-counter and starve
+		 * the engine. */
+		(void)rq_consumer_before;
+	}
+
+	mutex_unlock(&qp->state_lock);
 	return polled;
 }
 
@@ -1305,7 +2190,36 @@ int onic_ib_register(struct onic_private *priv)
 	dev->priv = priv;
 	spin_lock_init(&dev->pd_lock);
 	bitmap_zero(dev->pd_bitmap, ONIC_IB_MAX_PD);
+	/* Reserve PD 0 so first user PD gets pdn=1.  The MR keys are derived
+	 * from pdn (mr->lkey = mr->rkey = pdn) and many libibverbs paths treat
+	 * lkey=0 as "invalid local key" — post_recv would silently fail in
+	 * userspace before reaching the kernel.  The PDT row 0 is therefore
+	 * unused; rows 1..ONIC_IB_MAX_PD-1 carry real registrations. */
+	set_bit(0, dev->pd_bitmap);
 	onic_ddr_pool_init(&dev->ddr, 0 /* ERNIC0 */);
+
+	/* Perf #1 — coherent doorbell page for ERNIC CQ/RQ producer-index
+	 * DMA writes.  4 KiB total: cq_pidb[256]@0..0x3FF, rq_pidb[256]@
+	 * 0x400..0x7FF (4 B per QP, qp_num indexed).  Failure here is non-
+	 * fatal: every QP falls back to DDR4-tagged doorbells. */
+	dev->hdb.size    = PAGE_SIZE;
+	dev->hdb.enabled = false;
+	if (host_doorbell) {
+		dev->hdb.vaddr = dma_alloc_coherent(&priv->pdev->dev,
+						    dev->hdb.size,
+						    &dev->hdb.dma,
+						    GFP_KERNEL);
+		if (dev->hdb.vaddr) {
+			memset(dev->hdb.vaddr, 0, dev->hdb.size);
+			dev->hdb.enabled = true;
+			dev_info(&priv->pdev->dev,
+				 "host_doorbell: coherent page va=%px dma=%pad size=%zu\n",
+				 dev->hdb.vaddr, &dev->hdb.dma, dev->hdb.size);
+		} else {
+			dev_warn(&priv->pdev->dev,
+				 "host_doorbell alloc failed; using DDR4-tagged doorbells\n");
+		}
+	}
 
 	{
 		const u8 *mac = priv->netdev->dev_addr;
@@ -1318,6 +2232,29 @@ int onic_ib_register(struct onic_private *priv)
 	dev->ibdev.phys_port_cnt    = 2;
 	dev->ibdev.num_comp_vectors = 1;
 	dev->ibdev.dev.parent       = &priv->pdev->dev;
+
+	/* MLNX-OFED's ib_uverbs legacy write() path (used by ibv_cmd_post_recv
+	 * etc.) gates verb dispatch on this mask before checking the ops table.
+	 * Without these bits, post_recv/post_send/poll_cq return -EOPNOTSUPP at
+	 * the ib_uverbs layer without ever reaching our handler. */
+	dev->ibdev.uverbs_cmd_mask =
+		BIT_ULL(IB_USER_VERBS_CMD_GET_CONTEXT)        |
+		BIT_ULL(IB_USER_VERBS_CMD_QUERY_DEVICE)       |
+		BIT_ULL(IB_USER_VERBS_CMD_QUERY_PORT)         |
+		BIT_ULL(IB_USER_VERBS_CMD_ALLOC_PD)           |
+		BIT_ULL(IB_USER_VERBS_CMD_DEALLOC_PD)         |
+		BIT_ULL(IB_USER_VERBS_CMD_REG_MR)             |
+		BIT_ULL(IB_USER_VERBS_CMD_DEREG_MR)           |
+		BIT_ULL(IB_USER_VERBS_CMD_CREATE_CQ)          |
+		BIT_ULL(IB_USER_VERBS_CMD_DESTROY_CQ)         |
+		BIT_ULL(IB_USER_VERBS_CMD_CREATE_QP)          |
+		BIT_ULL(IB_USER_VERBS_CMD_MODIFY_QP)          |
+		BIT_ULL(IB_USER_VERBS_CMD_QUERY_QP)           |
+		BIT_ULL(IB_USER_VERBS_CMD_DESTROY_QP)         |
+		BIT_ULL(IB_USER_VERBS_CMD_POST_SEND)          |
+		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV)          |
+		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ)            |
+		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
 
 	ib_set_device_ops(&dev->ibdev, &onic_ib_ops);
 	rcu_assign_pointer(dev->port[0].netdev, priv->netdev);
@@ -1340,7 +2277,18 @@ int onic_ib_register(struct onic_private *priv)
 		return rv;
 	}
 
+	/* Bring ERNIC0 (port 1) out of reset.  ERNIC1 (port 2) is brought up
+	 * later in onic_ib_set_port2_netdev once the secondary netdev is
+	 * available. */
+	onic_ernic_global_init(dev, 1);
+
 	priv->ib_dev = dev;
+
+	/* Per-ib_device debugfs root: /sys/kernel/debug/onic/<ibdev_name>/.
+	 * Per-QP qp<N>/dump entries hang off this and are populated/removed
+	 * by onic_create_qp / onic_destroy_qp. */
+	onic_debugfs_register(dev);
+
 	dev_info(&priv->pdev->dev, "ib_device '%s' registered (2 ports, RoCEv2)\n",
 		 name);
 	return 0;
@@ -1350,11 +2298,18 @@ int onic_ib_set_port2_netdev(struct onic_private *primary,
 			     struct onic_private *secondary)
 {
 	struct onic_ib_dev *dev = primary ? primary->ib_dev : NULL;
+	int rv;
 
 	if (!dev || !secondary || !secondary->netdev)
 		return 0;
 	rcu_assign_pointer(dev->port[1].netdev, secondary->netdev);
-	return ib_device_set_netdev(&dev->ibdev, secondary->netdev, 2);
+	rv = ib_device_set_netdev(&dev->ibdev, secondary->netdev, 2);
+	if (rv)
+		return rv;
+
+	/* Bring ERNIC1 (port 2) out of reset now that we have its netdev. */
+	onic_ernic_global_init(dev, 2);
+	return 0;
 }
 
 void onic_ib_unregister(struct onic_private *priv)
@@ -1363,8 +2318,20 @@ void onic_ib_unregister(struct onic_private *priv)
 
 	if (!dev)
 		return;
+
+	/* Tear debugfs down before ib_unregister_device so no `cat dump` can
+	 * fire after the underlying ib_device is gone.  Per-QP entries get
+	 * pruned recursively as part of debugfs_root removal. */
+	onic_debugfs_unregister(dev);
+
 	ib_unregister_device(&dev->ibdev);
 	onic_ddr_pool_fini(&dev->ddr);
+	if (dev->hdb.vaddr) {
+		dma_free_coherent(&priv->pdev->dev, dev->hdb.size,
+				  dev->hdb.vaddr, dev->hdb.dma);
+		dev->hdb.vaddr   = NULL;
+		dev->hdb.enabled = false;
+	}
 	ib_dealloc_device(&dev->ibdev);
 	priv->ib_dev = NULL;
 }

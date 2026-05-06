@@ -24,11 +24,35 @@
 #define ONIC_DDR_QUEUE_SQ_OFF           0x00000000u
 #define ONIC_DDR_QUEUE_RQ_OFF           0x00001000u
 #define ONIC_DDR_QUEUE_CQ_OFF           0x00002000u
+/* Per-WR SEND-payload staging in the unused last 4 KiB of each 16 KiB
+ * slot.  ERNIC v4.2 fetches packet payload via M_AXI from laddr — the
+ * reference libreconic send_recv.c test ALWAYS sets laddr to a real
+ * DDR4 address and leaves send_small_payload zero, so the inline path
+ * apparently doesn't work in the IP we have.  64 bytes per WR is enough
+ * for the 8-byte ibv_rc_pingpong test; larger payloads need the MR's
+ * DDR4 mirror (future change). */
+#define ONIC_DDR_QUEUE_SEND_PAYLOAD_OFF 0x00003000u
+#define ONIC_DDR_QUEUE_SEND_PAYLOAD_STR 64u
+#define ONIC_DDR_QUEUE_SEND_PAYLOAD_MAX 64u
 
-/* B5 MR pool (single size class). */
+/* Doorbell DMA scratch — ERNIC v4.2 unconditionally DMA-writes the RQ
+ * write-pointer and CQ doorbell to the addresses in RQWPTRDBADDi /
+ * CQDBADDi when QP enters RTS, regardless of QPCONFi[4] HWHSHKDIS.
+ * If those registers are 0 the writes hit host PCIe address 0 and the
+ * IOMMU rejects them (AMD-Vi IO_PAGE_FAULT / DMAR DMA Write fault),
+ * stalling the engine.  Park them in the unused tail of each 16-KiB
+ * slot so writes land in DDR4 via the 0xA350.. tag and never traverse
+ * PCIe. */
+#define ONIC_DDR_QUEUE_RQDB_OFF         0x00003F00u
+#define ONIC_DDR_QUEUE_CQDB_OFF         0x00003F08u
+
+/* B5 MR pool (single size class).  Sized for Perf #3 — 16 MiB per slot
+ * lets `ib_write_bw -s 4096..16777216` register a payload buffer in one
+ * MR.  Total pool = 16 MiB × 64 = 1 GiB at offset 0x00400000, well within
+ * the 8 GiB per-ERNIC region cap. */
 #define ONIC_DDR_MR_TIER_OFF            0x00400000u
-#define ONIC_DDR_MR_SMALL_SIZE          0x00010000u   /* 64 KiB */
-#define ONIC_DDR_MR_SMALL_COUNT         256u
+#define ONIC_DDR_MR_SMALL_SIZE          0x01000000u   /* 16 MiB */
+#define ONIC_DDR_MR_SMALL_COUNT         64u
 
 /* Per-ERNIC region size — F4 §2.2 8 GiB each until lifted. */
 #define ONIC_DDR_ERNIC_REGION_SIZE      0x200000000ULL

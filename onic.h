@@ -41,18 +41,8 @@
 #define ONIC_DBG_INFO	1
 #define ONIC_DBG_INIT	2
 #define ONIC_DBG_DATA	3
-#define ONIC_DBG_XPATH	4	/* per-packet TX/RX path trace */
 
 extern int onic_debug_level;
-
-/* [DBG_XPATH] per-packet diagnostic. Lightweight, no rate-limit (caller
- * gates emission by debug_level >= 4). Tagged distinctly from [DBG3] so
- * "dmesg | grep DBG_XPATH" pulls only the per-packet trace. */
-#define onic_xpath(fmt, ...)						\
-	do {								\
-		if (onic_debug_level >= ONIC_DBG_XPATH)			\
-			pr_info("[DBG_XPATH] " fmt, ##__VA_ARGS__);	\
-	} while (0)
 
 #define onic_netdev_dbg(lvl, netdev, fmt, ...)				\
 	do {								\

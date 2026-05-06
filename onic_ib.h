@@ -10,8 +10,13 @@
 
 #include <linux/bitops.h>
 #include <linux/spinlock.h>
+#include <linux/kconfig.h>
 #include <rdma/ib_verbs.h>
 #include "onic_ddr_alloc.h"
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+struct dentry;
+#endif
 
 struct onic_private;
 
@@ -30,9 +35,19 @@ enum ernic_qp_state {
 
 #define ONIC_IB_MAX_PD 256
 
-/* B7 — RQBUFSZ field value for 512-B RQE slots (libreconic RQE_SIZE = 512).
- * QPCONFi[31:16] is RQE size in 256-B units, so 512 / 256 = 2.
- * The earlier B5 code packed `rq_depth` here by mistake. */
+/* QPCONFi[31:16] = RQ Buffer size in MULTIPLES OF 256B, per Xilinx
+ * PG332 v4.2 Table 8 (line ~2715): "RQ Buffer size (in multiple of
+ * 256B)... programmed value should be the power of 2 for expected
+ * behavior".  Programming 512 here meant ERNIC strode by 512*256B =
+ * 128 KiB per RQE slot, which is far beyond our 4 KiB RQ buffer
+ * allocation -- causing exactly one received packet to land correctly
+ * (in slot 0) and every subsequent packet to land outside the buffer
+ * and be silently dropped (INALLDRPPKTCNT++).
+ * 2026-05-03 fix: program 2 -> 512 B per RQE element.  Driver lays
+ * out RQ slots at 512 B stride (`s * 512` per onic_ib.c:1279) and
+ * libreconic also uses 512 B (programs `RQE_SIZE>>8 = 2`).  Earlier
+ * value of 1 (256 B stride) caused driver vs ERNIC to disagree on
+ * slot offsets. */
 #define ERNIC_RQE_SIZE_FIELD 2u
 
 /* B7 — packed ERNIC SQ WQE, 64 bytes.  Layout per
@@ -84,6 +99,27 @@ struct onic_ib_dev {
 
 	/* B5: DDR4 slab allocator — QP queue slots + MR staging. */
 	struct onic_ddr_pool  ddr;
+
+	/* Perf #1 — coherent host page for ERNIC doorbell DMA writes.
+	 * Replaces the DDR4-tagged RQWPTRDBADDi/CQDBADDi targets when
+	 * the host_doorbell module param is true.  4 KiB layout:
+	 *   0x000..0x3FF — cq_pidb[256] (4 B per QP)
+	 *   0x400..0x7FF — rq_pidb[256] (4 B per QP)
+	 * onic_poll_cq reads cq_pidb[qp->qp_num] instead of MMIO CQHEADi,
+	 * saving one PCIe read per poll. */
+	struct {
+		void           *vaddr;
+		dma_addr_t      dma;
+		size_t          size;
+		bool            enabled;
+	} hdb;
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	/* Per-ib_device debugfs root: /sys/kernel/debug/onic/<ibdev_name>/.
+	 * Created in onic_ib_register after ib_register_device, removed in
+	 * onic_ib_unregister.  Per-QP qp<N>/ subdirs hang off this. */
+	struct dentry         *debugfs_root;
+#endif
 };
 
 /* B3 PD struct, extended in B5 to track its single bound MR. */
@@ -98,12 +134,18 @@ struct onic_pd {
 struct onic_mr {
 	struct ib_mr     ibmr;
 	struct onic_pd  *pd;            /* back-pointer */
-	u64              va;            /* user VA (advisory) */
+	u64              va;            /* user VA (base of the MR's host range) */
 	u64              ddr_off;       /* DDR4 byte offset (from allocator) */
 	u64              length;
 	u8               access;        /* ERNIC ACCESSDESC[1:0] */
 	u32              lkey;          /* == rkey == pdn (Track B simplification) */
 	u32              rkey;
+	/* Perf #3 — DDR4 mirror is populated at reg_user_mr time via
+	 * copy_from_user → onic_ddr4_write, in 1 MiB chunks.  post_send /
+	 * post_write reference the mirror via wqe.laddr = ddr_off +
+	 * (sg_addr - va).  Snapshot semantics: post-registration mutations
+	 * to the host buffer don't propagate to DDR4 — matches IB undefined-
+	 * behaviour for post-reg writes. */
 };
 
 struct onic_qp;
@@ -150,7 +192,7 @@ struct onic_qp {
 	u8                      dmac[6];
 	union ib_gid            dgid;
 
-	spinlock_t              state_lock;
+	struct mutex            state_lock;	/* held across sysdma DDR4 r/w (sleeping); was spinlock — caused "scheduling while atomic" in post_send/poll_cq */
 
 	/* B7 — DDR4 byte offsets of the per-QP rings.  Final values are
 	 * resolved at RESET->INIT once port_num (and therefore the ERNIC
@@ -180,6 +222,32 @@ struct onic_qp {
 	u32                     sq_pidb;
 	u32                     rq_pidb;
 	u32                     cq_consumer_idx;
+	/* RQ consumer index — tracks how many RQEs we've reaped via
+	 * poll_cq.  Engine-side producer index lives in STATRQPIDBi
+	 * (QCSR 0x9C); when STATRQPIDBi > rq_consumer_idx, there are
+	 * IB_WC_RECV completions to deliver. */
+	u32                     rq_consumer_idx;
+
+	/* Perf #1 — slots inside the ib_dev's coherent doorbell page.
+	 * hdb_cq points at cq_pidb[qp_num], hdb_rq at rq_pidb[qp_num].
+	 * hdb_*_dma are the bus addresses that go into CQDBADDi /
+	 * RQWPTRDBADDi when hdb_active is true.  When hdb_active is
+	 * false the QP falls back to MMIO/DDR4-tagged doorbells. */
+	volatile __le32        *hdb_cq;
+	volatile __le32        *hdb_rq;
+	dma_addr_t              hdb_cq_dma;
+	dma_addr_t              hdb_rq_dma;
+	bool                    hdb_active;
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	/* Per-QP debugfs subdir: <ibdev>/qp<qp_num>/.  Created at the end of
+	 * onic_create_qp once qp_num is assigned; removed at the start of
+	 * onic_destroy_qp before any teardown so the read handler can never
+	 * race a free.  debugfs_remove_recursive is synchronous w.r.t. open
+	 * file handles so destroy_qp blocks until any in-flight `cat dump`
+	 * returns. */
+	struct dentry          *debugfs_dentry;
+#endif
 };
 
 struct onic_ucontext {
@@ -215,5 +283,10 @@ int  onic_ib_register(struct onic_private *priv);
 void onic_ib_unregister(struct onic_private *priv);
 int  onic_ib_set_port2_netdev(struct onic_private *primary,
 			      struct onic_private *secondary);
+
+/* Exposed for onic_debugfs.c — the on-demand QP-state dump handler.
+ * Same signature/implementation as the existing in-driver call sites
+ * around modify_qp transitions and post_send. */
+void onic_dump_qp_state(const struct onic_qp *qp, const char *tag);
 
 #endif /* __ONIC_IB_H__ */

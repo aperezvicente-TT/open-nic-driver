@@ -71,6 +71,14 @@ MODULE_PARM_DESC(host_id,
 	"Host identifier (0-255) for MAC uniqueness across identical hosts. "
 	"Default -1: auto-derive from DMI system UUID.");
 
+static bool shell_reset_on_load = true;
+module_param(shell_reset_on_load, bool, 0444);
+MODULE_PARM_DESC(shell_reset_on_load,
+	"Pulse the shell reset for ERNIC0/ERNIC1 (system_config bits 12/13) "
+	"during PCI probe. Default true. Set to false for bitstreams that do "
+	"not implement the RDMA reset bits (non-__rdma_enabled__ builds the "
+	"write is harmless but dev_info-noisy).");
+
 #ifdef CMS_SUPPORT
 extern int xocl_init_xmc(void);
 extern void xocl_fini_xmc(void);
@@ -282,6 +290,88 @@ static void onic_apply_netdev_features(struct net_device *netdev)
 	netdev->hw_features |= NETIF_F_HIGHDMA;
 }
 
+/* ERNIC sticky-state mask in the system_config SHELL_RESET register.
+ *
+ * open_nic_shell.sv top-level wires shell_rstn[12] -> ERNIC0 (rdma_rstn) and
+ * shell_rstn[13] -> ERNIC1 (rdma_1_rstn) under `__rdma_enabled__`.  Bits 0
+ * (QDMA), 4/5 (CMAC0/adapter), 8/9 (CMAC1/adapter) are deliberately NOT set
+ * here so this pulse does not disturb the host PCIe link or the in-flight
+ * netdevs while the driver loads.
+ *
+ * On non-RDMA bitstreams the [12:13] bits are unmapped and shell_rst_done is
+ * tied to 1'b1, so the write self-clears immediately and the poll exits on
+ * the first iteration -- safe but the dev_info still fires.  Use the
+ * shell_reset_on_load module param to suppress on those builds.
+ */
+#define ONIC_SHELL_RESET_MASK_ERNIC0	BIT(12)
+#define ONIC_SHELL_RESET_MASK_ERNIC1	BIT(13)
+#define ONIC_SHELL_RESET_MASK_ERNIC	(ONIC_SHELL_RESET_MASK_ERNIC0 | \
+					 ONIC_SHELL_RESET_MASK_ERNIC1)
+#define ONIC_SHELL_RESET_TIMEOUT_MS	200
+
+/*
+ * onic_shell_reset_ernic - pulse system_config shell reset for both ERNICs
+ *
+ * Clears the sticky GCSR/per-QP state inside the ERNIC IPs that survives
+ * `rmmod/insmod` and PCIe FLR -- specifically INSRRPKT, INALLDRP, ERRBUFWPTR,
+ * and the per-QP STATQPi counters.  Without this, every driver reload
+ * inherits stale "RX-side" counters and fragments of the previous QP context,
+ * which makes iteration during ERNIC bring-up impossible without a cold
+ * power cycle.
+ *
+ * The system_config register at SYSCFG_OFFSET_SHELL_RESET is write-1-to-pulse
+ * and self-clearing: the hardware deasserts the request bit when the
+ * corresponding shell_rst_done returns.  Software polls SHELL_STATUS for the
+ * matching done bits to come back high.  No explicit deassert is required.
+ */
+static void onic_shell_reset_ernic(struct onic_private *priv)
+{
+	struct onic_hardware *hw = &priv->hw;
+	struct pci_dev *pdev = priv->pdev;
+	u32 status;
+	int i;
+
+	if (!shell_reset_on_load)
+		return;
+
+	if (!hw->addr) {
+		dev_warn(&pdev->dev,
+			 "shell-reset: hw->addr not mapped, skipping ERNIC reset\n");
+		return;
+	}
+
+	/* Pulse bits 12 (ERNIC0) and 13 (ERNIC1) together; the read-after-write
+	 * acts as a posted-write flush so the request reaches the AXI-Lite
+	 * register before we start polling status.
+	 */
+	onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET,
+		       ONIC_SHELL_RESET_MASK_ERNIC);
+	(void)onic_read_reg(hw, SYSCFG_OFFSET_SHELL_RESET);
+
+	/* Poll SHELL_STATUS for the two ERNIC done bits to come back high.
+	 * On non-RDMA shells the status bits are tied high so this loop
+	 * exits on the first iteration.
+	 */
+	for (i = 0; i < ONIC_SHELL_RESET_TIMEOUT_MS; i++) {
+		status = onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS);
+		if ((status & ONIC_SHELL_RESET_MASK_ERNIC) ==
+		    ONIC_SHELL_RESET_MASK_ERNIC)
+			break;
+		mdelay(1);
+	}
+
+	if (i == ONIC_SHELL_RESET_TIMEOUT_MS) {
+		dev_warn(&pdev->dev,
+			 "shell-reset: ERNIC reset-done timed out (status=0x%08x), continuing\n",
+			 status);
+		return;
+	}
+
+	dev_info(&pdev->dev,
+		 "shell-reset: pulsed ERNIC0+ERNIC1 (bits 12/13), GCSR/STATQP cleared (took %d ms)\n",
+		 i);
+}
+
 /**
  * onic_setup_primary - bring up the CMAC0 netdev (master PF)
  *
@@ -370,6 +460,12 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		dev_err(&pdev->dev, "onic_init_hardware (primary), err = %d", rv);
 		goto clear_qdma;
 	}
+
+	/* Pulse the shell reset for both ERNICs now that hw->addr is mapped
+	 * but BEFORE any ERNIC GCSR programming (onic_ernic_irq_setup +
+	 * onic_ib_register).  Skips bits 0/4-9 to leave QDMA + both CMACs
+	 * untouched.  Gated by module param shell_reset_on_load. */
+	onic_shell_reset_ernic(priv);
 
 	rv = onic_init_interrupt(priv);
 	if (rv < 0) {

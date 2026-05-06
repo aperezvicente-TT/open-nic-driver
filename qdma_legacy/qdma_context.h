@@ -436,37 +436,4 @@ int qdma_clear_fmap_ctxt(struct qdma_dev *dev);
  **/
 int qdma_invalidate_fmap_ctxt(struct qdma_dev *dev);
 
-/**
- * qdma_read_sw_ctxt_raw - [SEC_DIAG] read raw SW context words
- * @dev: pointer to QDMA device
- * @qid: relative queue ID (translated to absolute via dev->q_base)
- * @dir: queue direction
- * @raw: 8-word output buffer (only first QDMA_SW_CTXT_NUM_WORDS=5 are valid;
- *       remainder are zero-padded for convenience).
- *
- * Returns 0 on success, negative on failure.
- **/
-int qdma_read_sw_ctxt_raw(struct qdma_dev *dev, u16 qid, enum qdma_dir dir,
-			  u32 raw[8]);
-
-/**
- * qdma_read_hw_ctxt_raw - [SEC_DIAG] read raw HW context words
- * @dev: pointer to QDMA device
- * @qid: relative queue ID (translated to absolute via dev->q_base)
- * @dir: queue direction
- * @raw: output buffer for HW context words
- * @max_words: capacity of @raw in words; up to QDMA_HW_CTXT_NUM_WORDS (2)
- *             are written, remainder zero-padded.
- *
- * The HW context exposes cidx (consumer index, W0[15:0]), credits used
- * (W0[31:16]), descriptor pending (W1[8]), idl_stp_b (W1[9]), event
- * pending (W1[10]), and fetch pending (W1[14:11]).  Used to determine
- * whether the QDMA engine actually consumed descriptors from a queue
- * or never advanced past PIDX=0.
- *
- * Returns 0 on success, negative on failure.
- **/
-int qdma_read_hw_ctxt_raw(struct qdma_dev *dev, u16 qid, enum qdma_dir dir,
-			  u32 *raw, int max_words);
-
 #endif

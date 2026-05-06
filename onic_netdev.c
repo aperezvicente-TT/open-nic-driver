@@ -85,7 +85,6 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 	struct onic_ring *ring = &q->ring;
 	struct qdma_wb_stat wb;
 	int work, i;
-	u16 ntc_old_dbg;
 
 	// this is a locking mechanism to guarantee that only one thread is cleaning the ring
 	// bitmask functions are atomic!
@@ -98,8 +97,6 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		clear_bit(0, q->state);
 		return;
 	}
-
-	ntc_old_dbg = ring->next_to_clean;
 
 	work = wb.cidx - ring->next_to_clean;
 	if (work < 0)
@@ -139,19 +136,6 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		buf->type = 0;
 
 		onic_ring_increment_tail(ring);
-	}
-
-	/* [DBG_XPATH] TX completion trace — log the ntc advance.  If TX_SUB
-	 * fires but no matching TX_DONE follows within ~tens of ms, the QDMA
-	 * H2C engine is stuck (descriptor fetched but no writeback) — the
-	 * drop is HW/shell-side, not a SW path issue. */
-	if (onic_debug_level >= ONIC_DBG_XPATH && work > 0) {
-		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + q->qid) : q->qid;
-		pr_info("[DBG_XPATH] TX_DONE %s qid=%u abs_qid=%u cidx_advance=%u->%u work=%d wb_cidx=%u cpu=%d ts=%llu\n",
-			netdev_name(q->netdev), q->qid, abs_qid_dbg,
-			ntc_old_dbg, ring->next_to_clean, work, wb.cidx,
-			smp_processor_id(), ktime_get_ns());
 	}
 
 	clear_bit(0, q->state);
@@ -248,9 +232,12 @@ static int onic_xmit_xdp_ring(struct onic_private *priv,struct  onic_tx_queue  *
 	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
 	desc.len = xdpf->len;
 	desc.src_addr = dma_addr;
-	/* metadata=0 → cdh_flags=0, pld_len=0 (no Custom Data Header). EQDMA5
-	 * silently drops packets where cdh_flags is set without matching CDH. */
-	desc.metadata = 0;
+	/* metadata[15:0] is consumed by the shell as the AXI-Stream packet length
+	 * sideband (qdma_subsystem_function.sv tkeep generator).  Zero here makes
+	 * the last beat's tkeep default to all-1s, so CMAC sees the full 64-byte
+	 * beat as valid and emits oversize frames (e.g. 1514B → 1536B on wire).
+	 * Must equal the actual packet length. */
+	desc.metadata = xdpf->len & 0xFFFF;
 	qdma_pack_h2c_st_desc(desc_ptr, &desc);
 
 	tx_queue->buffer[ring->next_to_use].xdpf = xdpf;
@@ -405,17 +392,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	if (qid < priv->num_tx_queues)
 		onic_tx_clean(priv->tx_queue[qid]);
 
-	/* [DBG_XPATH] RX_POLL_START — fires once per NAPI poll invocation.
-	 * Useful for: "is NAPI being woken on the right CPU/queue?" and "are
-	 * both CMACs' polls coscheduled on the same core?" (CPU + ts). */
-	if (onic_debug_level >= ONIC_DBG_XPATH) {
-		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-		pr_info("[DBG_XPATH] RX_POLL_START %s qid=%u abs_qid=%u budget=%d cpu=%d ts=%llu\n",
-			netdev_name(q->netdev), qid, abs_qid_dbg, budget,
-			smp_processor_id(), ktime_get_ns());
-	}
-
 	cmpl_ptr =
 		cmpl_ring->desc + QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean;
 	cmpl_stat_ptr =
@@ -449,14 +425,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	}
 
 	if (cmpl.err == 1) {
-		if (onic_debug_level >= ONIC_DBG_XPATH) {
-			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-			pr_info("[DBG_XPATH] RX_DROP %s qid=%u abs_qid=%u reason=cmpl_err len=%u ntc=%u pidx=%u\n",
-				netdev_name(q->netdev), qid, abs_qid_dbg,
-				cmpl.pkt_len, cmpl_ring->next_to_clean,
-				cmpl_stat.pidx);
-		}
 		netdev_warn(q->netdev, "completion error at ntc=%u pidx=%u — rescheduling",
 			    cmpl_ring->next_to_clean, cmpl_stat.pidx);
 		/* Do not disarm the global error IRQ here; onic_error_thread_fn
@@ -513,34 +481,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 
 				skb->protocol = eth_type_trans(skb, q->netdev);
 				skb_record_rx_queue(skb, qid);
-
-				/* [DBG_XPATH] RX_PKT — fires per delivered packet.
-				 * Use to confirm packets actually arrive on this
-				 * netdev's queue.  src_ip lets you correlate ICMP
-				 * echo-reply with the originating ping. */
-				if (onic_debug_level >= ONIC_DBG_XPATH) {
-					struct qdma_dev *qdev_dbg =
-						(struct qdma_dev *)priv->hw.qdma;
-					u16 abs_qid_dbg = qdev_dbg ?
-						(qdev_dbg->q_base + qid) : qid;
-					if (skb->protocol == htons(ETH_P_IP) &&
-					    skb_network_header(skb) >= skb->data) {
-						pr_info("[DBG_XPATH] RX_PKT %s qid=%u abs_qid=%u len=%u proto=0x%04x src_ip=%pI4 cpu=%d ts=%llu\n",
-							netdev_name(q->netdev),
-							qid, abs_qid_dbg, len,
-							ntohs(skb->protocol),
-							&ip_hdr(skb)->saddr,
-							smp_processor_id(),
-							ktime_get_ns());
-					} else {
-						pr_info("[DBG_XPATH] RX_PKT %s qid=%u abs_qid=%u len=%u proto=0x%04x src_ip=non-ip cpu=%d ts=%llu\n",
-							netdev_name(q->netdev),
-							qid, abs_qid_dbg, len,
-							ntohs(skb->protocol),
-							smp_processor_id(),
-							ktime_get_ns());
-					}
-				}
 
 				/* Deliver RX hardware timestamp from 16B completion.
 				 *
@@ -660,45 +600,9 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	if (cmpl_ring->next_to_clean != cmpl_stat.pidx)
 		napi_schedule(&q->napi);
 
-	/* [DBG_XPATH] RX_POLL_END — normal (napi_complete_done) exit path.
-	 * If processed=0 with budget=64 fires repeatedly on enp1s0d1 while
-	 * enp1s0 is also active, NAPI is being woken without work — likely
-	 * shared IRQ vector / spurious schedule.  RX_RING gives ring fill
-	 * level so we can distinguish "ring empty, NAPI spurious" from
-	 * "ring full, but completion ring stuck". */
-	if (onic_debug_level >= ONIC_DBG_XPATH) {
-		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-		u16 dr_cnt = onic_ring_get_real_count(desc_ring);
-		u16 nte = desc_ring->next_to_use;
-		u16 ntc = desc_ring->next_to_clean;
-		u16 fill = (dr_cnt > 0) ? ((nte - ntc) % dr_cnt) : 0;
-		pr_info("[DBG_XPATH] RX_POLL_END %s qid=%u abs_qid=%u processed=%d done=1 cpu=%d ts=%llu\n",
-			netdev_name(q->netdev), qid, abs_qid_dbg, work,
-			smp_processor_id(), ktime_get_ns());
-		pr_info("[DBG_XPATH] RX_RING %s qid=%u abs_qid=%u ntc=%u nte=%u rng=%u fill=%u cmpl_ntc=%u cmpl_pidx=%u\n",
-			netdev_name(q->netdev), qid, abs_qid_dbg,
-			ntc, nte, dr_cnt, fill,
-			cmpl_ring->next_to_clean, cmpl_stat.pidx);
-	}
 	return work;
 
 out_of_budget:
-	if (onic_debug_level >= ONIC_DBG_XPATH) {
-		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-		u16 dr_cnt = onic_ring_get_real_count(desc_ring);
-		u16 nte = desc_ring->next_to_use;
-		u16 ntc = desc_ring->next_to_clean;
-		u16 fill = (dr_cnt > 0) ? ((nte - ntc) % dr_cnt) : 0;
-		pr_info("[DBG_XPATH] RX_POLL_END %s qid=%u abs_qid=%u processed=%d done=0 cpu=%d ts=%llu\n",
-			netdev_name(q->netdev), qid, abs_qid_dbg, work,
-			smp_processor_id(), ktime_get_ns());
-		pr_info("[DBG_XPATH] RX_RING %s qid=%u abs_qid=%u ntc=%u nte=%u rng=%u fill=%u cmpl_ntc=%u cmpl_pidx=%u\n",
-			netdev_name(q->netdev), qid, abs_qid_dbg,
-			ntc, nte, dr_cnt, fill,
-			cmpl_ring->next_to_clean, cmpl_stat.pidx);
-	}
 	return work;
 }
 
@@ -1159,56 +1063,6 @@ int onic_open_netdev(struct net_device *dev)
 	if (rv < 0)
 		goto stop_netdev;
 
-	/* [SEC_DIAG] After all per-queue contexts have been written, read
-	 * back the H2C SW context for relative qid 0 of THIS netdev.  For
-	 * the primary (q_base=0) this is absolute qid 0; for the secondary
-	 * (q_base=64) it is absolute qid 64.  This is the load-bearing
-	 * diagnostic for hypothesis #2: if W1 bit 0 (qen) is 0 or W2:W3
-	 * (desc_base) is zero/wrong, queue 64's context did not land in
-	 * the right indirect slot and that explains why doorbell rings
-	 * are silently ignored on the secondary path. */
-	{
-		struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
-		u32 raw[8] = {0};
-		int rrv;
-
-		rrv = qdma_read_sw_ctxt_raw(qdev, 0, QDMA_H2C, raw);
-		pr_info("[SEC_DIAG] SW_CTXT abs_qid=%u H2C (cmac_id=%u q_base=%u rel_qid=0 rv=%d): W0=0x%08x W1=0x%08x W2=0x%08x W3=0x%08x W4=0x%08x W5=0x%08x W6=0x%08x W7=0x%08x\n",
-			qdev->q_base + 0, priv->cmac_id, qdev->q_base, rrv,
-			raw[0], raw[1], raw[2], raw[3],
-			raw[4], raw[5], raw[6], raw[7]);
-		pr_info("[SEC_DIAG] SW_CTXT abs_qid=%u H2C decoded: qen=%u desc_base=0x%08x%08x pidx=%u func_id=%u\n",
-			qdev->q_base + 0,
-			raw[1] & 0x1,
-			raw[3], raw[2],
-			raw[0] & 0xFFFF,
-			(raw[0] >> 17) & 0xFF);
-
-		/* [SEC_DIAG] Companion HW context readback.  cidx is the
-		 * load-bearing field: if cidx == 0 after a real ping attempt
-		 * the QDMA engine never fetched a descriptor from this queue
-		 * (so the bug is queue programming / QDMA-side gating).  If
-		 * cidx advances, the engine emitted packets and the bug is
-		 * downstream (shell, plugin RTL, CMAC).  Bit positions per
-		 * qdma_legacy/qdma_context.h:208-216 (struct qdma_hw_ctxt). */
-		{
-			u16 rel_qid = 0;
-			enum qdma_dir dir = QDMA_H2C;
-			u32 hw_raw[2] = {0};
-			int rv2 = qdma_read_hw_ctxt_raw(qdev, rel_qid, dir,
-							hw_raw, 2);
-			pr_info("[SEC_DIAG] HW_CTXT abs_qid=%u dir=%d (q_base=%u rel_qid=%u rv=%d): W0=0x%08x W1=0x%08x cidx=%u crd_use=%u idl_stp_b=%u dsc_pnd=%u evt_pnd=%u\n",
-				qdev->q_base + rel_qid, dir, qdev->q_base,
-				rel_qid, rv2,
-				hw_raw[0], hw_raw[1],
-				hw_raw[0] & 0xFFFF,           /* cidx */
-				(hw_raw[0] >> 16) & 0xFFFF,   /* crd_use */
-				(hw_raw[1] >> 9) & 0x1,       /* idl_stp_b */
-				(hw_raw[1] >> 8) & 0x1,       /* dsc_pnd */
-				(hw_raw[1] >> 10) & 0x1);     /* evt_pnd */
-		}
-	}
-
 	netif_tx_start_all_queues(dev);
 
 	/* Re-enable CMAC RX (and TX, RS-FEC, flow control) for this PF's CMAC.
@@ -1254,51 +1108,6 @@ int onic_stop_netdev(struct net_device *dev)
 	struct onic_hardware *hw = &priv->hw;
 	int qid;
 
-	/* [SEC_DIAG_FINAL] Snapshot HW context for every queue on this netdev
-	 * BEFORE we touch anything (queue stop, ring teardown, doorbell
-	 * silencing).  The cidx field tells us whether the QDMA engine
-	 * actually consumed any descriptors from this queue.  Compare CMAC0
-	 * (q_base=0) values vs CMAC1 (q_base=64) values:
-	 *   - both H2C cidx > 0  => QDMA fetches fine on both; CMAC1 bug is
-	 *                           shell-side / plugin RTL / CMAC.
-	 *   - CMAC0 H2C cidx > 0, CMAC1 H2C cidx == 0
-	 *                        => QDMA engine never advanced past PIDX=0
-	 *                           on the secondary queues; bug is in queue
-	 *                           programming or QDMA-side gating.
-	 *   - both H2C cidx == 0 => no TX traffic was actually pushed (test
-	 *                           setup issue; rerun with real ping).
-	 * Tagged separately from open-time SEC_DIAG so it greps clean. */
-	{
-		struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
-		int q;
-
-		if (qdev) {
-			for (q = 0; q < priv->num_tx_queues; ++q) {
-				u32 hw_raw[2] = {0};
-				int rv2 = qdma_read_hw_ctxt_raw(qdev, q,
-								QDMA_H2C,
-								hw_raw, 2);
-				pr_info("[SEC_DIAG_FINAL] %s abs_qid=%u dir=0 cidx=%u dsc_pnd=%u (rv=%d W0=0x%08x W1=0x%08x)\n",
-					netdev_name(dev),
-					qdev->q_base + q,
-					hw_raw[0] & 0xFFFF,
-					(hw_raw[1] >> 8) & 0x1,
-					rv2, hw_raw[0], hw_raw[1]);
-			}
-			for (q = 0; q < priv->num_rx_queues; ++q) {
-				u32 hw_raw[2] = {0};
-				int rv2 = qdma_read_hw_ctxt_raw(qdev, q,
-								QDMA_C2H,
-								hw_raw, 2);
-				pr_info("[SEC_DIAG_FINAL] %s abs_qid=%u dir=1 cidx=%u dsc_pnd=%u (rv=%d W0=0x%08x W1=0x%08x)\n",
-					netdev_name(dev),
-					qdev->q_base + q,
-					hw_raw[0] & 0xFFFF,
-					(hw_raw[1] >> 8) & 0x1,
-					rv2, hw_raw[0], hw_raw[1]);
-			}
-		}
-	}
 
 	onic_stop_link_watchdog(priv);
 
@@ -1355,16 +1164,8 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	onic_tx_clean(q);
 
-	if (unlikely(onic_ring_full(ring))) {
-		if (onic_debug_level >= ONIC_DBG_XPATH) {
-			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-			pr_info("[DBG_XPATH] TX_BUSY %s qid=%u abs_qid=%u reason=ring_full ntu=%u ntc=%u\n",
-				netdev_name(dev), qid, abs_qid_dbg,
-				ring->next_to_use, ring->next_to_clean);
-		}
+	if (unlikely(onic_ring_full(ring)))
 		return NETDEV_TX_BUSY;
-	}
 
 	rv = skb_put_padto(skb, ETH_ZLEN);
 	if (rv < 0) {
@@ -1376,12 +1177,6 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 				  DMA_TO_DEVICE);
 
 	if (unlikely(dma_mapping_error(&priv->pdev->dev, dma_addr))) {
-		if (onic_debug_level >= ONIC_DBG_XPATH) {
-			struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-			u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-			pr_info("[DBG_XPATH] TX_DROP %s qid=%u abs_qid=%u reason=dma_map_err len=%u\n",
-				netdev_name(dev), qid, abs_qid_dbg, skb->len);
-		}
 		dev_kfree_skb(skb);
 		pcpu_stats_pointer->tx_dropped++;
 		pcpu_stats_pointer->tx_errors++;
@@ -1391,10 +1186,13 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
 	desc.len = skb->len;
 	desc.src_addr = dma_addr;
-	/* metadata=0 → cdh_flags=0, pld_len=0 (no Custom Data Header). EQDMA5
-	 * silently drops packets where cdh_flags is set without matching CDH.
-	 * PTP path below overrides this with its tag encoding. */
-	desc.metadata = 0;
+	/* metadata[15:0] is consumed by the shell as the AXI-Stream packet length
+	 * sideband (qdma_subsystem_function.sv tkeep generator).  Zero here makes
+	 * the last beat's tkeep default to all-1s, so CMAC sees the full 64-byte
+	 * beat as valid and emits oversize frames (e.g. 1514B → 1536B on wire).
+	 * Must equal the actual packet length.  PTP path below ORs the tag into
+	 * the upper 16 bits while keeping the length in the lower 16. */
+	desc.metadata = skb->len & 0xFFFF;
 
 	/* TX PTP hardware timestamp: embed the PTP tag into desc.metadata */
 	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
@@ -1426,29 +1224,6 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	pcpu_stats_pointer->tx_packets++;
 	pcpu_stats_pointer->tx_bytes += skb->len;
-
-	/* [DBG_XPATH] TX submission trace — fires before doorbell.  Captures
-	 * src netdev, relative + absolute qid (q_base distinguishes CMAC0 vs
-	 * CMAC1), skb length, ethertype, dst IP if v4, and a monotonic ns
-	 * timestamp for cross-correlation with TX_DONE / RX_PKT. */
-	if (onic_debug_level >= ONIC_DBG_XPATH) {
-		struct qdma_dev *qdev_dbg = (struct qdma_dev *)priv->hw.qdma;
-		u16 abs_qid_dbg = qdev_dbg ? (qdev_dbg->q_base + qid) : qid;
-		__be16 proto = skb->protocol;
-		if (proto == htons(ETH_P_IP) && skb_network_header(skb) >= skb->data) {
-			pr_info("[DBG_XPATH] TX_SUB %s qid=%u abs_qid=%u skb_len=%u proto=0x%04x dst_ip=%pI4 ntu=%u ntc=%u cpu=%d ts=%llu\n",
-				netdev_name(dev), qid, abs_qid_dbg, skb->len,
-				ntohs(proto), &ip_hdr(skb)->daddr,
-				ring->next_to_use, ring->next_to_clean,
-				smp_processor_id(), ktime_get_ns());
-		} else {
-			pr_info("[DBG_XPATH] TX_SUB %s qid=%u abs_qid=%u skb_len=%u proto=0x%04x dst_ip=non-ip ntu=%u ntc=%u cpu=%d ts=%llu\n",
-				netdev_name(dev), qid, abs_qid_dbg, skb->len,
-				ntohs(proto),
-				ring->next_to_use, ring->next_to_clean,
-				smp_processor_id(), ktime_get_ns());
-		}
-	}
 
 	onic_ring_increment_head(ring);
 
