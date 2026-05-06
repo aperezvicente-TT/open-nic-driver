@@ -788,24 +788,61 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 		for (e = 0; e < 2; e++) {
 			row_base = ernic_bases[e] + pd->pdn * 0x100;
 			iowrite32(pd->pdn,                         mmio + row_base + 0x00);
-			/* PDT VIRTADDR = DDR4 buf_addr (RecoNIC convention, see
-			 * RecoNIC/examples/rdma_test/write.c:414 — exchanges the DDR4
-			 * dma_addr as `write_offset_server`).  Our test harness
-			 * (tests/rdma_write_bw) hardcodes remote_addr = the DDR4
-			 * 0xA3500000_0040_0000 slot, so VIRTADDR must equal buf_addr
-			 * for the responder's range check (remote_addr ∈ [VIRTADDR,
-			 * VIRTADDR+length]) to pass.  With VIRTADDR=user_va the check
-			 * fails on every WRITE → silent drop classified as INVDUP.
-			 * 2026-05-04 second attempt — first attempt reverted in
-			 * confusion, retrying with live monitor for clean read. */
-			iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x04);
-			iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x08);
-			iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x0C);
-			iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x10);
-			iowrite32(mr->rkey & 0xffu,                mmio + row_base + 0x14);
-			iowrite32((u32)(length & 0xffffffffu),     mmio + row_base + 0x18);
-			iowrite32(((u32)(length >> 16) & 0xffff0000u) |
-				  ((u32)mr->access & 0x3),         mmio + row_base + 0x1C);
+			/* PDT row layout per PG332 v4.2 Table 8 (line 1454-1505):
+			 *   0x00 PDPDNUM       (24-bit PD number)
+			 *   0x04 VIRTADDRLSB   (virtual address LSB — the buffer's VA
+			 *                       as the application sees it; the
+			 *                       incoming WRITE RETH carries this VA;
+			 *                       ERNIC range-checks remote_addr in
+			 *                       [VIRTADDR, VIRTADDR+length])
+			 *   0x08 VIRTADDRMSB   (VA MSB)
+			 *   0x0C BUFBASEADDRLSB(physical/DDR4 buffer addr LSB —
+			 *                       where ERNIC actually writes via M_AXI;
+			 *                       must be the 0xA3500000-tagged DDR4 slot
+			 *                       for routing through sys_mem_5to2 M01)
+			 *   0x10 BUFBASEADDRMSB(buf addr MSB)
+			 *   0x14 BUFRKEY       (8-bit R_KEY)
+			 *   0x18 WRRDBUFLEN    (length LSB)
+			 *   0x1C ACCESSDESC    ([3:0]: 0000=R, 0001=W, 0010=RW,
+			 *                       others NOT SUPPORTED;
+			 *                       [31:16]: length MSB)
+			 *
+			 * 2026-05-06 fixes (after PG332 read):
+			 * (1) VIRTADDR was previously buf_addr; standard verbs (perftest,
+			 *     rdma_cm apps) carry the user VA in WRITE RETH so the
+			 *     range check failed with bit-20 syndrome on every WRITE.
+			 *     Now VIRTADDR = mr->va (user VA from reg_user_mr).
+			 * (2) ACCESSDESC was `mr->access & 0x3` which for verbs flags
+			 *     LOCAL_WRITE|REMOTE_WRITE = 0x3 produced encoding "0011"
+			 *     which PG332 lists as "Not supported" → bit-20 fail.
+			 *     Map verbs flags to ERNIC encoding explicitly:
+			 *       no remote access     → 0b0000 (engine unusable)
+			 *       REMOTE_WRITE only    → 0b0001
+			 *       REMOTE_READ only     → 0b0000
+			 *       REMOTE_WRITE + READ  → 0b0010
+			 */
+			{
+				u32 access_enc = 0;
+				bool can_write =
+				    !!(mr->access & IB_ACCESS_REMOTE_WRITE);
+				bool can_read  =
+				    !!(mr->access & IB_ACCESS_REMOTE_READ);
+				if (can_write && can_read)
+					access_enc = 0x2;   /* Read and Write */
+				else if (can_write)
+					access_enc = 0x1;   /* Write Only */
+				else
+					access_enc = 0x0;   /* READ Only */
+
+				iowrite32((u32)(mr->va & 0xffffffffu),     mmio + row_base + 0x04);
+				iowrite32((u32)(mr->va >> 32),             mmio + row_base + 0x08);
+				iowrite32((u32)(buf_addr & 0xffffffffu),   mmio + row_base + 0x0C);
+				iowrite32((u32)(buf_addr >> 32),           mmio + row_base + 0x10);
+				iowrite32(mr->rkey & 0xffu,                mmio + row_base + 0x14);
+				iowrite32((u32)(length & 0xffffffffu),     mmio + row_base + 0x18);
+				iowrite32(((u32)(length >> 16) & 0xffff0000u) |
+					  (access_enc & 0xfu),             mmio + row_base + 0x1C);
+			}
 			(void)ioread32(mmio + row_base + 0x00);   /* posted-write flush */
 		}
 	}
@@ -1050,6 +1087,20 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		iowrite32(0, mmio + q + 0x04);      /* QPADVCONFi */
 		iowrite32(0, mmio + q + 0x3C);      /* QDEPTHi */
 		iowrite32(0, mmio + q + 0xB0);      /* PDi */
+
+		/* Reset PSN tracking state. Without this, LSTRQREQi (responder's
+		 * last-received PSN) and SQPSNi (sender's outgoing PSN) carry the
+		 * prior QP's values into the next QP that lands at this slot. The
+		 * next R->I rewrites these via onic_modify_qp_init_to_rtr (LSTRQREQi
+		 * @ 0x44) and rtr_to_rts (SQPSNi @ 0x40), but in the gap between
+		 * destroy_qp clearing QPEN and the new RTR programming, an
+		 * incoming packet validates against stale state -> syndrome 21
+		 * (PSN sequence error) -> silent INALLDRP increment. Explains the
+		 * "first run hangs / second run works" pattern observed since
+		 * project_b7_first_pingpong_2026_05_03.
+		 * 2026-05-06 fix: zero them at destroy. */
+		iowrite32(0, mmio + q + 0x40);      /* SQPSNi */
+		iowrite32(0, mmio + q + 0x44);      /* LSTRQREQi */
 
 		/* XRNIC_CONF_QP_EN is a per-QP bitmap (PG332 §Table 8 line 996
 		 * documents it as a count but actual hardware uses bits — see
