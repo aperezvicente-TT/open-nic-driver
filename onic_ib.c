@@ -30,12 +30,22 @@
  * onic_poll_cq then reads the CQ producer index from the host page
  * instead of issuing an MMIO read of QCSR CQHEADi (saves one PCIe
  * round-trip per poll, ~1 µs on Gen3 x16). */
-static bool host_doorbell = true;
+/* Default DISABLED 2026-05-07: cadence trace at onic_poll_cq:2086 showed
+ * cqhead_page=1 vs cqhead_mmio=5 with all 5 CQEs actually produced (sqpi=
+ * statcursqptr=5, inampkt=10).  ERNIC writes the host-coherent page once
+ * on the first completion and never again — PG332 calls the sideband
+ * notification a "completion count" (singular), not increment-per-WQE.
+ * The kernel poll_cq reads page=1, returns 1 completion, then loops
+ * forever returning 0 (~7000 spins per stalled WRITE batch).
+ *
+ * Until perf #1 is repaired (rearm CQDBADDi/CQDBADDMSBi after each poll,
+ * or per-QP coherent page that survives modify_qp), default to MMIO
+ * polling.  Set host_doorbell=1 explicitly to reproduce the bug. */
+static bool host_doorbell = false;
 module_param(host_doorbell, bool, 0444);
 MODULE_PARM_DESC(host_doorbell,
 	"Perf #1: use a host coherent page for ERNIC CQ/RQ doorbell DMA "
-	"(default true).  Set to 0 to fall back to DDR4-tagged doorbell "
-	"targets (the pre-Perf-#1 behaviour).");
+	"(default false; enable to reproduce the page-stuck-at-1 bug).");
 
 /* ====================================================================
  * Dual-ERNIC helpers — verb-path register access.
@@ -360,7 +370,14 @@ static void onic_ernic_global_init(struct onic_ib_dev *dev, u8 port_num)
 	const u32        num_qp            = 8;        /* matches sim default */
 	const u32        en_ernic          = 1;
 	const u32        err_buf_en        = 1;
-	const u32        tx_ack_gen        = 0;
+	/* XRNICCONF[4:3]: TX-ACK generation policy.  PG332 v4.2 line 1511-1516.
+	 *   00 = ACK on explicit-request OR coalesce-timeout (default).
+	 *   10 = ACK only on explicit request — disables coalesce-timeout path.
+	 * Multi-packet WRITEs ≥3 frames send unacked MIDDLE frames; if the
+	 * coalesce-timeout fires before LAST arrives, the responder may NAK
+	 * mid-burst and confuse the requester's PSN window (issue 1).  Set to
+	 * 10 to kill the timeout path and isolate. */
+	const u32        tx_ack_gen        = 2;
 	const u32        sw_override_en    = 0;
 	const u32        retry_cnt_fatal_d = 1;
 	const u32        base_count_width  = 10;       /* 250 MHz axil_aclk */
@@ -724,8 +741,17 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 	mr->ddr_off = ddr_off;
 	mr->length  = length;
 	mr->access  = access_desc & 0x3;
-	mr->lkey    = pd->pdn;
-	mr->rkey    = pd->pdn;
+	/* ERNIC IP uses wire RETH.RKey upper byte as MR_INDEX into the PDT
+	 * (PG332 v4.2 Figure 9 — confirmed empirically 2026-05-06 via
+	 * tools/ernic-baremetal: wire RKey = (idx<<8)|key_byte makes ERNIC
+	 * look up PDT[idx]; raw key_byte makes it look up PDT[0] which is
+	 * unused, triggering FATAL_CODE 0x17 on every WRITE).  Encode pdn
+	 * in bits [15:8] AND in [7:0] so PDT[pdn] is selected and BUFRKEY
+	 * (low 8 bits) matches.  See project_b7_baremetal_isolation_2026_05_06. */
+	mr->lkey    = (pd->pdn << 8) | (pd->pdn & 0xff);
+	mr->rkey    = (pd->pdn << 8) | (pd->pdn & 0xff);
+	pr_info("onic_ib: mr->rkey set to 0x%08x (pd->pdn=%u)\n",
+		mr->rkey, pd->pdn);
 
 	/* Perf #3 — populate the DDR4 mirror with the user buffer's contents.
 	 * Eager copy: snapshot at registration time, no ongoing pinning.
@@ -842,8 +868,22 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 				iowrite32((u32)(length & 0xffffffffu),     mmio + row_base + 0x18);
 				iowrite32(((u32)(length >> 16) & 0xffff0000u) |
 					  (access_enc & 0xfu),             mmio + row_base + 0x1C);
+				(void)ioread32(mmio + row_base + 0x00);
+				pr_info("onic_ib: PDT[%u]@ernic%d va=0x%llx buf=0x%llx rkey=%u len=%llu accdesc=0x%x readback: 04=%08x 08=%08x 0C=%08x 10=%08x 14=%08x 18=%08x 1C=%08x\n",
+					pd->pdn, e,
+					(unsigned long long)mr->va,
+					(unsigned long long)buf_addr,
+					(unsigned)(mr->rkey & 0xff),
+					(unsigned long long)length,
+					(unsigned)(((u32)(length >> 16) & 0xffff0000u) | (access_enc & 0xfu)),
+					ioread32(mmio + row_base + 0x04),
+					ioread32(mmio + row_base + 0x08),
+					ioread32(mmio + row_base + 0x0C),
+					ioread32(mmio + row_base + 0x10),
+					ioread32(mmio + row_base + 0x14),
+					ioread32(mmio + row_base + 0x18),
+					ioread32(mmio + row_base + 0x1C));
 			}
-			(void)ioread32(mmio + row_base + 0x00);   /* posted-write flush */
 		}
 	}
 
@@ -1836,18 +1876,28 @@ static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 	wqe.laddr_high = cpu_to_le32(upper_32_bits(laddr_axi));
 
 	if (wr->opcode == IB_WR_SEND) {
-		/* For SEND, r_key is unused; PD-derived rkey is a sentinel. */
-		wqe.r_key = cpu_to_le32(qp->pd->pdn & 0xffu);
+		/* For SEND, r_key is unused; PD-derived rkey is a sentinel.
+		 * Encode pdn in upper byte too in case ERNIC inspects it. */
+		wqe.r_key = cpu_to_le32((qp->pd->pdn << 8) |
+					(qp->pd->pdn & 0xffu));
 	} else {
 		/* RDMA_WRITE: target's remote_addr + rkey go in the WQE.  The
 		 * receiver's ERNIC translates remote_addr through its PDT row
 		 * (programmed by reg_user_mr at the receiver) into a DDR4
-		 * destination offset on the receiver. */
+		 * destination offset on the receiver.
+		 *
+		 * 2026-05-06 fix: drop the `& 0xffu` mask.  ERNIC IP uses the
+		 * upper byte of wire RETH.RKey as MR_INDEX into the receiver
+		 * PDT (PG332 v4.2 Figure 9 — confirmed empirically via
+		 * tools/ernic-baremetal).  reg_user_mr now sets
+		 * mr->rkey = (pdn<<8)|pdn so the full value must propagate.
+		 * Old `& 0xffu` truncation made wire RKey=0x01 → MR_INDEX=0
+		 * → PDT[0] (uninit) → FATAL_CODE 0x17 on every WRITE. */
 		wqe.remote_offset_low  =
 			cpu_to_le32(lower_32_bits(rdma_wr(wr)->remote_addr));
 		wqe.remote_offset_high =
 			cpu_to_le32(upper_32_bits(rdma_wr(wr)->remote_addr));
-		wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey & 0xffu);
+		wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey);
 	}
 
 	/* Land the 64 B WQE in DDR4 at qp->sq_ddr_off + slot * 64.  Uses
@@ -2022,16 +2072,35 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 
 	/* DEBUG-perf5: cadence trace — gap between consecutive poll_cq calls
 	 * tells us if the 24ms/spin is userspace cadence or kernel/HW.
+	 * Now also disambiguates host-coherent doorbell page vs MMIO CQHEADi
+	 * (perf #1 sanity check) and snapshots the 4 counters that decide
+	 * whether the spin is wire-side starvation (issue 1, multi-packet
+	 * PSN) vs CQ-doorbell coherency (issue 2, real perf #5):
+	 *   - hdb_cq vs CQHEADi: if they disagree, perf #1 write target is
+	 *     bogus.  If they agree but lag SQPIi, see next two.
+	 *   - STATCURSQPTRi: engine's TX cursor.  Tracks SQPIi when engine
+	 *     is making forward progress.
+	 *   - INAMPKT vs OUTAMPKT: ACKs received vs ACKs sent.  If CQHEAD
+	 *     ≈ INAMPKT and STATCURSQPTRi == SQPIi, the spin is *correct*:
+	 *     ERNIC's CQ engine is gated by ACK arrival, not stale reads.
 	 * Remove once perf #5 is closed. */
 	{
 		static u64 _last_poll_ns;
 		u64 _now = ktime_get_ns();
 		u64 _delta = _last_poll_ns ? (_now - _last_poll_ns) : 0;
+		u32 _q     = onic_qcsr(qp, 0x00);
+		u32 _gcsr  = qp->ernic_base + 0x00100000u;
+		u32 _cqh_mmio = ioread32(mmio + _q + 0x30);
+		u32 _cqh_page = qp->hdb_cq ? le32_to_cpu(READ_ONCE(*qp->hdb_cq)) : 0xffffffffu;
 		_last_poll_ns = _now;
-		pr_info("onic_poll_cq qp=%u hdb=%d delta_ns=%llu cqhead_pre=%u\n",
+		pr_info("onic_poll_cq qp=%u hdb=%d delta_ns=%llu cqhead_page=%u cqhead_mmio=%u sqpi=%u statcursqptr=%u statssn=%08x outampkt=%u inampkt=%u\n",
 			qp->qp_num, qp->hdb_active ? 1 : 0, _delta,
-			qp->hdb_active ? le32_to_cpu(READ_ONCE(*qp->hdb_cq))
-					: ioread32(mmio + onic_qcsr(qp, 0x30)));
+			_cqh_page, _cqh_mmio,
+			ioread32(mmio + _q + 0x38),
+			ioread32(mmio + _q + 0x8C),
+			ioread32(mmio + _q + 0x80),
+			ioread32(mmio + _gcsr + 0x10C),
+			ioread32(mmio + _gcsr + 0x104));
 	}
 
 	/* Perf #1 — read CQ producer index from the host coherent doorbell
