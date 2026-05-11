@@ -43,12 +43,31 @@ enum ernic_qp_state {
  * allocation -- causing exactly one received packet to land correctly
  * (in slot 0) and every subsequent packet to land outside the buffer
  * and be silently dropped (INALLDRPPKTCNT++).
- * 2026-05-03 fix: program 2 -> 512 B per RQE element.  Driver lays
- * out RQ slots at 512 B stride (`s * 512` per onic_ib.c:1279) and
- * libreconic also uses 512 B (programs `RQE_SIZE>>8 = 2`).  Earlier
- * value of 1 (256 B stride) caused driver vs ERNIC to disagree on
- * slot offsets. */
-#define ERNIC_RQE_SIZE_FIELD 2u
+ *
+ * 2026-05-10: bumped 2 -> 16 to support 4096-byte SENDs.  Empirical
+ * size sweep on ibv_rc_pingpong showed -s 512 worked and -s 513
+ * failed with FATAL_CODE 0x02 ("Req pkt length / Pad count fail",
+ * PG332 Table 5).  Server's IPKTERRQ confirmed the receive buffer
+ * was overflowing because the 512-B per-slot stride couldn't hold a
+ * single-packet SEND larger than 512 B.  With value 16 each RQ slot
+ * gets 4096 B; total RQ region is still 4 KiB (= 1 slot), so
+ * rq_depth is clamped at 1 in onic_create_qp.  Multi-depth support
+ * for 4096-B payloads requires bumping ONIC_DDR_QUEUE_SLOT_SIZE
+ * beyond 16 KiB and re-partitioning the per-QP DDR4 slot.
+ *
+ * Earlier values:
+ *   2  -> 512 B per RQE element (2026-05-03 fix, ibv_rc_pingpong
+ *         worked at <=512 B but failed for larger SENDs).
+ *   1  -> 256 B stride caused driver vs ERNIC slot-offset disagree. */
+#define ERNIC_RQE_SIZE_FIELD 16u
+
+/* Maximum RQ depth supported by the current 4 KiB RQ region per QP
+ * (ONIC_DDR_QUEUE_RQ_OFF .. ONIC_DDR_QUEUE_CQ_OFF) at the configured
+ * RQE size.  Clamped against userspace's requested max_recv_wr in
+ * onic_create_qp to keep slot 1+ from overflowing into the CQ
+ * region. */
+#define ERNIC_RQE_BUFFER_BYTES   (ERNIC_RQE_SIZE_FIELD * 256u)
+#define ERNIC_MAX_RQ_DEPTH       (0x1000u / ERNIC_RQE_BUFFER_BYTES)
 
 /* B7 — packed ERNIC SQ WQE, 64 bytes.  Layout per
  * reference_ernic_wqe_spec.md §2 / libreconic/rdma_api.h:138-158. */

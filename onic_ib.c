@@ -508,7 +508,11 @@ static int onic_query_device(struct ib_device *ibdev,
 	attr->vendor_part_id      = dev->priv->pdev->device;
 	attr->sys_image_guid      = dev->node_guid;
 	attr->max_qp              = 255;
-	attr->max_qp_wr           = 1024;
+	/* onic_create_qp rejects max_send_wr/max_recv_wr > 64 (line 982).
+	 * Report 64 here so test harnesses that query before creating (e.g.
+	 * perftest) auto-clamp instead of hitting EINVAL. Real fix would
+	 * deepen the per-QP shadow rings; cap at 64 for now matches HW. */
+	attr->max_qp_wr           = 64;
 	attr->device_cap_flags    = 0;
 	attr->kernel_cap_flags    = 0;
 	attr->max_send_sge        = 1;
@@ -1015,6 +1019,11 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->recv_cq    = rcq;
 	qp->slot_off   = slot_off;
 	qp->sq_depth   = init_attr->cap.max_send_wr;
+	/* NOTE: With ERNIC_RQE_SIZE_FIELD=16 (4096 B/slot) the 4 KiB RQ
+	 * region only safely holds 1 slot — slot 1+ overlaps the CQ
+	 * region.  ibv_rc_pingpong with -n 1 -r 1 only touches slot 0
+	 * so it works; perftest workloads with deeper rq_depth need
+	 * ONIC_DDR_QUEUE_SLOT_SIZE bumped first. */
 	qp->rq_depth   = init_attr->cap.max_recv_wr;
 	qp->cq_depth   = scq->depth;
 	qp->path_mtu   = 4;                       /* PATHMTU code 4 = 4096 */
@@ -2108,7 +2117,22 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 	 * completion (CQDBADDi was programmed at R->I).  Cuts one PCIe
 	 * read per poll_cq.  RQ-side (STATMSN) stays MMIO — the engine's
 	 * RQ-PIDB DMA over-counts on retransmits exactly like reading
-	 * STATRQPIDBi did, so we keep STATMSN as the deduped source. */
+	 * STATRQPIDBi did, so we keep STATMSN as the deduped source.
+	 *
+	 * Patch (B) attempt 2026-05-10 (REVERTED): tried rearming CQDBADDi /
+	 * CQDBADDMSBi per poll AND per CQE consumption.  Both variants
+	 * produced phantom doorbell writes (cqhead_page drifted to 4 / 33
+	 * with cqhead_mmio still at 1) AND the engine stalled at
+	 * statcursqptr=1 with sqpi=5.  The CQDBADDi rewrite appears to
+	 * trigger a synthetic doorbell DMA each time AND interferes with
+	 * the TX engine's WQE pipeline.  Without an HW errata sheet
+	 * explaining the side effects, kernel-side rearm is not a viable
+	 * fix.  Hypothesis (b) from project_b7_libonic_fastpath_2026_05_07
+	 * — "writes to stale physical address" — is now the leading
+	 * candidate; the doorbell DMA target may be cached/translated once
+	 * and never refreshed even when we rewrite CQDBADDi.  Confirming
+	 * needs a bitstream-side investigation (ILA or RTL trace of the
+	 * doorbell DMA path).  Until then, host_doorbell=true is BROKEN. */
 	if (qp->hdb_active) {
 		smp_rmb();
 		cqhead = le32_to_cpu(READ_ONCE(*qp->hdb_cq));
