@@ -852,17 +852,24 @@ onic_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 length, u64 virt_addr,
 			 *       REMOTE_WRITE + READ  → 0b0010
 			 */
 			{
-				u32 access_enc = 0;
-				bool can_write =
-				    !!(mr->access & IB_ACCESS_REMOTE_WRITE);
-				bool can_read  =
-				    !!(mr->access & IB_ACCESS_REMOTE_READ);
-				if (can_write && can_read)
-					access_enc = 0x2;   /* Read and Write */
-				else if (can_write)
-					access_enc = 0x1;   /* Write Only */
-				else
-					access_enc = 0x0;   /* READ Only */
+				/* ACCESSDESC mapping (PG332 §Table 8 0x1C):
+				 *   0x0=R, 0x1=W, 0x2=RW, others reserved.
+				 *
+				 * 2026-05-11 fix (B7 SEND-path):
+				 *   Earlier mapping wrote 0x0 when only LOCAL_WRITE was
+				 *   requested.  pingpong does reg_mr(IB_ACCESS_LOCAL_WRITE)
+				 *   for the SEND/RECV buffer, never REMOTE_*.  ERNIC then
+				 *   rejected every incoming SEND with syndrome bit 20
+				 *   ("access perm fail"): the responder must be able to
+				 *   *write* the payload into the local buffer, so the
+				 *   PDT entry must permit W.  Working bare-metal
+				 *   (tools/ernic-baremetal/bm_qp.c:99-102) uses RW
+				 *   unconditionally for the same reason — RDMA-WRITE
+				 *   targets need W, SEND/RECV need W, RDMA-READ targets
+				 *   need R, and PG332's 0x2=RW is the only encoding
+				 *   that covers all of them. */
+				u32 access_enc = 0x2;   /* Read and Write */
+				(void)mr->access;
 
 				iowrite32((u32)(mr->va & 0xffffffffu),     mmio + row_base + 0x04);
 				iowrite32((u32)(mr->va >> 32),             mmio + row_base + 0x08);
@@ -946,19 +953,24 @@ static int onic_create_cq(struct ib_cq *ibcq,
 	cq->depth = attr->cqe;
 	cq->head  = 0;
 	cq->tail  = 0;
-	cq->bound = false;
-	/* cq_id and ddr_off get filled in when create_qp binds this CQ. */
+	cq->num_bound_qps = 0;
+	memset(cq->bound_qps, 0, sizeof(cq->bound_qps));
+	/* cq_id and ddr_off get filled in by the first QP that binds. */
 	return 0;
 }
 
 static int onic_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
 	struct onic_cq *cq = to_onic_cq(ibcq);
+	unsigned long   flags;
+	int             rv = 0;
 	(void)udata;
 
-	if (cq->bound)
-		return -EBUSY;
-	return 0;
+	spin_lock_irqsave(&cq->lock, flags);
+	if (cq->num_bound_qps != 0)
+		rv = -EBUSY;
+	spin_unlock_irqrestore(&cq->lock, flags);
+	return rv;
 }
 
 static int onic_create_qp(struct ib_qp *ibqp,
@@ -983,18 +995,36 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	 * Same for RQ buffer at RQBA. Bumped from 16 → 64 (2026-05-06) to
 	 * exercise wrap-around bug at higher iters; if wrap bug bites, use
 	 * -t N where N >= iters to avoid it. */
-	if (init_attr->cap.max_send_wr > 64 ||
-	    init_attr->cap.max_recv_wr > 64 ||
+	/* Cap-check the user-requested depths against what our DDR4 slot
+	 * layout can hold.  ERNIC_MAX_{SQ,RQ}_DEPTH is derived from the
+	 * per-QP slot regions in onic_ddr_alloc.h; the actual depth used
+	 * downstream is clamped via clamp_t in this function too, but
+	 * outright rejecting requests beyond capacity gives userspace a
+	 * clear error instead of silently shrinking. */
+	if (init_attr->cap.max_send_wr > ERNIC_MAX_SQ_DEPTH ||
+	    init_attr->cap.max_recv_wr > ERNIC_MAX_RQ_DEPTH ||
 	    init_attr->cap.max_send_sge > 1 ||
 	    init_attr->cap.max_recv_sge > 1)
 		return -EINVAL;
 	if (!scq || !rcq)
 		return -EINVAL;
-	if (scq->bound || rcq->bound)
-		return -EINVAL;     /* B5: no CQ sharing across QPs */
 	if (rcq != scq)
-		return -EINVAL;     /* B5: single CQ for send + recv (ERNIC
-				     * has one CQ per QP) */
+		return -EINVAL;     /* ERNIC's per-QP SQ/RQ→CQ is 1:1; the QP's
+				     * send_cq and recv_cq objects must be the
+				     * same CQ.  Multiple QPs may still share
+				     * that CQ — see below. */
+	/* CQ-sharing capacity check: bind slot reservation is done after
+	 * onic_ddr_qp_slot_alloc succeeds (so we don't reserve a CQ slot
+	 * for a QP that can't get a DDR4 slot).  See "Bind into CQ" below. */
+	{
+		unsigned long flags;
+		bool full;
+		spin_lock_irqsave(&scq->lock, flags);
+		full = (scq->num_bound_qps >= ONIC_CQ_MAX_QPS);
+		spin_unlock_irqrestore(&scq->lock, flags);
+		if (full)
+			return -ENOMEM;
+	}
 
 	/* Require a PD with an MR registered — ERNIC needs the PDT row filled
 	 * before the QP can reference it. */
@@ -1018,13 +1048,28 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	qp->send_cq    = scq;
 	qp->recv_cq    = rcq;
 	qp->slot_off   = slot_off;
-	qp->sq_depth   = init_attr->cap.max_send_wr;
-	/* NOTE: With ERNIC_RQE_SIZE_FIELD=16 (4096 B/slot) the 4 KiB RQ
-	 * region only safely holds 1 slot — slot 1+ overlaps the CQ
-	 * region.  ibv_rc_pingpong with -n 1 -r 1 only touches slot 0
-	 * so it works; perftest workloads with deeper rq_depth need
-	 * ONIC_DDR_QUEUE_SLOT_SIZE bumped first. */
-	qp->rq_depth   = init_attr->cap.max_recv_wr;
+	/* Clamp queue depths to the spec-tested range.
+	 *
+	 * PG332 v4.3 §"RC QP Creation" (p.71): "The minimum tested depth of
+	 * the queues is 16."  Operating below this floor lets the engine's
+	 * internal credit logic hit untested edges — we observed multi-iter
+	 * ibv_rc_pingpong (-r 1) deadlocking in a HW retransmit storm
+	 * 2026-05-11, with the first iter completing normally and the
+	 * second iter stalled at SQPI=2/CQHEAD=1 while STATSSN grew into
+	 * the millions.  Floor at 16 to stay inside the characterized
+	 * envelope.  Ceiling is the per-slot RQ region capacity (computed
+	 * in onic_ib.h:ERNIC_MAX_RQ_DEPTH); same for SQ. */
+	qp->sq_depth = clamp_t(u32, init_attr->cap.max_send_wr,
+			       ERNIC_MIN_QUEUE_DEPTH, ERNIC_MAX_SQ_DEPTH);
+	qp->rq_depth = clamp_t(u32, init_attr->cap.max_recv_wr,
+			       ERNIC_MIN_QUEUE_DEPTH, ERNIC_MAX_RQ_DEPTH);
+	if (qp->sq_depth != init_attr->cap.max_send_wr ||
+	    qp->rq_depth != init_attr->cap.max_recv_wr)
+		pr_info("onic_ib: qp[%u] depth clamp: SQ %u->%u, RQ %u->%u (spec floor=%u, RQ ceil=%u)\n",
+			qp_idx,
+			init_attr->cap.max_send_wr, qp->sq_depth,
+			init_attr->cap.max_recv_wr, qp->rq_depth,
+			ERNIC_MIN_QUEUE_DEPTH, ERNIC_MAX_RQ_DEPTH);
 	qp->cq_depth   = scq->depth;
 	qp->path_mtu   = 4;                       /* PATHMTU code 4 = 4096 */
 	qp->state      = ERNIC_QP_RESET;
@@ -1080,13 +1125,35 @@ static int onic_create_qp(struct ib_qp *ibqp,
 		return -ENOMEM;
 	}
 
-	/* Bind the CQ to this slot.  cq->ddr_off is rebased at RESET->INIT
-	 * once the port (and therefore the DDR4 half) is known; for now we
-	 * record the in-half offset so destroy_qp can clear bookkeeping. */
-	scq->cq_id   = qp_idx;
-	scq->ddr_off = cq_off;
-	scq->bound   = true;
-	scq->qp_back = qp;        /* B7: poll_cq needs it */
+	/* Bind this QP into the CQ's QP list (multi-QP-per-CQ).
+	 *
+	 * cq_id and ddr_off keep their B7 meaning for the first-bound QP
+	 * only (informational; not relied on by poll_cq).  Subsequent QPs
+	 * leave them at the first-bind values — poll_cq looks up each QP's
+	 * own DDR4 CQ offset via qp->cq_ddr_off, not cq->ddr_off. */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&scq->lock, flags);
+		if (scq->num_bound_qps >= ONIC_CQ_MAX_QPS) {
+			/* Race lost to another concurrent create_qp; unwind.
+			 * The early capacity check above would have failed,
+			 * but two creates can race past it. */
+			spin_unlock_irqrestore(&scq->lock, flags);
+			kfree(qp->sq_shadow);
+			kfree(qp->rq_shadow);
+			qp->sq_shadow = NULL;
+			qp->rq_shadow = NULL;
+			onic_ddr_qp_slot_free(&dev->ddr, qp_idx);
+			return -ENOMEM;
+		}
+		if (scq->num_bound_qps == 0) {
+			/* First QP into this CQ — fill the informational fields. */
+			scq->cq_id   = qp_idx;
+			scq->ddr_off = cq_off;
+		}
+		scq->bound_qps[scq->num_bound_qps++] = qp;
+		spin_unlock_irqrestore(&scq->lock, flags);
+	}
 
 	/* B6: leave state at RESET — ibverbs sends an explicit RESET→INIT
 	 * modify_qp right after create_qp and that call is what advances
@@ -1162,13 +1229,27 @@ static int onic_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		(void)ioread32(mmio + q);
 	}
 
+	/* Unbind this QP from its CQ's list.  send_cq == recv_cq for us
+	 * (enforced at create_qp), so this single removal covers both
+	 * sides.  Order preserved by compacting any tail entries down. */
 	if (qp->send_cq) {
-		qp->send_cq->bound   = false;
-		qp->send_cq->qp_back = NULL;
-	}
-	if (qp->recv_cq && qp->recv_cq != qp->send_cq) {
-		qp->recv_cq->bound   = false;
-		qp->recv_cq->qp_back = NULL;
+		struct onic_cq *cq = qp->send_cq;
+		unsigned long   flags;
+		u32             i;
+
+		spin_lock_irqsave(&cq->lock, flags);
+		for (i = 0; i < cq->num_bound_qps; i++) {
+			if (cq->bound_qps[i] != qp)
+				continue;
+			memmove(&cq->bound_qps[i],
+				&cq->bound_qps[i + 1],
+				(cq->num_bound_qps - i - 1) *
+				sizeof(cq->bound_qps[0]));
+			cq->num_bound_qps--;
+			cq->bound_qps[cq->num_bound_qps] = NULL;
+			break;
+		}
+		spin_unlock_irqrestore(&cq->lock, flags);
 	}
 
 	/* Perf #1 — zero our host doorbell slot so a fresh QP later assigned
@@ -1263,8 +1344,10 @@ static int onic_modify_qp_reset_to_init(struct onic_qp *qp,
 	qp->sq_ddr_off = port_off + sq_off;
 	qp->rq_ddr_off = port_off + rq_off;
 	qp->cq_ddr_off = port_off + cq_off;
-	if (qp->send_cq)
-		qp->send_cq->ddr_off = qp->cq_ddr_off;
+	/* cq->ddr_off was a per-CQ snapshot of the QP's CQ DDR4 offset,
+	 * used only by debug paths.  With multi-QP-per-CQ that field
+	 * only meaningfully describes the first-bound QP; poll_cq reaches
+	 * per-QP cq_ddr_off through the bound_qps[] iterator instead. */
 
 	{
 		u64 sq_axi = ((u64)ONIC_DDR4_MSB << 32) | qp->sq_ddr_off;
@@ -2033,19 +2116,36 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	}
 
 	if (posted) {
-		/* RQCIi (0x34) — write the running count of armed slots.
-		 * Empirically required: PG332 line 911-914 says "On receiving
-		 * this doorbell, the corresponding RX buffer is made available
-		 * to" the engine — writing RQCIi grants buffer credit.  Without
-		 * the write the engine never fills RQ slots, STATRQPIDB/STATMSN
-		 * never advance, and poll_cq returns 0 forever.  libreconic
-		 * appears to rely on a fixed-ring model where credit is
-		 * implicit at QP-setup; our ibverbs flow needs the doorbell
-		 * per-post.  We additionally bump RQCIi in poll_cq when a
-		 * RECV is reaped (see onic_poll_cq) so the engine sees
-		 * released slots — both writes are required. */
+		/* RQCIi (0x34) — write the buffer-credit count visible to
+		 * the engine.  Two facts shape this:
+		 *
+		 * 1. PG332 v4.3 p.13 ("RDMA Queues"): "The Receive Queue work
+		 *    requests need not be posted by the application as the
+		 *    ERNIC Hardware automatically re-posts consumed receive
+		 *    buffers as per the configured receive queue depth."  So
+		 *    the engine maintains an internal RQ-slot ring sized by
+		 *    QDEPTHi[31:16] and recycles slots automatically; the host
+		 *    just needs to tell the engine when slots are "released".
+		 *
+		 * 2. Empirically (2026-05-11): an incoming SEND with RQCIi=1
+		 *    against QDEPTHi=16 fires REQERRBUF syndrome bit 20
+		 *    ("access perm fail").  Same packet against RQCIi=64,
+		 *    depth=64 (the old unclamped pingpong -r 64 path) is
+		 *    accepted.  The engine appears to gate SEND acceptance on
+		 *    RQCIi >= QDEPTHi at startup — interpretable as "the RQ
+		 *    must be fully credited before any traffic flows".
+		 *
+		 * Therefore: write `max(rq_pidb, rq_depth)` so the engine
+		 * always sees a fully credited RQ even when userspace posted
+		 * fewer recv WRs than the spec-floored depth (16).  This is
+		 * safe because the ERNIC RX path deposits payload at the
+		 * fixed DDR4 address `RQBA + slot * RQE_SIZE` — it never
+		 * dereferences a host-side SGE — and our poll_cq still
+		 * clamps RECV completion delivery to `rq_pidb` so we don't
+		 * surface phantom completions for unposted WRs. */
+		u32 rqci = max_t(u32, qp->rq_pidb, qp->rq_depth);
 		wmb();
-		iowrite32(qp->rq_pidb, mmio + onic_qcsr(qp, 0x34));
+		iowrite32(rqci, mmio + onic_qcsr(qp, 0x34));
 		(void)ioread32(mmio + onic_qcsr(qp, 0x34));
 	}
 
@@ -2053,86 +2153,62 @@ static int onic_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	return 0;
 }
 
-static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
+/* Reap as many completions as possible from ONE QP into wc[] starting
+ * at wc_off.  Returns the number of completions delivered (0..budget).
+ *
+ * Caller is responsible for the upper-level num_entries budget; this
+ * helper takes a budget (= num_entries - already_polled) and bounds
+ * its own loops against it.
+ *
+ * All per-QP state mutations (`cq_consumer_idx`, `rq_consumer_idx`)
+ * occur under qp->state_lock — exactly as the pre-multi-QP code did.
+ * The CQ-list lock is NOT held here so different CQs / different QPs
+ * on the same CQ can poll concurrently from different ULP threads. */
+static int onic_poll_one_qp(struct onic_qp *qp, struct onic_ib_dev *dev,
+			    int budget, struct ib_wc *wc)
 {
-	struct onic_cq      *cq   = to_onic_cq(ibcq);
-	struct onic_ib_dev  *dev  = to_onic_ib_dev(ibcq->device);
-	void __iomem        *mmio = dev->priv->hw.addr;
-	struct onic_private *priv = dev->priv;
-	struct onic_qp      *qp;
-	u32                  cqhead;
-	int                  polled = 0;
+	void __iomem *mmio;
+	u32           cqhead;
+	int           polled = 0;
 
-	if (num_entries <= 0)
+	if (budget <= 0)
 		return 0;
-	if (!cq->bound)
-		return 0;
+	if (!qp || !qp->ernic_base)
+		return 0;       /* QP never advanced past RESET */
 
-	/* ERNIC v4.2 has a strict 1:1 QP↔CQ mapping; create_qp stashes the
-	 * back-pointer on the CQ. Without it we can't find the doorbell. */
-	qp = cq->qp_back;
-	if (!qp)
-		return 0;
+	mmio = dev->priv->hw.addr;
 
-	/* If QP never advanced past RESET, ernic_base is 0 and there are
-	 * no completions to poll. */
-	if (!qp->ernic_base)
-		return 0;
-
-	/* DEBUG-perf5: cadence trace — gap between consecutive poll_cq calls
-	 * tells us if the 24ms/spin is userspace cadence or kernel/HW.
-	 * Now also disambiguates host-coherent doorbell page vs MMIO CQHEADi
-	 * (perf #1 sanity check) and snapshots the 4 counters that decide
-	 * whether the spin is wire-side starvation (issue 1, multi-packet
-	 * PSN) vs CQ-doorbell coherency (issue 2, real perf #5):
-	 *   - hdb_cq vs CQHEADi: if they disagree, perf #1 write target is
-	 *     bogus.  If they agree but lag SQPIi, see next two.
-	 *   - STATCURSQPTRi: engine's TX cursor.  Tracks SQPIi when engine
-	 *     is making forward progress.
-	 *   - INAMPKT vs OUTAMPKT: ACKs received vs ACKs sent.  If CQHEAD
-	 *     ≈ INAMPKT and STATCURSQPTRi == SQPIi, the spin is *correct*:
-	 *     ERNIC's CQ engine is gated by ACK arrival, not stale reads.
-	 * Remove once perf #5 is closed. */
+	/* DEBUG-perf5: cadence trace — gap between consecutive poll calls
+	 * per QP, with the four counters that disambiguate perf #5 (CQ-
+	 * doorbell coherency) vs wire-side starvation.  Remove once
+	 * perf #5 is closed. */
 	{
-		static u64 _last_poll_ns;
-		u64 _now = ktime_get_ns();
-		u64 _delta = _last_poll_ns ? (_now - _last_poll_ns) : 0;
-		u32 _q     = onic_qcsr(qp, 0x00);
-		u32 _gcsr  = qp->ernic_base + 0x00100000u;
+		static u64 _last_poll_ns;       /* SHARED across all QPs —
+						 * good enough for cadence
+						 * spotting; per-QP timestamps
+						 * would require extra state. */
+		u64 _now    = ktime_get_ns();
+		u64 _delta  = _last_poll_ns ? (_now - _last_poll_ns) : 0;
+		u32 _q      = onic_qcsr(qp, 0x00);
+		u32 _gcsr   = qp->ernic_base + 0x00100000u;
 		u32 _cqh_mmio = ioread32(mmio + _q + 0x30);
-		u32 _cqh_page = qp->hdb_cq ? le32_to_cpu(READ_ONCE(*qp->hdb_cq)) : 0xffffffffu;
+		u32 _cqh_page = qp->hdb_cq ? le32_to_cpu(READ_ONCE(*qp->hdb_cq))
+					   : 0xffffffffu;
 		_last_poll_ns = _now;
-		pr_info("onic_poll_cq qp=%u hdb=%d delta_ns=%llu cqhead_page=%u cqhead_mmio=%u sqpi=%u statcursqptr=%u statssn=%08x outampkt=%u inampkt=%u\n",
+		pr_info("onic_poll_cq qp=%u hdb=%d delta_ns=%llu cqhead_page=%u cqhead_mmio=%u sqpi=%u statcursqptr=%u statssn=%08x outampkt=%u inampkt=%u sw_cq_ci=%u sw_sq_pi=%u budget=%d\n",
 			qp->qp_num, qp->hdb_active ? 1 : 0, _delta,
 			_cqh_page, _cqh_mmio,
 			ioread32(mmio + _q + 0x38),
 			ioread32(mmio + _q + 0x8C),
 			ioread32(mmio + _q + 0x80),
 			ioread32(mmio + _gcsr + 0x10C),
-			ioread32(mmio + _gcsr + 0x104));
+			ioread32(mmio + _gcsr + 0x104),
+			qp->cq_consumer_idx, qp->sq_pidb, budget);
 	}
 
-	/* Perf #1 — read CQ producer index from the host coherent doorbell
-	 * page when active.  ERNIC DMAs the index here on every CQ
-	 * completion (CQDBADDi was programmed at R->I).  Cuts one PCIe
-	 * read per poll_cq.  RQ-side (STATMSN) stays MMIO — the engine's
-	 * RQ-PIDB DMA over-counts on retransmits exactly like reading
-	 * STATRQPIDBi did, so we keep STATMSN as the deduped source.
-	 *
-	 * Patch (B) attempt 2026-05-10 (REVERTED): tried rearming CQDBADDi /
-	 * CQDBADDMSBi per poll AND per CQE consumption.  Both variants
-	 * produced phantom doorbell writes (cqhead_page drifted to 4 / 33
-	 * with cqhead_mmio still at 1) AND the engine stalled at
-	 * statcursqptr=1 with sqpi=5.  The CQDBADDi rewrite appears to
-	 * trigger a synthetic doorbell DMA each time AND interferes with
-	 * the TX engine's WQE pipeline.  Without an HW errata sheet
-	 * explaining the side effects, kernel-side rearm is not a viable
-	 * fix.  Hypothesis (b) from project_b7_libonic_fastpath_2026_05_07
-	 * — "writes to stale physical address" — is now the leading
-	 * candidate; the doorbell DMA target may be cached/translated once
-	 * and never refreshed even when we rewrite CQDBADDi.  Confirming
-	 * needs a bitstream-side investigation (ILA or RTL trace of the
-	 * doorbell DMA path).  Until then, host_doorbell=true is BROKEN. */
+	/* Perf #1 (host-coherent CQ doorbell page) is currently disabled
+	 * by default (see hdb_active init in onic_create_qp).  Until the
+	 * bitstream-side fix lands we always read CQHEADi via MMIO. */
 	if (qp->hdb_active) {
 		smp_rmb();
 		cqhead = le32_to_cpu(READ_ONCE(*qp->hdb_cq));
@@ -2142,35 +2218,11 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 
 	mutex_lock(&qp->state_lock);
 
-	/* SQ-side completions: ERNIC bumps CQHEADi when a SEND/WRITE WQE
-	 * completes.  Treat the bump itself as the completion indicator.
-	 *
-	 * Why we don't read the 4-byte CQE in DDR4: when we tried, reads
-	 * came back 0x7b7b7b7b (looks uninitialized) even though CQHEAD
-	 * advanced and STATSSN/STATCURSQPTR confirmed success.  We don't
-	 * know which of these is the cause: wrong AXI tag for engine
-	 * writes vs QDMA reads, wrong slot offset, write/read ordering,
-	 * a gating bit we haven't identified, or this IP build simply
-	 * not wiring CQE writes through.  PG332 line 2701 frames CQE
-	 * writes as a debug aid ("CQE writes can be enabled to debug
-	 * failed completions"), suggesting the doorbell-advance-only
-	 * path is the intended contract.
-	 *
-	 * What we do trust: libreconic's poll_cq_cidb (rdma_api.c:858)
-	 * polls CQHEADi and never reads CQE bytes — and it works in this
-	 * IP family.  We match that.  wr_id/opcode/length come from
-	 * sq_shadow (correct because completions are in submission order
-	 * for an ordered SQ); errors surface through STATQPi syndrome at
-	 * QP-level recovery rather than per-CQE status. */
-	/* Phantom-completion clamp (variance fix 2026-05-03): never deliver
-	 * more SEND completions than the ULP has actually posted.  Without
-	 * this, a stale CQHEAD value from before this QP's lifetime (e.g.
-	 * carrying over from a prior QP that occupied this slot) could
-	 * deliver IB_WC_SUCCESS for WQEs that don't exist, returning bogus
-	 * sub-100-µs latencies in pingpong loops.  qp->sq_pidb is the count
-	 * of post_send calls on this QP since last R->I, so it's the
-	 * authoritative upper bound. */
-	while (polled < num_entries &&
+	/* SQ-side completions: phantom-completion clamp (variance fix
+	 * 2026-05-03) — never deliver more SEND completions than
+	 * qp->sq_pidb (count of post_send calls on this QP since last
+	 * R->I). */
+	while (polled < budget &&
 	       qp->cq_consumer_idx != cqhead &&
 	       qp->cq_consumer_idx != qp->sq_pidb) {
 		u32 wqe_slot = qp->cq_consumer_idx % qp->sq_depth;
@@ -2185,36 +2237,17 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 		polled++;
 	}
 
-	/* RQ-side completions: deliver one IB_WC_RECV per *message*
-	 * actually received at the engine.  STATMSNi (QCSR 0x84) tracks
-	 * "expected incoming MSN" — when ERNIC has fully received N
-	 * messages, STATMSNi reads (N+1) (next-expected).  So the count
-	 * of fully-completed message-level receives is STATMSNi - 1.
-	 *
-	 * STATRQPIDBi advances per RQE the engine writes, which can
-	 * include retransmits a peer in retry-loop sends — so using it
-	 * over-delivers RECV completions and ULPs that compare rcnt to
-	 * an iteration count (ibv_rc_pingpong) loop forever.
-	 *
-	 * Two clamps on top of the engine count:
-	 *   - polled < num_entries: respect the caller's wc[] capacity.
-	 *   - rq_consumer_idx != rq_pidb: never deliver more RECVs than
-	 *     the ULP has posted recv buffers for.
-	 */
+	/* RQ-side completions: STATMSNi counts received messages
+	 * (advances 0 -> N after N message-receives).  Two clamps:
+	 *   - budget cap from caller
+	 *   - rq_consumer_idx != rq_pidb (never deliver more RECVs than
+	 *     ULP has posted recv buffers for) */
 	{
 		u32 statmsn = ioread32(mmio + onic_qcsr(qp, 0x84)) &
 			      0x00ffffffu;
-		/* STATMSN counts from 0: starts at 0 pre-traffic, advances
-		 * to 1 after the engine processes the first incoming
-		 * message.  So STATMSN itself == number of messages
-		 * received (no -1).  Empirically confirmed: snapshot showed
-		 * STATMSN=1 + STATRQPIDB=1 after the responder processed
-		 * one SEND; with -1 we delivered 0 completions and pingpong
-		 * blocked. */
 		u32 rcv_count = statmsn;
-		u32 rq_consumer_before = qp->rq_consumer_idx;
 
-		while (polled < num_entries &&
+		while (polled < budget &&
 		       qp->rq_consumer_idx != rcv_count &&
 		       qp->rq_consumer_idx != qp->rq_pidb) {
 			u32 slot = qp->rq_consumer_idx % qp->rq_depth;
@@ -2224,26 +2257,59 @@ static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
 			wc[polled].wr_id     = qp->rq_shadow[slot].wr_id;
 			wc[polled].opcode    = IB_WC_RECV;
 			wc[polled].status    = IB_WC_SUCCESS;
-			/* byte_len: ERNIC writes payload directly to the RQ
-			 * buffer; for SEND-Only the full message fits in one
-			 * RQE slot.  We don't currently parse the BTH/RETH
-			 * length back from the RQE — leave 0 for B7.  ULPs
-			 * that need it (e.g. ibv_rc_pingpong checks) won't
-			 * fail on byte_len=0; they verify content. */
 			wc[polled].byte_len  = 0;
 			qp->rq_consumer_idx++;
 			polled++;
 		}
-
-		/* Don't write RQCIi here — post_recv handles the doorbell
-		 * with the rq_pidb (post-counter) value.  The engine treats
-		 * RQCIi as "buffers available" credit; writing the consumer
-		 * index here would clobber the post-counter and starve
-		 * the engine. */
-		(void)rq_consumer_before;
 	}
 
 	mutex_unlock(&qp->state_lock);
+	return polled;
+}
+
+static int onic_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
+{
+	struct onic_cq      *cq   = to_onic_cq(ibcq);
+	struct onic_ib_dev  *dev  = to_onic_ib_dev(ibcq->device);
+	struct onic_qp      *qps_snap[ONIC_CQ_MAX_QPS];
+	unsigned long        flags;
+	u32                  n_qps;
+	u32                  i;
+	int                  polled = 0;
+
+	if (num_entries <= 0)
+		return 0;
+
+	/* Snapshot the bound-QP list under cq->lock, then drop the lock
+	 * before reaping.  Keeps the lock-held region tiny — concurrent
+	 * destroy_qp / create_qp can re-acquire the lock while we walk
+	 * QPs that were valid at the snapshot instant.
+	 *
+	 * Per-QP state mutations during reap happen under qp->state_lock
+	 * inside onic_poll_one_qp.  A QP being torn down concurrently is
+	 * safe to read: destroy_qp clears QPCONFi[0] and removes the QP
+	 * from this list *before* freeing the QP storage (verbs core
+	 * holds a refcount through the destroy callback). */
+	spin_lock_irqsave(&cq->lock, flags);
+	n_qps = cq->num_bound_qps;
+	for (i = 0; i < n_qps; i++)
+		qps_snap[i] = cq->bound_qps[i];
+	spin_unlock_irqrestore(&cq->lock, flags);
+
+	if (n_qps == 0)
+		return 0;
+
+	/* Round-robin reap.  Each pass takes (num_entries - polled) as the
+	 * per-QP budget, so a busy QP cannot monopolize a small num_entries
+	 * caller (e.g. perftest --cq-mod=N polls in groups of N). */
+	for (i = 0; i < n_qps && polled < num_entries; i++) {
+		int got = onic_poll_one_qp(qps_snap[i], dev,
+					   num_entries - polled,
+					   &wc[polled]);
+		if (got > 0)
+			polled += got;
+	}
+
 	return polled;
 }
 

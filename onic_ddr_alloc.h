@@ -18,20 +18,49 @@
  * inside DDR4 is OR'd into the LSB. */
 #define ONIC_DDR4_MSB                   0xa3500000u
 
-/* F4 §2.5 — queue tier */
+/* F4 §2.5 — queue tier
+ *
+ * Per-QP slot layout sized for spec-minimum-tested queue depth.  PG332
+ * v4.3 §"RC QP Creation" (p.71) is explicit:
+ *
+ *   "The minimum tested depth of the queues is 16."
+ *
+ * PG332 §Memory Requirement Table 10 (p.69) uses 128 entries per queue
+ * as the reference dimensioning.  We target 16 here as a balance:
+ *   - the slot fits cleanly in the existing queue tier (0x40000..
+ *     0x400000 = 3.75 MiB) without disturbing the MR tier or per-ERNIC
+ *     GBUF region;
+ *   - it satisfies the spec's documented validity floor, unlike the
+ *     prior depth=1 which the IP was never characterized at and which
+ *     caused multi-iter pingpong to stall (2026-05-11);
+ *   - bumping later to 128 (full spec reference) requires shifting
+ *     MR_TIER_OFF + GBUF base — see project_b7_send_path_fixed_2026_05_11
+ *     for the layout sketch.
+ *
+ * Per-QP 128-KiB slot breakdown:
+ *   0x00000 .. 0x01FFF   8 KiB  SQ        — 128 × 64-B WQE (room for full
+ *                                            spec-reference depth even
+ *                                            though our RQ caps at 16)
+ *   0x02000 .. 0x11FFF  64 KiB  RQ        — 16 × 4-KiB RQE matches
+ *                                            ERNIC_RQE_SIZE_FIELD=16
+ *                                            (PMTU 4096 single-packet)
+ *   0x12000 .. 0x12FFF   4 KiB  CQ        — 128 × 4-B CQE + slack
+ *   0x13000 .. 0x13FFF   4 KiB  SEND-payload staging
+ *   0x14000 .. 0x1FFEF  48 KiB  reserved for future use
+ *   0x1FFF0 .. 0x1FFF7   8 B    RQDB scratch (RQWPTRDBADDi target)
+ *   0x1FFF8 .. 0x1FFFF   8 B    CQDB scratch (CQDBADDi target)
+ */
 #define ONIC_DDR_QUEUE_TIER_OFF         0x00040000u
-#define ONIC_DDR_QUEUE_SLOT_SIZE        0x00004000u   /* 16 KiB */
+#define ONIC_DDR_QUEUE_SLOT_SIZE        0x00020000u   /* 128 KiB */
 #define ONIC_DDR_QUEUE_SQ_OFF           0x00000000u
-#define ONIC_DDR_QUEUE_RQ_OFF           0x00001000u
-#define ONIC_DDR_QUEUE_CQ_OFF           0x00002000u
-/* Per-WR SEND-payload staging in the unused last 4 KiB of each 16 KiB
- * slot.  ERNIC v4.2 fetches packet payload via M_AXI from laddr — the
- * reference libreconic send_recv.c test ALWAYS sets laddr to a real
- * DDR4 address and leaves send_small_payload zero, so the inline path
- * apparently doesn't work in the IP we have.  64 bytes per WR is enough
- * for the 8-byte ibv_rc_pingpong test; larger payloads need the MR's
- * DDR4 mirror (future change). */
-#define ONIC_DDR_QUEUE_SEND_PAYLOAD_OFF 0x00003000u
+#define ONIC_DDR_QUEUE_RQ_OFF           0x00002000u
+#define ONIC_DDR_QUEUE_CQ_OFF           0x00012000u
+
+/* Per-WR SEND-payload staging area.  ERNIC v4.2 fetches packet payload
+ * via M_AXI from laddr — libreconic's reference test ALWAYS sets laddr
+ * to a real DDR4 address and leaves send_small_payload zero, so the
+ * BTH-inline path appears not to work on this IP variant. */
+#define ONIC_DDR_QUEUE_SEND_PAYLOAD_OFF 0x00013000u
 #define ONIC_DDR_QUEUE_SEND_PAYLOAD_STR 64u
 #define ONIC_DDR_QUEUE_SEND_PAYLOAD_MAX 64u
 
@@ -40,11 +69,15 @@
  * CQDBADDi when QP enters RTS, regardless of QPCONFi[4] HWHSHKDIS.
  * If those registers are 0 the writes hit host PCIe address 0 and the
  * IOMMU rejects them (AMD-Vi IO_PAGE_FAULT / DMAR DMA Write fault),
- * stalling the engine.  Park them in the unused tail of each 16-KiB
- * slot so writes land in DDR4 via the 0xA350.. tag and never traverse
- * PCIe. */
-#define ONIC_DDR_QUEUE_RQDB_OFF         0x00003F00u
-#define ONIC_DDR_QUEUE_CQDB_OFF         0x00003F08u
+ * stalling the engine.  Park them in the unused tail of each slot so
+ * writes land in DDR4 via the 0xA350.. tag and never traverse PCIe. */
+#define ONIC_DDR_QUEUE_RQDB_OFF         0x0001FFF0u
+#define ONIC_DDR_QUEUE_CQDB_OFF         0x0001FFF8u
+
+/* Sanity: per-slot inner regions must not overlap and must fit. */
+#define _ONIC_DDR_RQ_SIZE       (ONIC_DDR_QUEUE_CQ_OFF - ONIC_DDR_QUEUE_RQ_OFF)
+#define _ONIC_DDR_SQ_SIZE       (ONIC_DDR_QUEUE_RQ_OFF - ONIC_DDR_QUEUE_SQ_OFF)
+#define _ONIC_DDR_CQ_SIZE       (ONIC_DDR_QUEUE_SEND_PAYLOAD_OFF - ONIC_DDR_QUEUE_CQ_OFF)
 
 /* B5 MR pool (single size class).  Sized for Perf #3 — 16 MiB per slot
  * lets `ib_write_bw -s 4096..16777216` register a payload buffer in one
@@ -57,9 +90,26 @@
 /* Per-ERNIC region size — F4 §2.2 8 GiB each until lifted. */
 #define ONIC_DDR_ERNIC_REGION_SIZE      0x200000000ULL
 
-/* QP 0 + QP 1 are reserved (PG332 §7; F1 §5.4). */
+/* QP 0 + QP 1 are reserved (PG332 §7; F1 §5.4).
+ *
+ * XRNIC_CONF_QP_EN was discovered to be a 6-bit-wide bitmap on this IP
+ * (see `project_b7_qp_en_bitmap_2026_05_05`), so the engine can only
+ * have 6 enabled QPs at once.  More importantly, per PG332 the actual
+ * QP count is configured at IP-generation time via the C_NUM_QP
+ * parameter; reads of XRNIC_CONF_QP_EN show our build sets it to 6.
+ *
+ * Queue-tier capacity check (sanity):
+ *   ONIC_DDR_QUEUE_TIER_OFF + ONIC_QP_MAX * SLOT_SIZE  must be
+ *   <= ONIC_DDR_MR_TIER_OFF.
+ *
+ * Current: 0x40000 + 16 * 0x20000 = 0x240000 < 0x400000 ✓
+ *
+ * For future growth (RQ depth 128 → SLOT_SIZE 1 MiB), MR_TIER_OFF
+ * must move beyond 0x40000 + 16 * 0x100000 = 0x1040000 AND the
+ * per-ERNIC GBUF region (0x01000000) must also shift to avoid
+ * overlap. */
 #define ONIC_QP_RESERVED_LO             2u
-#define ONIC_QP_MAX                     256u
+#define ONIC_QP_MAX                     16u
 
 struct onic_ddr_pool {
 	/* base_off: 0 for ERNIC0, 0x2_0000_0000 for ERNIC1 (F4 §2.2). */

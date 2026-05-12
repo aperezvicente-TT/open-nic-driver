@@ -38,36 +38,38 @@ enum ernic_qp_state {
 /* QPCONFi[31:16] = RQ Buffer size in MULTIPLES OF 256B, per Xilinx
  * PG332 v4.2 Table 8 (line ~2715): "RQ Buffer size (in multiple of
  * 256B)... programmed value should be the power of 2 for expected
- * behavior".  Programming 512 here meant ERNIC strode by 512*256B =
- * 128 KiB per RQE slot, which is far beyond our 4 KiB RQ buffer
- * allocation -- causing exactly one received packet to land correctly
- * (in slot 0) and every subsequent packet to land outside the buffer
- * and be silently dropped (INALLDRPPKTCNT++).
+ * behavior".  Value 16 makes each RQE slot 4096 B, matching the
+ * single-packet PMTU=4096 RoCE flow.
  *
- * 2026-05-10: bumped 2 -> 16 to support 4096-byte SENDs.  Empirical
- * size sweep on ibv_rc_pingpong showed -s 512 worked and -s 513
- * failed with FATAL_CODE 0x02 ("Req pkt length / Pad count fail",
- * PG332 Table 5).  Server's IPKTERRQ confirmed the receive buffer
- * was overflowing because the 512-B per-slot stride couldn't hold a
- * single-packet SEND larger than 512 B.  With value 16 each RQ slot
- * gets 4096 B; total RQ region is still 4 KiB (= 1 slot), so
- * rq_depth is clamped at 1 in onic_create_qp.  Multi-depth support
- * for 4096-B payloads requires bumping ONIC_DDR_QUEUE_SLOT_SIZE
- * beyond 16 KiB and re-partitioning the per-QP DDR4 slot.
- *
- * Earlier values:
- *   2  -> 512 B per RQE element (2026-05-03 fix, ibv_rc_pingpong
- *         worked at <=512 B but failed for larger SENDs).
- *   1  -> 256 B stride caused driver vs ERNIC slot-offset disagree. */
+ * History:
+ *   1  -> 256 B stride (2026-04: caused driver/ERNIC slot-offset
+ *         disagreement).
+ *   2  -> 512 B (2026-05-03 fix: -s ≤512 worked, larger SENDs failed
+ *         with FATAL_CODE 0x02 due to per-slot overflow).
+ *   16 -> 4096 B (2026-05-10 fix: covers full PMTU 4096 single-packet
+ *         SENDs; combined with the 64-KiB RQ region from
+ *         ONIC_DDR_QUEUE_SLOT_SIZE=128 KiB this lets rq_depth go to
+ *         16 — the spec-minimum-tested queue depth, PG332 v4.3 p.71). */
 #define ERNIC_RQE_SIZE_FIELD 16u
 
-/* Maximum RQ depth supported by the current 4 KiB RQ region per QP
- * (ONIC_DDR_QUEUE_RQ_OFF .. ONIC_DDR_QUEUE_CQ_OFF) at the configured
- * RQE size.  Clamped against userspace's requested max_recv_wr in
- * onic_create_qp to keep slot 1+ from overflowing into the CQ
- * region. */
+/* Derived sizing — computed from the slot layout in onic_ddr_alloc.h
+ * so a future slot-size change re-derives the depth caps automatically.
+ *
+ * ERNIC_MAX_RQ_DEPTH is the upper bound on the per-QP RQ depth that
+ * still fits inside the slot's RQ region without overlapping the CQ
+ * region.  onic_create_qp clamps userspace's requested max_recv_wr
+ * against this *and* against the PG332 minimum tested depth of 16. */
 #define ERNIC_RQE_BUFFER_BYTES   (ERNIC_RQE_SIZE_FIELD * 256u)
-#define ERNIC_MAX_RQ_DEPTH       (0x1000u / ERNIC_RQE_BUFFER_BYTES)
+#define ERNIC_MAX_RQ_DEPTH       (_ONIC_DDR_RQ_SIZE / ERNIC_RQE_BUFFER_BYTES)
+
+/* SQ depth ceiling: SQ region holds N × 64-B WQEs (struct ernic_sq_wqe
+ * below).  Using a literal because the struct isn't visible yet here. */
+#define ERNIC_MAX_SQ_DEPTH       (_ONIC_DDR_SQ_SIZE / 64u)
+
+/* PG332 v4.3 p.71 ("RC QP Creation"): "The minimum tested depth of the
+ * queues is 16."  We hard-floor user-requested depths to this so the
+ * IP is never operated below its characterized range. */
+#define ERNIC_MIN_QUEUE_DEPTH    16u
 
 /* B7 — packed ERNIC SQ WQE, 64 bytes.  Layout per
  * reference_ernic_wqe_spec.md §2 / libreconic/rdma_api.h:138-158. */
@@ -169,21 +171,33 @@ struct onic_mr {
 
 struct onic_qp;
 
+/* B7 originally enforced a 1:1 QP↔CQ binding (single back-pointer).
+ * That broke any multi-QP workload — perftest -q 2..N uses ONE CQ
+ * shared across all -q QPs, and ConnectX-style throughput tests need
+ * the same.  2026-05-11: lifted to N:1 (multiple QPs per CQ).
+ *
+ * The cap matches ERNIC's `XRNIC_CONF_QP_EN` bitmap width (6 in this
+ * IP build, per `project_b7_qp_en_bitmap_2026_05_05`).  Sized to
+ * ONIC_QP_MAX so any future bitmap widening is automatic. */
+#define ONIC_CQ_MAX_QPS  ONIC_QP_MAX
+
 struct onic_cq {
 	struct ib_cq     ibcq;
-	u32              cq_id;         /* == bound QP index once bound */
-	u64              ddr_off;       /* DDR4 byte offset of CQ ring */
+	u32              cq_id;         /* informational; first-bound QP idx */
+	u64              ddr_off;       /* informational; first-bound QP's CQ DDR4 off */
 	u32              depth;
 	u32              head;          /* driver-side tail-tracker (for B8) */
 	u32              tail;
-	bool             bound;         /* false until create_qp binds it */
-	spinlock_t       lock;
+	spinlock_t       lock;          /* guards bound_qps + num_bound_qps */
 
-	/* B7 — back-pointer to the QP bound to this CQ. Populated by
-	 * create_qp; cleared by destroy_qp. ERNIC v4.2 has a 1:1 mapping
-	 * between QP and CQ, so this is unambiguous. Used by poll_cq to
-	 * find the QCSR doorbell, sq_shadow and DDR4 CQ ring offset. */
-	struct onic_qp  *qp_back;
+	/* Back-pointers to every QP whose send_cq (== recv_cq, ERNIC's 1:1
+	 * SQ↔RQ↔CQ per-QP rule) is this CQ.  poll_cq iterates this list and
+	 * reaps each QP's CQHEADi / STATMSN independently.  Order is
+	 * insertion-order (FIFO); removal compacts.
+	 *
+	 * Guarded by lock above. */
+	struct onic_qp  *bound_qps[ONIC_CQ_MAX_QPS];
+	u32              num_bound_qps;
 };
 
 struct onic_qp {
