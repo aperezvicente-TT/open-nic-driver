@@ -71,6 +71,18 @@ enum ernic_qp_state {
  * IP is never operated below its characterized range. */
 #define ERNIC_MIN_QUEUE_DEPTH    16u
 
+/* Max bytes per single ERNIC WQE.  Empirically pinned 2026-05-11:
+ * a WRITE with length > 16 × PMTU silently wedges the TX engine
+ * (statcursqptr stays at 0; PCIe Bus Reset required to recover).
+ * PG332 v4.3 §"Unsupported Features" says the architectural ceiling is
+ * 8 MB, so this is a fragment-queue parameter baked into our bitstream
+ * (PMTU 4096 × 16 entries = 64 KiB).  See
+ * project_b7_64kib_write_cap_2026_05_11.md.
+ *
+ * Driver fragments any WRITE > this into N consecutive WQEs and
+ * presents one ULP-visible CQE for the whole chain. */
+#define ERNIC_MAX_WRITE_FRAG     (16u * 4096u)
+
 /* B7 — packed ERNIC SQ WQE, 64 bytes.  Layout per
  * reference_ernic_wqe_spec.md §2 / libreconic/rdma_api.h:138-158. */
 struct ernic_sq_wqe {
@@ -102,6 +114,12 @@ struct ernic_sq_shadow {
 	u64                  wr_id;
 	enum ib_wc_opcode    ib_opcode;
 	u32                  length;
+	/* is_filler: this slot belongs to a fragmented WRITE chain but is
+	 * not the chain's last fragment.  poll_cq must absorb the engine's
+	 * CQE for it (advance cq_consumer_idx) without delivering an
+	 * ib_wc.  Only the chain's last slot carries the user-visible
+	 * wr_id / ib_opcode / total length. */
+	bool                 is_filler;
 };
 
 struct ernic_rq_shadow {

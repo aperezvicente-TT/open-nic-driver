@@ -1916,12 +1916,13 @@ static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 	struct ernic_sq_wqe wqe;
 	u32                 ernic_op;
 	enum ib_wc_opcode   wc_op;
-	u32                 slot;
 	u32                 length;
 	u32                 lkey;
 	u64                 user_va;
-	u64                 ddr_off;
-	u64                 laddr_axi;
+	u64                 ddr_off = 0;
+	u32                 n_frags;
+	u32                 in_flight;
+	u32                 frag;
 	int                 rv;
 
 	if (wr->num_sge > 1)
@@ -1939,16 +1940,9 @@ static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 	user_va = (wr->num_sge == 1) ? wr->sg_list[0].addr   : 0;
 	lkey    = (wr->num_sge == 1) ? wr->sg_list[0].lkey   : 0;
 
-	memset(&wqe, 0, sizeof(wqe));
-	slot = qp->sq_pidb % qp->sq_depth;
-
-	wqe.wrid   = cpu_to_le16((u16)slot);
-	wqe.length = cpu_to_le32(length);
-	wqe.opcode = cpu_to_le32(ernic_op & 0xff);
-
-	/* Resolve user VA → DDR4 mirror offset (Perf #3).  Zero-length WRs
-	 * are allowed; we set ddr_off=0 in that case (engine ignores laddr
-	 * when length=0). */
+	/* Resolve user VA → DDR4 mirror offset (Perf #3) once for the whole
+	 * chain; per-fragment laddr/remote_offset are derived by adding the
+	 * intra-chain byte offset. */
 	if (length > 0) {
 		rv = ernic_mr_xlate(qp, lkey, user_va, length, &ddr_off);
 		if (rv) {
@@ -1957,60 +1951,102 @@ static int ernic_sq_post_one(struct onic_qp *qp, const struct ib_send_wr *wr)
 				 lkey, (unsigned long long)user_va, length);
 			return rv;
 		}
+	}
+
+	/* Fragment-queue cap (project_b7_64kib_write_cap_2026_05_11): WRITE
+	 * WQEs larger than ERNIC_MAX_WRITE_FRAG silently wedge the engine.
+	 * Only WRITE is fragmented; SEND and READ are out of scope for now
+	 * (SEND > 64 KiB has never been tested on this stack; READ has its
+	 * own outstanding-request queue per PG332). */
+	if (wr->opcode == IB_WR_RDMA_WRITE &&
+	    length > ERNIC_MAX_WRITE_FRAG) {
+		n_frags = DIV_ROUND_UP(length, ERNIC_MAX_WRITE_FRAG);
 	} else {
-		ddr_off = 0;
+		n_frags = 1;
 	}
 
-	/* laddr carries the 0xA350.. tag so ERNIC's M_AXI fetches via
-	 * sys_mem_5to2 M01.  Same encoding for SEND and WRITE. */
-	laddr_axi = ((u64)ONIC_DDR4_MSB << 32) | ddr_off;
-	wqe.laddr_low  = cpu_to_le32(lower_32_bits(laddr_axi));
-	wqe.laddr_high = cpu_to_le32(upper_32_bits(laddr_axi));
-
-	if (wr->opcode == IB_WR_SEND) {
-		/* For SEND, r_key is unused; PD-derived rkey is a sentinel.
-		 * Encode pdn in upper byte too in case ERNIC inspects it. */
-		wqe.r_key = cpu_to_le32((qp->pd->pdn << 8) |
-					(qp->pd->pdn & 0xffu));
-	} else {
-		/* RDMA_WRITE: target's remote_addr + rkey go in the WQE.  The
-		 * receiver's ERNIC translates remote_addr through its PDT row
-		 * (programmed by reg_user_mr at the receiver) into a DDR4
-		 * destination offset on the receiver.
-		 *
-		 * 2026-05-06 fix: drop the `& 0xffu` mask.  ERNIC IP uses the
-		 * upper byte of wire RETH.RKey as MR_INDEX into the receiver
-		 * PDT (PG332 v4.2 Figure 9 — confirmed empirically via
-		 * tools/ernic-baremetal).  reg_user_mr now sets
-		 * mr->rkey = (pdn<<8)|pdn so the full value must propagate.
-		 * Old `& 0xffu` truncation made wire RKey=0x01 → MR_INDEX=0
-		 * → PDT[0] (uninit) → FATAL_CODE 0x17 on every WRITE. */
-		wqe.remote_offset_low  =
-			cpu_to_le32(lower_32_bits(rdma_wr(wr)->remote_addr));
-		wqe.remote_offset_high =
-			cpu_to_le32(upper_32_bits(rdma_wr(wr)->remote_addr));
-		wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey);
+	/* Reject if posting n_frags WQEs would overrun the SQ slot ring.
+	 * poll_cq advances cq_consumer_idx to track engine completions;
+	 * (sq_pidb - cq_consumer_idx) is the number of in-flight WQEs.
+	 * We need at least n_frags free slots beyond that. */
+	in_flight = qp->sq_pidb - qp->cq_consumer_idx;
+	if (in_flight + n_frags > qp->sq_depth) {
+		dev_info_ratelimited(&dev->priv->pdev->dev,
+				     "onic_ib: post_send qp[%u] SQ full (in_flight=%u n_frags=%u depth=%u)\n",
+				     qp->qp_num, in_flight, n_frags,
+				     qp->sq_depth);
+		return -ENOMEM;
 	}
 
-	/* Land the 64 B WQE in DDR4 at qp->sq_ddr_off + slot * 64.  Uses
-	 * libqdma's H2C MM queue (onic_sysdma) — its M_AXI master reaches
-	 * DDR4 untagged.  ERNIC reads the same DDR4 byte via SQBAi. */
-	rv = onic_ddr4_write(dev->priv,
-			     qp->sq_ddr_off + (u64)slot * sizeof(wqe),
-			     &wqe, sizeof(wqe));
-	if (rv) {
-		dev_info(&dev->priv->pdev->dev,
-			 "onic_ib: post_send sysdma WRITE failed qp=%u slot=%u rv=%d\n",
-			 qp->qp_num, slot, rv);
-		return rv;
+	for (frag = 0; frag < n_frags; frag++) {
+		u32      slot       = qp->sq_pidb % qp->sq_depth;
+		u32      frag_off   = frag * ERNIC_MAX_WRITE_FRAG;
+		u32      frag_len   = (length - frag_off > ERNIC_MAX_WRITE_FRAG)
+				    ? ERNIC_MAX_WRITE_FRAG
+				    : (length - frag_off);
+		u64      laddr_axi  = ((u64)ONIC_DDR4_MSB << 32) |
+				      (ddr_off + frag_off);
+		bool     is_last    = (frag == n_frags - 1);
+
+		memset(&wqe, 0, sizeof(wqe));
+		wqe.wrid       = cpu_to_le16((u16)slot);
+		wqe.length     = cpu_to_le32(frag_len);
+		wqe.opcode     = cpu_to_le32(ernic_op & 0xff);
+		wqe.laddr_low  = cpu_to_le32(lower_32_bits(laddr_axi));
+		wqe.laddr_high = cpu_to_le32(upper_32_bits(laddr_axi));
+
+		if (wr->opcode == IB_WR_SEND) {
+			/* For SEND, r_key is unused; PD-derived rkey is a
+			 * sentinel.  Encode pdn in upper byte too in case
+			 * ERNIC inspects it. */
+			wqe.r_key = cpu_to_le32((qp->pd->pdn << 8) |
+						(qp->pd->pdn & 0xffu));
+		} else {
+			u64 raddr = rdma_wr(wr)->remote_addr + frag_off;
+
+			/* 2026-05-06 fix: drop the `& 0xffu` mask.  ERNIC IP
+			 * uses the upper byte of wire RETH.RKey as MR_INDEX
+			 * into the receiver PDT (PG332 v4.2 Figure 9 —
+			 * confirmed empirically via tools/ernic-baremetal).
+			 * reg_user_mr now sets mr->rkey = (pdn<<8)|pdn so
+			 * the full value must propagate. */
+			wqe.remote_offset_low  =
+				cpu_to_le32(lower_32_bits(raddr));
+			wqe.remote_offset_high =
+				cpu_to_le32(upper_32_bits(raddr));
+			wqe.r_key = cpu_to_le32(rdma_wr(wr)->rkey);
+		}
+
+		/* Land the 64 B WQE in DDR4 at qp->sq_ddr_off + slot * 64. */
+		rv = onic_ddr4_write(dev->priv,
+				     qp->sq_ddr_off +
+					(u64)slot * sizeof(wqe),
+				     &wqe, sizeof(wqe));
+		if (rv) {
+			dev_info(&dev->priv->pdev->dev,
+				 "onic_ib: post_send sysdma WRITE failed qp=%u slot=%u frag=%u/%u rv=%d\n",
+				 qp->qp_num, slot, frag, n_frags, rv);
+			return rv;
+		}
+
+		/* SQ shadow: only the chain's last slot carries the user's
+		 * wr_id; earlier slots are marked is_filler so poll_cq absorbs
+		 * their CQEs without delivering ib_wc. */
+		if (is_last) {
+			qp->sq_shadow[slot].is_filler = false;
+			qp->sq_shadow[slot].wr_id     = wr->wr_id;
+			qp->sq_shadow[slot].ib_opcode = wc_op;
+			qp->sq_shadow[slot].length    = length;
+		} else {
+			qp->sq_shadow[slot].is_filler = true;
+			qp->sq_shadow[slot].wr_id     = 0;
+			qp->sq_shadow[slot].ib_opcode = 0;
+			qp->sq_shadow[slot].length    = 0;
+		}
+
+		qp->sq_pidb++;
 	}
 
-	/* Update the SQ shadow so poll_cq can recover the full wr_id. */
-	qp->sq_shadow[slot].wr_id     = wr->wr_id;
-	qp->sq_shadow[slot].ib_opcode = wc_op;
-	qp->sq_shadow[slot].length    = length;
-
-	qp->sq_pidb++;
 	return 0;
 }
 
@@ -2221,11 +2257,24 @@ static int onic_poll_one_qp(struct onic_qp *qp, struct onic_ib_dev *dev,
 	/* SQ-side completions: phantom-completion clamp (variance fix
 	 * 2026-05-03) — never deliver more SEND completions than
 	 * qp->sq_pidb (count of post_send calls on this QP since last
-	 * R->I). */
-	while (polled < budget &&
-	       qp->cq_consumer_idx != cqhead &&
+	 * R->I).
+	 *
+	 * Fragmented WRITE (project_b7_64kib_write_cap_2026_05_11): a single
+	 * user-visible WRITE > 64 KiB is split into N internal WQEs in
+	 * ernic_sq_post_one.  The engine produces a CQE per WQE; for the
+	 * leading N-1 fragments the SQ shadow has is_filler=true and we
+	 * advance cq_consumer_idx without delivering an ib_wc.  Only the
+	 * chain's last slot surfaces to the ULP. */
+	while (qp->cq_consumer_idx != cqhead &&
 	       qp->cq_consumer_idx != qp->sq_pidb) {
 		u32 wqe_slot = qp->cq_consumer_idx % qp->sq_depth;
+
+		if (qp->sq_shadow[wqe_slot].is_filler) {
+			qp->cq_consumer_idx++;
+			continue;
+		}
+		if (polled >= budget)
+			break;
 
 		memset(&wc[polled], 0, sizeof(wc[polled]));
 		wc[polled].qp        = &qp->ibqp;
