@@ -461,10 +461,10 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		goto clear_qdma;
 	}
 
-	/* Pulse the shell reset for both ERNICs now that hw->addr is mapped
-	 * but BEFORE any ERNIC GCSR programming (onic_ernic_irq_setup +
-	 * onic_ib_register).  Skips bits 0/4-9 to leave QDMA + both CMACs
-	 * untouched.  Gated by module param shell_reset_on_load. */
+	/* Pulse the shell reset now that hw->addr is mapped.  On pure-Ethernet
+	 * (non-RDMA) shells the ERNIC reset-done status bits are tied high, so
+	 * this returns on the first poll; it just clears sticky shell state.
+	 * Gated by module param shell_reset_on_load. */
 	onic_shell_reset_ernic(priv);
 
 	rv = onic_init_interrupt(priv);
@@ -473,11 +473,9 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 		goto clear_hardware;
 	}
 
-	rv = onic_ernic_irq_setup(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_ernic_irq_setup, err = %d", rv);
-		goto clear_interrupt;
-	}
+	/* RDMA stripped on this pure-Ethernet build: no ERNIC IRQ setup, no
+	 * ib_device registration, no sysdma WQE path.  Both CMAC netdevs come
+	 * up as plain NICs (PTP timestamping still works via the C2H path). */
 
 	netif_set_real_num_tx_queues(priv->netdev, priv->num_tx_queues);
 	netif_set_real_num_rx_queues(priv->netdev, priv->num_rx_queues);
@@ -487,31 +485,6 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 	if (rv < 0) {
 		dev_err(&pdev->dev, "register_netdev (primary), err = %d", rv);
 		goto clear_interrupt;
-	}
-
-	rv = onic_ib_register(priv);
-	if (rv < 0) {
-		dev_err(&pdev->dev, "onic_ib_register, err = %d", rv);
-		unregister_netdev(priv->netdev);
-		goto clear_interrupt;
-	}
-
-	/* B7: bring up the QDMA AXI-MM system DMA queue (master PF only).
-	 * Used by the RDMA verb path to write WQEs into ERNIC's DDR4
-	 * rings.  Failure is non-fatal — netdev + ib_device still work,
-	 * RDMA verbs requiring DDR4 access will fail at post_send/recv. */
-	rv = onic_sysdma_init(priv);
-	if (rv < 0) {
-		dev_warn(&pdev->dev,
-			 "onic_sysdma_init failed (%d) — RDMA WQE path unavailable\n",
-			 rv);
-		/* deliberately not goto-out: probe continues. */
-		rv = 0;
-	} else {
-		/* Smoke-test the H2C MM path with a 64-byte write.  Failure
-		 * is logged at error level but probe still succeeds; the
-		 * RDMA verbs themselves will return more specific errors. */
-		(void)onic_sysdma_self_test(priv);
 	}
 
 	netif_carrier_off(priv->netdev);
@@ -635,9 +608,7 @@ static void onic_teardown_netdev(struct onic_private *priv)
 	set_bit(ONIC_FLAG_CMAC_RX_DISABLED, priv->flags);
 
 	cancel_work_sync(&priv->link_recovery_work);
-	onic_sysdma_fini(priv);  /* B7: tear down MM queue before ib_dev unregister */
-	onic_ib_unregister(priv);
-	onic_ernic_irq_teardown(priv);
+	/* RDMA stripped: no sysdma / ib_device / ERNIC IRQ teardown needed. */
 	onic_clear_interrupt(priv);
 	cancel_work_sync(&priv->link_recovery_work);
 
@@ -732,11 +703,9 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 				rv);
 			/* Non-fatal: leave primary up.  CMAC1 will be unused. */
 			rv = 0;
-		} else {
-			/* Bind port 2 of the ib_device to the secondary's netdev
-			 * now that register_netdev() has assigned its name. */
-			(void)onic_ib_set_port2_netdev(primary, secondary);
 		}
+		/* RDMA stripped: secondary comes up as a plain Ethernet netdev;
+		 * no ib_device port-2 binding on this build. */
 	}
 
 	rv = onic_ptp_init(primary);
@@ -798,13 +767,8 @@ static void onic_remove(struct pci_dev *pdev)
 
 	secondary = primary->peer;
 
-	/* B3/B3.5: Unregister the ib_device FIRST, before any netdev teardown.
-	 * ib_device_set_netdev() took refcounts on both primary->netdev (port 1)
-	 * and secondary->netdev (port 2); those refcounts must be released
-	 * before unregister_netdev() will complete.  Otherwise the kernel loops
-	 * on "unregister_netdevice: waiting for enp1s0d1 to become free".
-	 * onic_ib_unregister() is a no-op on non-master-PF / VFs. */
-	onic_ib_unregister(primary);
+	/* RDMA stripped: no ib_device was registered, so nothing to unregister
+	 * here on this pure-Ethernet build. */
 
 	if (secondary) {
 		/* Break the bidirectional peer link before teardown so the
