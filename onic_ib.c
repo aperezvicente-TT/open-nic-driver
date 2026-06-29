@@ -1059,8 +1059,13 @@ static int onic_create_qp(struct ib_qp *ibqp,
 	 * the millions.  Floor at 16 to stay inside the characterized
 	 * envelope.  Ceiling is the per-slot RQ region capacity (computed
 	 * in onic_ib.h:ERNIC_MAX_RQ_DEPTH); same for SQ. */
-	qp->sq_depth = clamp_t(u32, init_attr->cap.max_send_wr,
-			       ERNIC_MIN_QUEUE_DEPTH, ERNIC_MAX_SQ_DEPTH);
+	/* Fix #A 2026-05-14: cap SQ depth at 2 to test the load-dependent 45×
+	 * wire-amplification hypothesis from project_b7_2x83_wire_amp_2026_05_13.
+	 * min(max(val, 16), 2) = 2 always (max yields ≥16, min(≥16, 2) = 2). */
+	qp->sq_depth = min_t(u32,
+			     max_t(u32, init_attr->cap.max_send_wr,
+				   ERNIC_MIN_QUEUE_DEPTH),
+			     2u);
 	qp->rq_depth = clamp_t(u32, init_attr->cap.max_recv_wr,
 			       ERNIC_MIN_QUEUE_DEPTH, ERNIC_MAX_RQ_DEPTH);
 	if (qp->sq_depth != init_attr->cap.max_send_wr ||
