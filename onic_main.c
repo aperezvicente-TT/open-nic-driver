@@ -414,7 +414,15 @@ static int onic_setup_primary(struct pci_dev *pdev, struct onic_private **out)
 	 * the QDMA's per-function queue limit register to 64; the engine
 	 * then refused to fetch descriptors for qid >= 64 (HW context
 	 * shows idl_stp_b=1 forever).  Set to ONIC_MAX_QUEUES so libqdma
-	 * sees the full 128-queue range secondary uses. */
+	 * sees the full 128-queue range secondary uses.
+	 *
+	 * N-CMAC NOTE: this runs before onic_init_hardware discovers
+	 * num_cmacs, so it can't size to the live CMAC count.  2 *
+	 * ONIC_PER_CMAC_QUEUES covers the common dual-CMAC case exactly (the
+	 * 2-CMAC contract).  Shells exposing more than two CMACs whose
+	 * secondaries use qid >= 2*PER_CMAC_QUEUES must raise this bound to
+	 * num_cmacs * ONIC_PER_CMAC_QUEUES (subject to the per-PF MSI-X
+	 * ceiling noted in onic_setup_secondary). */
 	priv->qdma_dev_conf.qsets_max          = 2 * ONIC_PER_CMAC_QUEUES;
 	priv->qdma_dev_conf.master_pf          = 1;
 	priv->qdma_dev_conf.qdma_drv_mode      = POLL_MODE;
@@ -511,41 +519,63 @@ free_netdev:
 }
 
 /**
- * onic_setup_secondary - bring up the CMAC1 netdev on the same PF
+ * onic_setup_secondary - bring up a secondary CMAC netdev on the same PF
+ * @primary: the master-PF netdev that owns BAR2/QDMA/MSI-X
+ * @cmac_id: CMAC index this secondary serves (1 .. num_cmacs-1)
+ * @out: receives the new priv on success
  *
  * Shares the primary's BAR2 iomap, QDMA device (via a child with q_base),
- * and upper-half of the primary's MSI-X pool (via vec_base).  Does not take
- * user/error IRQs — those belong to the primary only.
+ * and a slice of the primary's MSI-X pool (via vec_base).  Does not take
+ * user/error IRQs — those belong to the primary only.  Generalises the old
+ * hardcoded-CMAC1 path to any secondary CMAC index.
  */
 static int onic_setup_secondary(struct onic_private *primary,
-				struct onic_private **out)
+				u8 cmac_id, struct onic_private **out)
 {
 	struct pci_dev *pdev = primary->pdev;
 	struct onic_private *priv;
+	u16 per_secondary_vectors;
 	int rv;
 
-	priv = onic_alloc_netdev(pdev, 1);
+	priv = onic_alloc_netdev(pdev, cmac_id);
 	if (!priv)
 		return -ENOMEM;
 
 	/* Primary reserves the MSI-X slots just past its own queue vectors
-	 * for user IRQ (always) and error IRQ (MASTER_PF only).  Secondary's
-	 * queues must start after those — onic_init_q_vector builds its IRQ
-	 * number as pci_irq_vector(pdev, vec_base + relative_vid). */
+	 * for user IRQ (always) and error IRQ (MASTER_PF only).  The first
+	 * secondary's queues start after those reservations; each subsequent
+	 * secondary is spaced one full secondary's worth of vectors further on.
+	 * onic_init_q_vector builds its IRQ number as
+	 * pci_irq_vector(pdev, vec_base + relative_vid).
+	 *
+	 * MSI-X BUDGET CEILING: every CMAC's queue vectors (plus the primary's
+	 * non-queue reservations) must fit one PF's MSI-X table.  At high CMAC
+	 * counts this caps queues-per-CMAC: roughly
+	 *   non_q + num_cmacs * per_secondary_vectors <= PF MSI-X entries.
+	 * Do not raise ONIC_PER_CMAC_QUEUES / queue counts without re-checking
+	 * the table size, or onic_init_interrupt will fail to allocate. */
 	{
 		u16 non_q = 1; /* user IRQ */
 		if (test_bit(ONIC_FLAG_MASTER_PF, primary->flags)) {
 			non_q++;     /* + error IRQ */
 			non_q += 2;  /* + ERNIC0 + ERNIC1 IRQs (F5) */
 		}
-		priv->vec_base = primary->num_q_vectors + non_q;
+		/* A secondary owns one MSI-X vector per queue vector.  Each
+		 * secondary is sized identically, so spacing == its vector count.
+		 * Preserves the old 2-CMAC math: cmac_id==1 lands at
+		 * num_q_vectors + non_q (the first slot past primary's
+		 * reservations), exactly as before. */
+		per_secondary_vectors = primary->num_q_vectors;
+		priv->vec_base = primary->num_q_vectors + non_q +
+				 (cmac_id - 1) * per_secondary_vectors;
 	}
 	/* qid_base is dictated by the shell plugin's PER_CMAC_QUEUES constant —
 	 * NOT by primary->num_tx_queues.  Primary uses queues [0, N) within the
-	 * CMAC0 range; secondary must sit at the CMAC1 range start. */
-	priv->qid_base = ONIC_PER_CMAC_QUEUES;
+	 * CMAC0 range; each secondary sits at its own CMAC range start. */
+	priv->qid_base = cmac_id * ONIC_PER_CMAC_QUEUES;
+	/* Point this secondary at the owner; the primary records the back-link
+	 * in its secondaries[] array (the primary's own ->peer stays NULL). */
 	priv->peer = primary;
-	primary->peer = priv;
 
 	onic_init_capacity_slave(priv, primary);
 
@@ -581,7 +611,8 @@ clear_hardware:
 	onic_clear_hardware(priv);
 	onic_clear_capacity(priv);
 free_netdev:
-	primary->peer = NULL;
+	/* This secondary was never recorded in primary->secondaries[] (the
+	 * caller only stores it on success), so there is no back-link to undo. */
 	free_netdev(priv->netdev);
 	return rv;
 }
@@ -646,8 +677,8 @@ static void onic_teardown_netdev(struct onic_private *priv)
 static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct onic_private *primary = NULL;
-	struct onic_private *secondary = NULL;
 	int rv;
+	int i;
 #ifdef CMS_SUPPORT
         static int xmc_init=0;
 #endif
@@ -693,28 +724,40 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_drvdata(pdev, primary);
 
-	/* Spawn secondary netdev for CMAC1 if the shell exposes two CMACs.
-	 * num_cmacs is discovered during primary's hardware init. */
-	if (primary->hw.num_cmacs >= 2) {
-		rv = onic_setup_secondary(primary, &secondary);
+	/* Spawn a secondary netdev for each additional CMAC the shell exposes
+	 * (CMAC1 .. CMACn-1).  num_cmacs is discovered during primary's hardware
+	 * init and is capped at ONIC_MAX_CMACS by the hardware layer. */
+	for (i = 1; i < primary->hw.num_cmacs && i < ONIC_MAX_CMACS; i++) {
+		struct onic_private *sec = NULL;
+
+		rv = onic_setup_secondary(primary, (u8)i, &sec);
 		if (rv < 0) {
 			dev_err(&pdev->dev,
-				"secondary (CMAC1) setup failed (err=%d); primary still usable\n",
-				rv);
-			/* Non-fatal: leave primary up.  CMAC1 will be unused. */
+				"secondary (CMAC%d) setup failed (err=%d); primary still usable\n",
+				i, rv);
+			/* Non-fatal per-iteration: leave primary (and any
+			 * already-brought-up secondaries) up; this CMAC is
+			 * unused.  Continue trying the remaining CMACs. */
 			rv = 0;
+			continue;
 		}
+		primary->secondaries[i] = sec;
+		primary->num_secondaries++;
 		/* RDMA stripped: secondary comes up as a plain Ethernet netdev;
-		 * no ib_device port-2 binding on this build. */
+		 * no ib_device port binding on this build. */
 	}
 
 	rv = onic_ptp_init(primary);
 	if (rv < 0)
 		dev_warn(&pdev->dev, "PTP init (primary) failed (err=%d), continuing\n", rv);
-	if (secondary) {
-		rv = onic_ptp_init(secondary);
+	for (i = 1; i < ONIC_MAX_CMACS; i++) {
+		if (!primary->secondaries[i])
+			continue;
+		rv = onic_ptp_init(primary->secondaries[i]);
 		if (rv < 0)
-			dev_warn(&pdev->dev, "PTP init (secondary) failed (err=%d), continuing\n", rv);
+			dev_warn(&pdev->dev,
+				 "PTP init (CMAC%d secondary) failed (err=%d), continuing\n",
+				 i, rv);
 	}
 	rv = 0;
 
@@ -755,7 +798,7 @@ disable_device:
 static void onic_remove(struct pci_dev *pdev)
 {
 	struct onic_private *primary = pci_get_drvdata(pdev);
-	struct onic_private *secondary;
+	int i;
 #ifdef CMS_SUPPORT
         static int xmc_remove=0;
 #endif
@@ -765,16 +808,24 @@ static void onic_remove(struct pci_dev *pdev)
 	if (!primary)
 		return;
 
-	secondary = primary->peer;
-
 	/* RDMA stripped: no ib_device was registered, so nothing to unregister
 	 * here on this pure-Ethernet build. */
 
-	if (secondary) {
-		/* Break the bidirectional peer link before teardown so the
-		 * link-recovery path (which dereferences priv->peer) doesn't
-		 * touch the secondary while it's being freed. */
-		primary->peer = NULL;
+	/* Tear down secondaries first (highest CMAC index first — reverse of
+	 * the bring-up order), then the primary.  The primary runs the full
+	 * QDMA shell reset, fmap invalidation, and BAR2 iounmap that the
+	 * secondaries' child qdma_devs shared, so it must go last. */
+	for (i = ONIC_MAX_CMACS - 1; i >= 1; i--) {
+		struct onic_private *secondary = primary->secondaries[i];
+
+		if (!secondary)
+			continue;
+		/* Break the peer link and drop the back-reference before
+		 * teardown so the link-recovery path (which looks the secondary
+		 * up via primary->secondaries[] / priv->peer) doesn't touch it
+		 * while it's being freed. */
+		primary->secondaries[i] = NULL;
+		primary->num_secondaries--;
 		secondary->peer = NULL;
 		onic_teardown_netdev(secondary);
 	}

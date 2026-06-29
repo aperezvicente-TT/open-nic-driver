@@ -102,11 +102,14 @@ static void onic_link_recovery_work(struct work_struct *work)
 				continue;
 			}
 		} else {
-			/* Single-PF dual-CMAC: CMAC1 served by secondary net_device.
-			 * Use the peer pointer instead of a PCIe slot lookup. */
-			if (!priv->peer)
+			/* Single-PF multi-CMAC: CMAC i (i>=1) is served by the
+			 * secondary net_device recorded in the master PF's
+			 * secondaries[] array.  This work item runs on the master
+			 * PF's priv, so index directly rather than doing a PCIe
+			 * slot lookup. */
+			if (i >= ONIC_MAX_CMACS || !priv->secondaries[i])
 				continue;
-			pf_priv = priv->peer;
+			pf_priv = priv->secondaries[i];
 			pf_pdev = pf_priv->pdev;
 			pci_dev_get(pf_pdev);
 		}

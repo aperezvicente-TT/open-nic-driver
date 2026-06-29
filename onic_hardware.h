@@ -19,7 +19,7 @@
 
 #include "qdma_export.h"
 
-#define ONIC_MAX_CMACS			2
+#define ONIC_MAX_CMACS			8
 #define ONIC_CMAC_CORE_VERSION		0x00000301
 
 struct onic_hardware {

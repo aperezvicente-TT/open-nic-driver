@@ -251,7 +251,15 @@ struct onic_private {
 				 * Absolute qid = priv->hw.qdma's q_base + relative qid.
 				 * The child qdma_dev encodes this; qid_base mirrors it
 				 * for callers that need the offset pre-qdev-creation. */
-	struct onic_private *peer; /* bidirectional link: primary<->secondary on single-PF */
+	/* Single-PF multi-CMAC linkage.  Each secondary's @peer points at the
+	 * PRIMARY (the MSI-X/QDMA owner) so link-recovery and slave-init code
+	 * that dereferences priv->peer always finds the owner.  The primary
+	 * keeps a back-array of its secondaries for teardown iteration; its own
+	 * @peer is NULL.  Generalises the old 2-CMAC primary<->secondary pair to
+	 * up to ONIC_MAX_CMACS CMACs served from one PF. */
+	struct onic_private *peer;
+	struct onic_private *secondaries[ONIC_MAX_CMACS]; /* primary only; indexed by cmac_id (slot 0 unused) */
+	u8 num_secondaries;                               /* primary only */
 
 	/* ERNIC MSI-X dispatch (master PF only — zero-initialised on
 	 * secondary and on non-master PFs, teardown is a no-op there).
