@@ -63,7 +63,12 @@ static inline void onic_write_reg(struct onic_hardware *hw, u32 offset, u32 val)
 /***** CMAC subsystem registers *****/
 #define CMAC_SUBSYSTEM_0_OFFSET				0x8000
 #define CMAC_SUBSYSTEM_1_OFFSET				0xC000
-#define CMAC_SUBSYSTEM_OFFSET(i)			(((i) == 0) ? CMAC_SUBSYSTEM_0_OFFSET : CMAC_SUBSYSTEM_1_OFFSET)
+/* Per-CMAC subsystem stride: CMAC0=0x8000, CMAC1=0xC000, CMAC i=0x8000+i*0x4000.
+ * The old ternary returned 0xC000 for EVERY i>=1, so the CMAC-count detection
+ * loop kept re-reading CMAC1's valid version and never broke -> num_cmacs=8.
+ * With the stride, an absent CMAC (e.g. i=2 on a 2-CMAC build) reads an
+ * unpopulated offset -> version mismatch -> loop breaks at the true count. */
+#define CMAC_SUBSYSTEM_OFFSET(i)			(CMAC_SUBSYSTEM_0_OFFSET + (i) * (CMAC_SUBSYSTEM_1_OFFSET - CMAC_SUBSYSTEM_0_OFFSET))
 
 #define CMAC_OFFSET(i)					(CMAC_SUBSYSTEM_OFFSET(i) + 0x0)
 #define CMAC_QSFP_OFFSET(i)				(CMAC_SUBSYSTEM_OFFSET(i) + 0x2000)
