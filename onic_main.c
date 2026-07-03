@@ -288,6 +288,11 @@ static void onic_apply_netdev_features(struct net_device *netdev)
 	netdev->max_mtu = 9600 - ETH_HLEN;    /* jumbo, max_pkt_len=9600 from shell */
 	netdev->features |= NETIF_F_HIGHDMA;
 	netdev->hw_features |= NETIF_F_HIGHDMA;
+	/* NB: NETIF_F_RXHASH is intentionally NOT advertised — the 16B C2H
+	 * completion (struct qdma_c2h_cmpl) carries no RSS hash, so we cannot set
+	 * skb->hash truthfully.  Per-port RSS spread still works because packets
+	 * physically land on distinct rx queues (per-queue NAPI + skb_record_rx_queue
+	 * in onic_rx_poll); the stack's RPS/RFS can steer from the recorded queue. */
 }
 
 /* ERNIC sticky-state mask in the system_config SHELL_RESET register.

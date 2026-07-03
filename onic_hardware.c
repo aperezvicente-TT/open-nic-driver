@@ -258,13 +258,37 @@ static int onic_init_hardware_master(struct onic_private *priv)
 	      FIELD_SET(QDMA_FUNC_QCONF_NUMQ_MASK, total_qmax);
 	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(0), val);
 
-	/* RSS indirection table spans the full combined range.  Hash-selected
-	 * queues within a CMAC's share stay in that CMAC's range because the
-	 * plugin's direct qid tagging happens before QDMA indir lookup. */
-	for (i = 0; i < 128; ++i) {
-		u32 v = (i % total_qmax) & 0x0000FFFF;
-		u32 offset = QDMA_FUNC_OFFSET_INDIR_TABLE(0, i);
-		onic_write_reg(hw, offset, v);
+	/* RSS indirection table.  In combine-mode (shell RSS_ON_EXT=1) the plugin's
+	 * external qid supplies the CMAC-select high bits and QDMA ORs in the LOW
+	 * QID_LO_W bits of the selected indir entry as the per-CMAC RSS index — so
+	 * entries must stay within a CMAC's *configured* queue range [0, num_rx_queues).
+	 * Spread the 128 hash buckets round-robin across the active rx queues.
+	 * (In full-external mode the table is unused, so this fill is harmless there.) */
+	{
+		u16 nq = priv->num_rx_queues ? priv->num_rx_queues : 1;
+		for (i = 0; i < 128; ++i) {
+			u32 v = (i % nq) & 0x0000FFFF;
+			u32 offset = QDMA_FUNC_OFFSET_INDIR_TABLE(0, i);
+			onic_write_reg(hw, offset, v);
+		}
+	}
+
+	/* Default Toeplitz RSS hash key.  Without a non-zero key the hash collapses
+	 * to bucket 0 and every packet lands on queue 0 (no RSS spread).  Program the
+	 * standard 40-byte Microsoft RSS key; users can override it via `ethtool -X`.
+	 * Only functionally required in combine-mode; harmless otherwise. */
+	{
+		static const u8 rss_key[ONIC_EN_RSS_KEY_SIZE] = {
+			0x6d,0x5a,0x56,0xda, 0x25,0x5b,0x0e,0xc2, 0x41,0x67,0x25,0x3d,
+			0x43,0xa3,0x8f,0xb0, 0xd0,0xca,0x2b,0xcb, 0xae,0x7b,0x30,0xb4,
+			0x77,0xcb,0x2d,0xa3, 0x80,0x30,0xf2,0x0c, 0x6a,0x42,0xb7,0x3b,
+			0xbe,0xac,0x01,0xfa
+		};
+		for (i = 0; i < ONIC_EN_RSS_KEY_SIZE / 4; ++i) {
+			u32 v;
+			memcpy(&v, &rss_key[i * 4], 4);
+			onic_write_reg(hw, QDMA_FUNC_OFFSET_HASH_KEY(0, i), v);
+		}
 	}
 
 	/* QDMA core CSRs (ring/buffer/timer/counter pools, GLBL_DSC_CFG,
