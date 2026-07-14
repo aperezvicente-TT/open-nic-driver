@@ -288,6 +288,35 @@ static void onic_apply_netdev_features(struct net_device *netdev)
 	netdev->max_mtu = 9600 - ETH_HLEN;    /* jumbo, max_pkt_len=9600 from shell */
 	netdev->features |= NETIF_F_HIGHDMA;
 	netdev->hw_features |= NETIF_F_HIGHDMA;
+	/* NETIF_F_SG is deliberately NOT advertised on this bitstream.
+	 *
+	 * onic_xmit_frame CAN build one QDMA H2C descriptor per skb fragment
+	 * (SOP on the head, EOP on the last), but multi-descriptor packets do
+	 * not gather on this design. Root-caused on hardware (2026-07-14, au200
+	 * 1PF/2CMAC, QSFP0<->ConnectX-6, on-wire hex capture): a 2-descriptor
+	 * frame (66B head + 124B frag = 190B) arrives with correct headers but a
+	 * garbage payload (adjacent host memory read past the head buffer -- the
+	 * frag descriptor's buffer is never fetched) and exactly one 64B AXI beat
+	 * short (190->126); the peer drops it (frame_len != IP_len), so TCP stalls
+	 * at the first fragmented skb. Linear (single-descriptor) TX is flawless
+	 * (~9.4 Gbit/s, 0 retr).
+	 *
+	 * It is NOT a descriptor-encoding bug: a sweep of six metadata encodings
+	 * (legacy; Xilinx-reference cdh_flags=0/pld_len=seg; pld_len=seg|cdh=total;
+	 * ZERO_CDH variants; total-on-EOP-only) ALL failed identically. Cause:
+	 * the QDMA H2C ST engine runs in INTERNAL mode here (descriptor bypass is
+	 * tied off in qdma_subsystem.sv), and internal mode does not honor the
+	 * descriptor SOP/EOP framing that spans multiple descriptors into one
+	 * packet -- SOP/EOP are only meaningful in descriptor-bypass mode (cf.
+	 * libqdma descq_proc_st_h2c_request, which sets SOP/EOP only when
+	 * conf.desc_bypass). So there is no driver-only fix.
+	 *
+	 * Advertising SG breaks TCP outright (the iperf3 control handshake is a
+	 * fragmented skb). Leave SG off so the stack linearizes paged skbs before
+	 * xmit. Re-enabling needs an FPGA change: run H2C in descriptor-bypass
+	 * mode with shell logic driving sop/eop/len, or add a coalescing shim
+	 * ahead of the CMAC. The multi-descriptor code in onic_xmit_frame is
+	 * retained, dormant, for that future bitstream. */
 	/* NB: NETIF_F_RXHASH is intentionally NOT advertised — the 16B C2H
 	 * completion (struct qdma_c2h_cmpl) carries no RSS hash, so we cannot set
 	 * skb->hash truthfully.  Per-port RSS spread still works because packets

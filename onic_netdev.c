@@ -117,9 +117,17 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		struct onic_tx_buffer *buf = &q->buffer[ring->next_to_clean];
 
 		if (buf->type == ONIC_TX_SKB) {
+			/* Fragment DMA unmap. dma_unmap_single is API-equivalent
+			 * to dma_unmap_page for a given (addr,len,dir), so it is
+			 * correct for both the linear head (dma_map_single) and
+			 * SG fragments (skb_frag_dma_map). */
 			dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len, DMA_TO_DEVICE);
-			dev_kfree_skb_any(buf->skb);
-			buf->skb = NULL;
+			/* SG: only the EOP slot carries the skb; head/body slots
+			 * unmap their fragment DMA but must not free it. */
+			if (buf->skb) {
+				dev_kfree_skb_any(buf->skb);
+				buf->skb = NULL;
+			}
 		} else if (buf->type == ONIC_TX_XDPF) {
 			xdp_return_frame(buf->xdpf);
 			buf->xdpf = NULL;
@@ -238,6 +246,9 @@ static int onic_xmit_xdp_ring(struct onic_private *priv,struct  onic_tx_queue  *
 	 * beat as valid and emits oversize frames (e.g. 1514B → 1536B on wire).
 	 * Must equal the actual packet length. */
 	desc.metadata = xdpf->len & 0xFFFF;
+	/* XDP frames are a single contiguous buffer: one descriptor == one
+	 * packet, so it carries both SOP and EOP. */
+	desc.flags = QDMA_H2C_ST_DESC_F_SOP | QDMA_H2C_ST_DESC_F_EOP;
 	qdma_pack_h2c_st_desc(desc_ptr, &desc);
 
 	tx_queue->buffer[ring->next_to_use].xdpf = xdpf;
@@ -1144,11 +1155,13 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	struct onic_private *priv = netdev_priv(dev);
 	struct onic_tx_queue *q;
 	struct onic_ring *ring;
-	struct qdma_h2c_st_desc desc;
 	u16 qid = skb->queue_mapping;
-	dma_addr_t dma_addr;
 	u8 *desc_ptr;
 	int rv;
+	unsigned int nr_frags, nr_desc, f;
+	u16 first_ntu;
+	u32 total_len;
+	u16 ptp_tag = 0;
 	bool ptp_tagged = false;
 	struct rtnl_link_stats64 *pcpu_stats_pointer;
 	pcpu_stats_pointer = this_cpu_ptr(priv->netdev_stats);
@@ -1164,68 +1177,100 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	onic_tx_clean(q);
 
-	if (unlikely(onic_ring_full(ring)))
-		return NETDEV_TX_BUSY;
-
+	/* Pad runts on the linear region *before* reading headlen/nr_frags so
+	 * the segment lengths below are final. */
 	rv = skb_put_padto(skb, ETH_ZLEN);
 	if (rv < 0) {
 		netdev_err(dev, "skb_put_padto failed, err = %d", rv);
 		return NETDEV_TX_OK;
 	}
 
-	dma_addr = dma_map_single(&priv->pdev->dev, skb->data, skb->len,
-				  DMA_TO_DEVICE);
+	nr_frags = skb_shinfo(skb)->nr_frags;
+	nr_desc  = nr_frags + 1;		/* linear head + one per fragment */
 
-	if (unlikely(dma_mapping_error(&priv->pdev->dev, dma_addr))) {
-		dev_kfree_skb(skb);
-		pcpu_stats_pointer->tx_dropped++;
-		pcpu_stats_pointer->tx_errors++;
-		return NETDEV_TX_OK;
-	}
+	/* One packet spans nr_desc contiguous descriptors; need them all free. */
+	if (unlikely(onic_ring_free_count(ring) < nr_desc))
+		return NETDEV_TX_BUSY;
 
-	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
-	desc.len = skb->len;
-	desc.src_addr = dma_addr;
-	/* metadata[15:0] is consumed by the shell as the AXI-Stream packet length
-	 * sideband (qdma_subsystem_function.sv tkeep generator).  Zero here makes
-	 * the last beat's tkeep default to all-1s, so CMAC sees the full 64-byte
-	 * beat as valid and emits oversize frames (e.g. 1514B → 1536B on wire).
-	 * Must equal the actual packet length.  PTP path below ORs the tag into
-	 * the upper 16 bits while keeping the length in the lower 16. */
-	desc.metadata = skb->len & 0xFFFF;
+	total_len = skb->len;
+	first_ntu = ring->next_to_use;
 
-	/* TX PTP hardware timestamp: embed the PTP tag into desc.metadata */
-	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
-	    priv->tstamp_config.tx_type == HWTSTAMP_TX_ON) {
-		u16 ptp_tag;
+	/* Build the descriptor chain. The QDMA H2C engine forwards one
+	 * descriptor's metadata as the packet's tuser_size sideband, and the
+	 * shell trims only the final (EOP) beat's tkeep from tuser_size[5:0]
+	 * (qdma_subsystem_function.sv). Putting the *total* packet length in
+	 * metadata[15:0] on every descriptor makes that last-beat tkeep correct
+	 * regardless of which descriptor's metadata the IP forwards. Per-descriptor
+	 * .len is the fragment byte count QDMA reads from that src_addr. */
+	for (f = 0; f < nr_desc; f++) {
+		struct qdma_h2c_st_desc desc;
+		unsigned int seg_len;
+		dma_addr_t seg_dma;
+		u16 flags = 0;
 
-		if (onic_ptp_alloc_tx_tag(priv, skb, &ptp_tag) == 0) {
+		if (f == 0) {
+			seg_len = skb_headlen(skb);
+			seg_dma = dma_map_single(&priv->pdev->dev, skb->data,
+						 seg_len, DMA_TO_DEVICE);
+		} else {
+			const skb_frag_t *frag =
+				&skb_shinfo(skb)->frags[f - 1];
+			seg_len = skb_frag_size(frag);
+			seg_dma = skb_frag_dma_map(&priv->pdev->dev, frag, 0,
+						   seg_len, DMA_TO_DEVICE);
+		}
+		if (unlikely(dma_mapping_error(&priv->pdev->dev, seg_dma)))
+			goto dma_err;
+
+		if (f == 0)
+			flags |= QDMA_H2C_ST_DESC_F_SOP;
+		if (f == nr_desc - 1)
+			flags |= QDMA_H2C_ST_DESC_F_EOP;
+
+		desc.len      = seg_len;
+		desc.src_addr = seg_dma;
+		desc.metadata = total_len & 0xFFFF;
+		desc.flags    = flags;
+
+		/* PTP TX hardware timestamp: allocate the tag on the EOP
+		 * descriptor (after its DMA map succeeds, so a bailout above
+		 * never leaks a tag) and OR it into metadata[31:16] — that is
+		 * the beat the shell timestamps. PTP frames are linear
+		 * (nr_frags == 0) so EOP is the only descriptor in practice. */
+		if (f == nr_desc - 1 &&
+		    (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
+		    priv->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
+		    onic_ptp_alloc_tx_tag(priv, skb, &ptp_tag) == 0) {
 			desc.metadata = ((u32)ptp_tag << 16) |
-					(skb->len & 0xFFFF);
+					(total_len & 0xFFFF);
 			ptp_tagged = true;
 			netdev_dbg(dev, "PTP TX tag=%u qid=%u len=%u ntu=%u ntc=%u metadata=0x%08x\n",
-				   ptp_tag, qid, skb->len,
+				   ptp_tag, qid, total_len,
 				   ring->next_to_use, ring->next_to_clean,
 				   desc.metadata);
-		} else {
-			/* HW timestamp not possible — fall back to SW */
-			skb_tx_timestamp(skb);
 		}
-	} else {
-		skb_tx_timestamp(skb);	/* SW timestamp fallback */
+
+		desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
+		qdma_pack_h2c_st_desc(desc_ptr, &desc);
+
+		q->buffer[ring->next_to_use].type     = ONIC_TX_SKB;
+		q->buffer[ring->next_to_use].dma_addr = seg_dma;
+		q->buffer[ring->next_to_use].len      = seg_len;
+		/* Free the skb exactly once, from the EOP slot; head/body slots
+		 * unmap their fragment DMA but carry no skb pointer. */
+		q->buffer[ring->next_to_use].skb =
+			(f == nr_desc - 1) ? skb : NULL;
+
+		onic_ring_increment_head(ring);
 	}
 
-	qdma_pack_h2c_st_desc(desc_ptr, &desc);
-
-	q->buffer[ring->next_to_use].type = ONIC_TX_SKB;
-	q->buffer[ring->next_to_use].skb = skb;
-	q->buffer[ring->next_to_use].dma_addr = dma_addr;
-	q->buffer[ring->next_to_use].len = skb->len;
+	/* No HW timestamp taken -> software timestamp (covers "not requested"
+	 * and "requested but tag alloc failed"). */
+	if (!ptp_tagged)
+		skb_tx_timestamp(skb);
 
 	pcpu_stats_pointer->tx_packets++;
-	pcpu_stats_pointer->tx_bytes += skb->len;
-
-	onic_ring_increment_head(ring);
+	pcpu_stats_pointer->tx_bytes += total_len;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
 	if (ptp_tagged || onic_ring_full(ring) || !netdev_xmit_more()) {
@@ -1246,6 +1291,27 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 		}
 	}
 
+	return NETDEV_TX_OK;
+
+dma_err:
+	/* A fragment map failed partway through: unmap the segments already
+	 * mapped for this packet, roll next_to_use back, and drop. No PTP tag
+	 * can be outstanding here — it is allocated only after the EOP (last)
+	 * descriptor's map succeeds. */
+	while (ring->next_to_use != first_ntu) {
+		ring->next_to_use = (ring->next_to_use == 0)
+			? onic_ring_get_real_count(ring) - 1
+			: ring->next_to_use - 1;
+		dma_unmap_single(&priv->pdev->dev,
+				 q->buffer[ring->next_to_use].dma_addr,
+				 q->buffer[ring->next_to_use].len,
+				 DMA_TO_DEVICE);
+		q->buffer[ring->next_to_use].type = 0;
+		q->buffer[ring->next_to_use].skb  = NULL;
+	}
+	dev_kfree_skb_any(skb);
+	pcpu_stats_pointer->tx_dropped++;
+	pcpu_stats_pointer->tx_errors++;
 	return NETDEV_TX_OK;
 }
 
