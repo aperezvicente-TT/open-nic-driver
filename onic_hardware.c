@@ -24,6 +24,14 @@
 #include "qdma_context.h"
 #include "qdma_error_info.h"
 #include "libqdma/libqdma_export.h"
+#include <linux/moduleparam.h>
+
+/* SG-TX Phase A A/B isolation: H2C descriptor-bypass mode on/off (default off =
+ * internal mode). `insmod onic.ko h2c_bypass=1` enables the qdma_subsystem_h2c_byp
+ * passthrough. INVESTIGATION ONLY. */
+static int h2c_bypass = 0;
+module_param(h2c_bypass, int, 0444);
+MODULE_PARM_DESC(h2c_bypass, "H2C descriptor-bypass mode (0=internal, 1=bypass) [investigation]");
 
 #define RX_ALIGN_TIMEOUT_MS			1000
 #define CMAC_RESET_WAIT_MS			1
@@ -505,6 +513,19 @@ int onic_qdma_init_tx_queue(unsigned long qdma, u16 qid,
 	sw_ctxt.irq_en = 0;
 	sw_ctxt.desc_sz = 1; /* 1: 16B for H2C stream */
 	sw_ctxt.fcrd_en = 0;
+	/* SG-TX Phase A: the Xilinx reference (libqdma qdma_context.c) sets
+	 * fetch_max = FETCH_MAX_NUM (7) for every non-64B ST queue; OpenNIC left
+	 * it 0 (works in internal mode, but a bypass queue needs outstanding
+	 * descriptor fetches to feed the byp_out->byp_in loop). Set it when bypass
+	 * is enabled. */
+	if (h2c_bypass)
+		sw_ctxt.fetch_max = 7;
+	/* SG-TX Phase A: route H2C descriptors through the shell's
+	 * qdma_subsystem_h2c_byp passthrough (descriptor-bypass mode) so the
+	 * driver-supplied SOP/EOP framing is honored. Toggle at load with
+	 * `insmod onic.ko h2c_bypass=0|1` for A/B isolation (0 = internal mode,
+	 * my module inert; 1 = bypass mode). */
+	sw_ctxt.bypass = h2c_bypass ? 1 : 0;
 	sw_ctxt.wbi_chk = 1;
 	sw_ctxt.wbi_intvl_en = 1;
 	sw_ctxt.at = 0;
