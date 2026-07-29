@@ -24,6 +24,7 @@
 
 #include "onic.h"
 #include "onic_register.h"
+#include "onic_netdev.h"
 
 extern const char onic_drv_name[];
 extern const char onic_drv_ver[];
@@ -667,7 +668,80 @@ static int onic_get_ts_info(struct net_device *dev,
 	return 0;
 }
 
+/*
+ * C2H completion coalescing.  RX only -- the H2C side has no equivalent
+ * completion-interrupt moderation in this design.
+ *
+ * Both values are rounded to the nearest entry of the fixed QDMA pools
+ * (cnt_th = 2,4,8,...,192 entries; tmr_cnt = 1,2,4,...,200 ticks of
+ * C2H_INT_TIMER_TICK), so a read-back after a write will often differ from
+ * what was asked for.  Measured effect of moving off the historical
+ * 2-frames/1-tick default: single-port RX 36.8 -> 98.5 Gbit/s.
+ */
+static int onic_get_coalesce(struct net_device *netdev,
+			     struct ethtool_coalesce *ec,
+			     struct kernel_ethtool_coalesce *kec,
+			     struct netlink_ext_ack *extack)
+{
+	struct onic_private *priv = netdev_priv(netdev);
+	u32 frames = 0, usecs = 0;
+
+	onic_qdma_get_coalesce(priv->hw.qdma, &frames, &usecs);
+	ec->rx_max_coalesced_frames = frames;
+	ec->rx_coalesce_usecs = usecs;
+	return 0;
+}
+
+static int onic_set_coalesce(struct net_device *netdev,
+			     struct ethtool_coalesce *ec,
+			     struct kernel_ethtool_coalesce *kec,
+			     struct netlink_ext_ack *extack)
+{
+	struct onic_private *priv = netdev_priv(netdev);
+	int rv;
+
+	rv = onic_qdma_set_coalesce(priv->hw.qdma, ec->rx_max_coalesced_frames,
+				    ec->rx_coalesce_usecs);
+	if (rv < 0)
+		return rv;
+
+	/*
+	 * The thresholds that actually govern interrupt generation live in the
+	 * per-queue completion CONTEXT, written when the queue is initialised.
+	 * The counter/timer fields carried by each CMPT CIDX update do not
+	 * override it: measured, setting 64 frames / 3 us live left RX at
+	 * 35.0 Gbit/s, while the identical values after a queue re-init gave
+	 * 98.5 Gbit/s.  So bounce the queues, as other drivers do for coalesce
+	 * and ring changes.  Costs a brief link flap.
+	 */
+	if (netif_running(netdev)) {
+		rv = onic_stop_netdev(netdev);
+		if (rv < 0)
+			netdev_warn(netdev, "coalesce: stop failed (%d)\n", rv);
+		rv = onic_open_netdev(netdev);
+		if (rv < 0) {
+			netdev_err(netdev,
+				   "coalesce: re-open failed (%d); interface is down\n",
+				   rv);
+			return rv;
+		}
+	}
+
+	/* Report what the hardware will actually use, so the rounding is visible
+	 * in the very next `ethtool -c`. */
+	onic_qdma_get_coalesce(priv->hw.qdma, &ec->rx_max_coalesced_frames,
+			       &ec->rx_coalesce_usecs);
+	netdev_info(netdev, "coalesce: rx-frames %u rx-usecs %u (tick %u ns)\n",
+		    ec->rx_max_coalesced_frames, ec->rx_coalesce_usecs,
+		    onic_qdma_cmpl_tick_ns(priv->hw.qdma));
+	return 0;
+}
+
 static const struct ethtool_ops onic_ethtool_ops = {
+    .supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
+				 ETHTOOL_COALESCE_RX_MAX_FRAMES,
+    .get_coalesce        = onic_get_coalesce,
+    .set_coalesce        = onic_set_coalesce,
     .get_drvinfo         = onic_get_drvinfo,
     .get_msglevel        = onic_get_msglevel,
     .set_msglevel        = onic_set_msglevel,

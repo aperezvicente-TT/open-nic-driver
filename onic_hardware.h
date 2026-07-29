@@ -142,6 +142,12 @@ void onic_set_rx_head(unsigned long qdma, u16 qid, u16 head);
  **/
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm);
 
+/* C2H completion coalescing (ethtool -c/-C).  Values are rounded to the fixed
+ * QDMA threshold pools; changes take effect on the next completion update. */
+u32 onic_qdma_cmpl_tick_ns(unsigned long qdma);
+void onic_qdma_get_coalesce(unsigned long qdma, u32 *frames, u32 *usecs);
+int onic_qdma_set_coalesce(unsigned long qdma, u32 frames, u32 usecs);
+
 int  onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id, bool reset);
 int  onic_reset_cmac_shell(struct onic_hardware *hw, u8 cmac_id);
 

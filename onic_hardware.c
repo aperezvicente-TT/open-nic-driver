@@ -86,6 +86,25 @@ static inline u8 onic_cmpl_tmr_idx(void)
 		? (u8)cmpl_tmr_idx : 0;
 }
 
+/* Nearest entry in one of the QDMA threshold pools.  The pools are fixed by
+ * libqdma, so a requested value is rounded to what the hardware can express. */
+static u8 onic_pool_nearest(const u16 *pool, int n, u32 want)
+{
+	u32 best_delta = U32_MAX;
+	u8 best = 0;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		u32 delta = (pool[i] > want) ? (pool[i] - want) : (want - pool[i]);
+
+		if (delta < best_delta) {
+			best_delta = delta;
+			best = (u8)i;
+		}
+	}
+	return best;
+}
+
 static const u16 rngcnt_pool[QDMA_NUM_DESC_RNGCNT] = {
 	2049, 65, 129, 193, 257, 385, 513, 769,
 	1025, 1537, 3073, 4097, 6145, 8193, 12289, 16385
@@ -806,6 +825,61 @@ void onic_qdma_dump_error_regs(unsigned long qdma)
 		"SBE=0x%08x DBE=0x%08x C2H_FIRST_ERR_QID=0x%08x\n",
 		glbl, dsc, trq, c2h, c2h_fatal, h2c, sbe, dbe,
 		qdma_read_reg(qdev, QDMA_OFFSET_C2H_FIRST_ERR_QID));
+}
+
+/**
+ * onic_qdma_cmpl_tick_ns - duration of one C2H completion-timer tick, in ns
+ *
+ * C2H_INT_TIMER_TICK holds the number of QDMA user-clock cycles per tick; the
+ * user clock in this shell is axis_aclk = 250 MHz, i.e. 4 ns.  Read at runtime
+ * rather than assumed, so a shell built at another frequency still reports
+ * something self-consistent (adjust ONIC_QDMA_USER_CLK_NS if axis_aclk changes).
+ */
+#define ONIC_QDMA_USER_CLK_NS 4
+
+u32 onic_qdma_cmpl_tick_ns(unsigned long qdma)
+{
+	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
+	u32 tick = qdma_read_reg(qdev, QDMA_OFFSET_C2H_INT_TIMER_TICK);
+
+	return tick * ONIC_QDMA_USER_CLK_NS;
+}
+
+/**
+ * onic_qdma_get_coalesce - current C2H completion coalescing settings
+ * @frames: out, completion entries before an interrupt (cnt_th)
+ * @usecs: out, timer threshold converted to microseconds
+ */
+void onic_qdma_get_coalesce(unsigned long qdma, u32 *frames, u32 *usecs)
+{
+	u32 tick_ns = onic_qdma_cmpl_tick_ns(qdma);
+
+	if (frames)
+		*frames = c2h_thres_pool[onic_cmpl_cnt_idx()];
+	if (usecs)
+		*usecs = (c2h_timer_pool[onic_cmpl_tmr_idx()] * tick_ns) / 1000;
+}
+
+/**
+ * onic_qdma_set_coalesce - choose C2H completion coalescing thresholds
+ *
+ * Values are rounded to the nearest entry of the fixed hardware pools.  The
+ * new indices are picked up by the next onic_set_completion_tail() -- which
+ * runs on every NAPI completion update -- so this takes effect live, without
+ * re-initialising the queues.
+ */
+int onic_qdma_set_coalesce(unsigned long qdma, u32 frames, u32 usecs)
+{
+	u32 tick_ns = onic_qdma_cmpl_tick_ns(qdma);
+
+	if (!tick_ns)
+		return -EIO;
+
+	cmpl_cnt_idx = onic_pool_nearest(c2h_thres_pool,
+					 QDMA_NUM_C2H_COUNTERS, frames);
+	cmpl_tmr_idx = onic_pool_nearest(c2h_timer_pool, QDMA_NUM_C2H_TIMERS,
+					 (usecs * 1000) / tick_ns);
+	return 0;
 }
 
 void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
