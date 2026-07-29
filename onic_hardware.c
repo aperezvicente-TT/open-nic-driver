@@ -887,6 +887,19 @@ void onic_qdma_dump_error_regs(unsigned long qdma)
  */
 #define ONIC_QDMA_USER_CLK_NS 4
 
+/**
+ * onic_qdma_read_stat - read a QDMA global register (BAR0) for ethtool -S
+ *
+ * The QDMA C2H statistics live in the QDMA config BAR, which the shell register
+ * accessor cannot reach.  Device-global: one QDMA serves both CMACs.
+ */
+u32 onic_qdma_read_stat(unsigned long qdma, u32 offset)
+{
+	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
+
+	return qdma_read_reg(qdev, offset);
+}
+
 u32 onic_qdma_cmpl_tick_ns(unsigned long qdma)
 {
 	struct qdma_dev *qdev = (struct qdma_dev *)qdma;

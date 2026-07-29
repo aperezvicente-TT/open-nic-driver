@@ -281,4 +281,16 @@ static inline void onic_write_reg(struct onic_hardware *hw, u32 offset, u32 val)
 #define ONIC_EN_RSS_KEY_SIZE	  			    40
 
 
+
+/* Plugin diagnostic counters (BAR2), Ch. 4 §4.5 / Ch. 9 */
+#define PLUGIN_OFFSET_RX0_ADAP_IN			0x100000
+#define PLUGIN_OFFSET_RX1_ADAP_IN			0x100018
+#define PLUGIN_OFFSET_RX_MARK_MISMATCH			0x100040
+#define PLUGIN_OFFSET_TX_QID_CHANGED			0x100044
+
+/* QDMA global C2H statistics (BAR0), read via onic_qdma_read_stat() */
+#define QDMA_OFFSET_C2H_STAT_S_AXIS_ACCEPTED		0xA88
+#define QDMA_OFFSET_C2H_STAT_DESC_RSP_DROP		0xB10
+#define QDMA_OFFSET_C2H_STAT_DESC_RSP_ERR		0xB14
+
 #endif

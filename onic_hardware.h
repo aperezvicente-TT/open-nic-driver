@@ -146,6 +146,7 @@ void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
  * QDMA threshold pools; changes take effect on the next completion update. */
 u8 onic_desc_rngcnt_idx(void);
 u8 onic_cmpl_rngcnt_idx(void);
+u32 onic_qdma_read_stat(unsigned long qdma, u32 offset);
 u32 onic_qdma_cmpl_tick_ns(unsigned long qdma);
 void onic_qdma_get_coalesce(unsigned long qdma, u32 *frames, u32 *usecs);
 int onic_qdma_set_coalesce(unsigned long qdma, u32 frames, u32 usecs);

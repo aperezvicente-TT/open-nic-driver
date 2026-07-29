@@ -30,7 +30,7 @@ extern const char onic_drv_name[];
 extern const char onic_drv_ver[];
 void onic_set_ethtool_ops(struct net_device *netdev);
 // netdev stats are stats kept by the driver, like xdp stats, onic_stats are kept in the NIC and accessed via the on-board registers 
-enum { NETDEV_STATS, ONIC_STATS };
+enum { NETDEV_STATS, ONIC_STATS, QDMA_STATS };
 
 enum {
 	ETHTOOL_XDP_REDIRECT,
@@ -61,6 +61,18 @@ struct onic_stats {
 	.stat1_offset = _stat1, \
 }
 
+
+/* QDMA global C2H statistics, read from BAR0 via the QDMA accessor.  These are
+ * per-device, NOT per-port: one QDMA serves both CMACs, so the same value appears
+ * on both netdevs.  Per-port RX loss is instead derived from the plugin's
+ * per-CMAC adap_in counter below minus that netdev's rx_packets. */
+#define _STAT_QDMA(_name, _off) { \
+	.stat_string = _name, \
+	.type = QDMA_STATS, \
+	.sizeof_stat = sizeof(u32), \
+	.stat0_offset = _off, \
+	.stat1_offset = _off, \
+}
 
 #define _STAT_NETDEV(_name,_stat) {\
 	.stat_string = _name, \
@@ -277,6 +289,22 @@ static const struct onic_stats onic_gstrings_stats[] = {
     _STAT_NETDEV("tx_xdp_xmit_errors", ETHTOOL_XDP_XMIT_ERR ),
     _STAT_NETDEV("tx_dropped", ETHTOOL_TX_DROPPED),
     _STAT_NETDEV("tx_errors", ETHTOOL_TX_ERRORS),
+    /* --- C2H receive-loss visibility (Ch. 13 §13.2) ------------------------
+     * netdev rx_dropped reads 0 while QDMA discards packets, so before this the
+     * only evidence was a raw BAR0 register.  A ConnectX-7 reports the same class
+     * of drop directly in rx_dropped. */
+    _STAT_ONIC("plugin_rx_adap_in",            /* per-CMAC, BAR2 plugin diag */
+          PLUGIN_OFFSET_RX0_ADAP_IN,
+          PLUGIN_OFFSET_RX1_ADAP_IN),
+    _STAT_ONIC("plugin_rx_mark_mismatch",      /* trip-wire, must stay 0 */
+          PLUGIN_OFFSET_RX_MARK_MISMATCH,
+          PLUGIN_OFFSET_RX_MARK_MISMATCH),
+    _STAT_ONIC("plugin_tx_qid_changed",        /* trip-wire, must stay 0 */
+          PLUGIN_OFFSET_TX_QID_CHANGED,
+          PLUGIN_OFFSET_TX_QID_CHANGED),
+    _STAT_QDMA("qdma_c2h_accepted",     QDMA_OFFSET_C2H_STAT_S_AXIS_ACCEPTED),
+    _STAT_QDMA("qdma_c2h_desc_rsp_drop", QDMA_OFFSET_C2H_STAT_DESC_RSP_DROP),
+    _STAT_QDMA("qdma_c2h_desc_rsp_err",  QDMA_OFFSET_C2H_STAT_DESC_RSP_ERR),
 };
 
 #define ONIC_QUEUE_STATS_LEN 0
@@ -465,6 +493,10 @@ static void onic_get_ethtool_stats(struct net_device *netdev,
         else
           off = onic_gstrings_stats[i].stat1_offset;
         data[i] = onic_read_reg(hw, off);
+      } else if (onic_gstrings_stats[i].type == QDMA_STATS) {
+        /* device-global: same value on both netdevs, see _STAT_QDMA */
+        data[i] = onic_qdma_read_stat(hw->qdma,
+                                     onic_gstrings_stats[i].stat0_offset);
       } else {
         switch (onic_gstrings_stats[i].stat0_offset) {
 

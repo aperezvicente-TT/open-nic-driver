@@ -210,6 +210,17 @@ struct onic_private {
 
 	struct onic_hardware hw;
 
+	/* RX-loss accounting (Ch. 13 §13.2).  The plugin's per-CMAC adap_in counter
+	 * (BAR2) counts frames handed to the adapter; the netdev counts frames
+	 * delivered to the stack.  The difference is what QDMA discarded, and it is
+	 * the only *per-port* view of it -- the QDMA DESC_RSP_DROP register is
+	 * device-global.  The hardware counter is 32-bit and never resets, while the
+	 * netdev counters reset on every driver load, so accumulate deltas rather
+	 * than subtracting raw values. */
+	u32 rx_adap_in_last;
+	u64 rx_adap_in_total;
+	u64 rx_missed_acc;
+
 	unsigned long cmac_last_enable_jiffies[ONIC_MAX_CMACS]; /* IRQ debounce */
 
 	/* Workqueue item for link-recovery (cable replug).  Scheduled from

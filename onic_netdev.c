@@ -1078,6 +1078,16 @@ int onic_update_carrier(struct net_device *dev)
 
 int onic_open_netdev(struct net_device *dev)
 {
+	struct onic_private *priv_stats = netdev_priv(dev);
+	/* Seed the RX-loss baseline: the plugin counter is cumulative since bitstream
+	 * load, so without this the first get_stats64 would report ~700M "missed". */
+	priv_stats->rx_adap_in_last =
+		onic_read_reg(&priv_stats->hw,
+			      priv_stats->cmac_id ? PLUGIN_OFFSET_RX1_ADAP_IN
+						  : PLUGIN_OFFSET_RX0_ADAP_IN);
+	priv_stats->rx_adap_in_total = 0;
+	priv_stats->rx_missed_acc = 0;
+
 	struct onic_private *priv = netdev_priv(dev);
 	int rv;
 
@@ -1350,6 +1360,38 @@ inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s
 	stats->rx_bytes = total_stats.rx_bytes;
 	stats->tx_dropped = total_stats.tx_dropped;
 	stats->tx_errors = total_stats.tx_errors;
+
+	/*
+	 * Per-port receive loss.  Before this, rx_dropped read 0 while QDMA discarded
+	 * packets and the only evidence was a raw BAR0 register -- a ConnectX-7 in the
+	 * same box reports the identical class of drop in rx_dropped (Ch. 13 §13.2).
+	 *
+	 * plugin adap_in counts frames the plugin handed to the adapter for THIS CMAC;
+	 * rx_packets counts what reached the stack.  Accumulate the 32-bit hardware
+	 * delta (natural u32 wrap) so a counter that never resets can be compared
+	 * against netdev counters that reset on driver load.
+	 *
+	 * Caveat: if get_stats64 is not called for >2^32 frames (~50 min at line rate)
+	 * the hardware counter wraps more than once and the loss is undercounted.
+	 */
+	{
+		u32 now = onic_read_reg(&priv->hw,
+				       priv->cmac_id ? PLUGIN_OFFSET_RX1_ADAP_IN
+						     : PLUGIN_OFFSET_RX0_ADAP_IN);
+
+		priv->rx_adap_in_total += (u32)(now - priv->rx_adap_in_last);
+		priv->rx_adap_in_last = now;
+
+		if (priv->rx_adap_in_total > stats->rx_packets) {
+			u64 missed = priv->rx_adap_in_total - stats->rx_packets;
+
+			/* monotonic: never let a sampling skew walk it backwards */
+			if (missed > priv->rx_missed_acc)
+				priv->rx_missed_acc = missed;
+		}
+		stats->rx_missed_errors = priv->rx_missed_acc;
+		stats->rx_dropped = priv->rx_missed_acc;
+	}
 }
 
 
