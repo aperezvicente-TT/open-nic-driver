@@ -27,6 +27,7 @@
 #include <linux/bpf_trace.h>
 #include <linux/ip.h>
 #include <linux/ktime.h>
+#include <linux/log2.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #include <net/page_pool/helpers.h>
@@ -44,7 +45,21 @@
 #include "onic.h"
 #include "onic_ptp.h"
 
-#define ONIC_RX_DESC_STEP 256
+/*
+ * Size of the posted-descriptor window, in descriptors.
+ *
+ * onic_rx_high_watermark() refills when fewer than ONIC_RX_DESC_STEP/2 remain
+ * posted, and onic_rx_refill() advances the head by ONIC_RX_DESC_STEP.  Steady
+ * state therefore keeps only [STEP/2, 1.5*STEP] descriptors visible to hardware
+ * -- ~128-384 at the historical 256 -- *independently of the ring size*.  That is
+ * why an 8x ring-depth change (2049 -> 16385) measured no difference in
+ * DESC_RSP_DROP: the ring was never the limit, this window was.
+ */
+static int rx_desc_step = 256;
+module_param(rx_desc_step, int, 0444);
+MODULE_PARM_DESC(rx_desc_step,
+	"RX posted-descriptor window in descriptors (default 256; must be <= ring size)");
+#define ONIC_RX_DESC_STEP (rx_desc_step)
 
 inline static u16 onic_ring_get_real_count(struct onic_ring *ring)
 {
@@ -873,6 +888,22 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	/* allocate DMA memory for RX descriptor ring */
 	ring = &q->desc_ring;
 	ring->count = onic_ring_count(desc_rngcnt_idx);
+
+	/* The refill window must fit inside the ring with room to spare: steady state
+	 * holds up to 1.5x the step posted, and next_to_use wraps modulo the real
+	 * count.  An oversized step silently wedges the datapath (measured: step 4096
+	 * against a 2049-entry ring accepted zero packets, with no error anywhere), so
+	 * clamp loudly instead. */
+	if (rx_desc_step * 2 > ring->count) {
+		int clamped = rounddown_pow_of_two(max(64, ring->count / 4));
+
+		if (clamped != rx_desc_step) {
+			netdev_warn(dev,
+				    "rx_desc_step %d too large for a %u-entry ring; clamping to %d\n",
+				    rx_desc_step, ring->count, clamped);
+			rx_desc_step = clamped;
+		}
+	}
 	real_count = ring->count - 1;
 
 	size = QDMA_C2H_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
