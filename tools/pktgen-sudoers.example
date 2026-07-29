@@ -1,0 +1,76 @@
+# /etc/sudoers.d/onic-pktgen
+#
+# Closes the one privilege gap that stops the open-nic RX-drop measurement harness
+# from using the kernel packet generator. Install ON THE SENDER (desktop-0); the
+# same file is also useful on the receiver if you ever want to generate in the
+# other direction.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS MISSING TODAY, EXACTLY
+# ---------------------------------------------------------------------------
+# /proc/net/pktgen/* is created by the kernel as  -rw-------  root:root.
+# An unprivileged process can neither read nor write it:
+#
+#     $ echo reset > /proc/net/pktgen/pgctrl
+#     bash: /proc/net/pktgen/pgctrl: Permission denied
+#     $ cat /proc/net/pktgen/kpktgend_0
+#     cat: /proc/net/pktgen/kpktgend_0: Permission denied
+#
+# LOADING the module is already permitted passwordlessly by the existing rule
+#     (root) NOPASSWD: ..., /usr/sbin/modprobe, /usr/sbin/rmmod, /usr/sbin/insmod, ...
+# so `sudo -n modprobe pktgen` works. That is necessary but NOT sufficient: without
+# a way to write the proc files, the generator can be loaded and never configured.
+#
+# None of the generic escape hatches is in the NOPASSWD set, and none should be
+# added -- each is unrestricted root:
+#     sudo -n sh -c '...'    -> sudo: a password is required
+#     sudo -n tee FILE       -> sudo: a password is required
+#     sudo -n dd of=FILE     -> sudo: a password is required
+#     sudo -n bash -c '...'  -> sudo: a password is required
+#
+# Do NOT be tempted by a rule like
+#     alex ALL=(root) NOPASSWD: /usr/bin/tee /proc/net/pktgen/*
+# In sudoers, wildcards in COMMAND ARGUMENTS do match '/', so that pattern also
+# matches /proc/net/pktgen/../../../etc/shadow. It is full root.
+#
+# ---------------------------------------------------------------------------
+# INSTALL
+# ---------------------------------------------------------------------------
+#   TOOLS=/home/alex/mpi-shfs/fpga/open-nic-driver/tools
+#   sudo install -o root -g root -m 0755 $TOOLS/pktgen-proc-write /usr/local/sbin/
+#   sudo install -o root -g root -m 0440 $TOOLS/pktgen-sudoers.example \
+#        /etc/sudoers.d/onic-pktgen
+#   sudo visudo -cf /etc/sudoers.d/onic-pktgen      # must print "parsed OK"
+#
+# The helper MUST be copied to /usr/local/sbin (root-owned, root-writable-only).
+# Whitelisting it at its path inside the repo would be equivalent to unrestricted
+# root, because the repo sits on a user-writable NFS share.
+#
+# ---------------------------------------------------------------------------
+# THE RULE
+# ---------------------------------------------------------------------------
+# One command, no arguments wildcarded in a path position. The helper itself
+# validates its NAME argument against ^(pgctrl|kpktgend_[0-9]+|<ifname>@[0-9]+)$
+# and its value against a fixed pktgen keyword list, so it cannot write outside
+# /proc/net/pktgen.
+
+alex ALL=(root) NOPASSWD: /usr/local/sbin/pktgen-proc-write
+
+# Residual capability this grants, stated plainly: whoever can run the helper can
+# make this host transmit arbitrary-rate traffic out of any of its interfaces.
+# That is the intended function. Grant it on a test bench only.
+#
+# ---------------------------------------------------------------------------
+# ALTERNATIVE WITH NO SUDOERS CHANGE AT ALL
+# ---------------------------------------------------------------------------
+# This account already has `(ALL : ALL) ALL` with a password, so a human at a
+# terminal can simply run the generator directly and skip everything above:
+#
+#   sudo modprobe pktgen
+#   sudo /home/alex/mpi-shfs/fpga/open-nic-driver/tools/pktgen-sender.sh \
+#        --dev enp130s0f0np0 --dst-ip 10.98.0.1 --dst-mac 00:0a:35:0d:c2:00 \
+#        --src-ip 10.98.0.2 --pps 500000 --count 5000000 --frame-size 9014
+#
+# What that costs: the run cannot be launched from the receiver over ssh, so
+# flowctl-bench.sh --gate cannot drive `--gen pktgen` unattended. Use
+# `--gen udp-pacer` (no privileges needed) until the rule above is installed.

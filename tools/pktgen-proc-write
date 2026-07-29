@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# pktgen-proc-write -- minimal, auditable root helper for /proc/net/pktgen access.
+#
+# THIS FILE IS MEANT TO BE INSTALLED ROOT-OWNED IN A ROOT-ONLY DIRECTORY and then
+# whitelisted in sudoers. Do NOT whitelist it at its path inside the repo: the
+# repo lives on a user-writable NFS share, so a sudoers rule pointing there would
+# be equivalent to handing out unrestricted root.
+#
+#   sudo install -o root -g root -m 0755 pktgen-proc-write /usr/local/sbin/
+#   sudo install -o root -g root -m 0440 pktgen-sudoers.example /etc/sudoers.d/onic-pktgen
+#   sudo visudo -cf /etc/sudoers.d/onic-pktgen
+#
+# Why this exists: /proc/net/pktgen/* is created by the kernel as -rw------- root:root,
+# so an unprivileged process can neither read nor write it. The obvious workarounds
+# (sudo sh -c, sudo tee, sudo dd) are all general-purpose root and are correctly
+# absent from the NOPASSWD set on this bench. This helper is the narrow alternative:
+# it can only ever touch files directly inside /proc/net/pktgen, whose names it
+# validates against a strict pattern, and it accepts only the pktgen keywords the
+# measurement harness actually needs.
+#
+# Usage:
+#   pktgen-proc-write -l                       load the pktgen module if needed
+#   pktgen-proc-write -r NAME                  read /proc/net/pktgen/NAME
+#   pktgen-proc-write NAME VALUE...            write "VALUE..." to it
+#
+# NAME must match:  pgctrl | kpktgend_<digits> | <ifname>@<digits>
+# The written value must match the allowed keyword set below.
+#
+# Security notes / deliberate limits:
+#   * NAME is matched against an explicit regex, so it cannot contain '/' or '..'
+#     and therefore cannot escape /proc/net/pktgen.
+#   * The value is matched against a keyword whitelist, so this helper cannot be
+#     used to write anything else anywhere.
+#   * It does not exec anything except `modprobe pktgen` under -l.
+#   * pktgen can transmit arbitrary traffic out of any interface. Anyone allowed
+#     to run this helper can therefore generate load on this host's NICs. That is
+#     the whole point; grant it only on a test bench.
+#
+set -euo pipefail
+
+PROG=${0##*/}
+PG=/proc/net/pktgen
+
+die() { printf '%s: FATAL: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  pktgen-proc-write -l                load the pktgen module (idempotent)
+  pktgen-proc-write -r NAME           print /proc/net/pktgen/NAME
+  pktgen-proc-write NAME VALUE...     write VALUE... to /proc/net/pktgen/NAME
+  pktgen-proc-write -h                this text
+
+NAME  : pgctrl | kpktgend_<n> | <ifname>@<n>
+VALUE : one of the pktgen keywords the onic measurement harness uses:
+        start stop reset
+        add_device rem_device_all
+        count clone_skb pkt_size delay burst frag
+        dst dst_min dst_max src_min src_max dst_mac src_mac
+        udp_src_min udp_src_max udp_dst_min udp_dst_max
+        queue_map_min queue_map_max flag
+EOF
+}
+
+# ------------------------------------------------------------------ modes -----
+MODE=write
+if [ $# -ge 1 ]; then
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -l|--load) MODE=load; shift ;;
+        -r|--read) MODE=read; shift ;;
+    esac
+fi
+
+if [ "$MODE" = load ]; then
+    [ $# -eq 0 ] || die "-l takes no further arguments"
+    if [ ! -d "$PG" ]; then
+        modprobe pktgen || die "modprobe pktgen failed"
+    fi
+    [ -d "$PG" ] || die "pktgen loaded but $PG is absent"
+    printf 'pktgen ready at %s\n' "$PG"
+    exit 0
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+NAME=$1; shift
+
+# ---- validate NAME. No '/', no '..', nothing outside $PG. --------------------
+if ! [[ $NAME =~ ^(pgctrl|kpktgend_[0-9]{1,5}|[A-Za-z0-9._-]{1,15}@[0-9]{1,5})$ ]]; then
+    die "refusing NAME '$NAME': must be pgctrl, kpktgend_<n>, or <ifname>@<n>"
+fi
+TARGET=$PG/$NAME
+
+if [ "$MODE" = read ]; then
+    [ $# -eq 0 ] || die "-r takes exactly one NAME"
+    [ -d "$PG" ] || die "$PG does not exist (pktgen not loaded; run '$PROG -l' first)"
+    [ -e "$TARGET" ] || die "$TARGET does not exist"
+    cat -- "$TARGET"
+    exit 0
+fi
+
+# ---- validate the value ------------------------------------------------------
+[ $# -ge 1 ] || die "no value given to write to $NAME"
+VALUE="$*"
+
+KEYWORD=${VALUE%% *}
+case "$KEYWORD" in
+    start|stop|reset|rem_device_all|add_device|count|clone_skb|pkt_size|delay|\
+burst|frag|dst|dst_min|dst_max|src_min|src_max|dst_mac|src_mac|\
+udp_src_min|udp_src_max|udp_dst_min|udp_dst_max|\
+queue_map_min|queue_map_max|flag) : ;;
+    *) die "refusing to write '$KEYWORD ...': not in the allowed pktgen keyword set" ;;
+esac
+case "$VALUE" in
+    *$'\n'*) die "refusing a value containing a newline" ;;
+esac
+if [ "${#VALUE}" -gt 128 ]; then die "refusing an over-long value (${#VALUE} bytes)"; fi
+
+[ -d "$PG" ] || die "$PG does not exist (pktgen not loaded; run '$PROG -l' first)"
+[ -e "$TARGET" ] || die "$TARGET does not exist (add_device it first?)"
+printf '%s\n' "$VALUE" > "$TARGET" || die "kernel rejected: echo '$VALUE' > $TARGET"
+exit 0
