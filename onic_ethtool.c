@@ -787,6 +787,120 @@ static int onic_set_coalesce(struct net_device *netdev,
 	return 0;
 }
 
+/*
+ * Link-level (802.3x) flow control -- shell docs Ch. 13 §13.3 / Ch. 10 §1.5.
+ *
+ * The CMAC USplus pause machinery is configured entirely through AXI-Lite CSRs in
+ * this design (no flow-control IP generics are set, see §13.3), and
+ * onic_enable_cmac() already programs it on every CMAC enable:
+ *
+ *   CONF_TX_FC_CTRL_1 (0x8030) = 0x000001FF   ctl_tx_pause_enable[8:0]
+ *   CONF_RX_FC_CTRL_1 (0x8084) = 0x00003DFF   ctl_rx_pause_enable[8:0] + GCP/PCP
+ *                                             frame-check enables in [13:10]
+ *   CONF_RX_FC_CTRL_2 (0x8088) = 0x0001C631   pause-frame recognition (DA/SA/
+ *                                             etype/opcode checks)
+ *   CONF_TX_FC_QNTA_1..5, CONF_TX_FC_RFRH_1..5 = max (0xFFFF per priority)
+ *
+ * In both CTRL_1 registers the enable vector is bits [8:0]: [7:0] are the eight
+ * PFC priorities and [8] is global/link-level pause, which is what ethtool's
+ * rx_pause/tx_pause mean.  So these ops read-modify-write bit 8 only, per CMAC,
+ * leaving the PFC enables, the frame-check bits and the quanta/refresh values
+ * exactly as onic_enable_cmac() left them -- and leaving the other port's CMAC
+ * untouched, which matters because the two CMACs share one PF (§13.4).
+ *
+ * autoneg is always false: the CMAC does not negotiate flow control (there is no
+ * 802.3 clause-73 pause negotiation in this path), so the setting is purely
+ * administrative on both ends.
+ *
+ * ############################  READ THIS  ############################
+ * Neither direction is functionally complete in gateware today:
+ *
+ *  - tx_pause (pause GENERATION) requires RTL that does not exist yet.  The shell
+ *    ties the CMAC's pause request off:
+ *        cmac_subsystem_cmac_wrapper.sv:343  assign ctl_tx_pause_req = 9'b0;
+ *    Nothing drives it from RX-path FIFO fill (§13.4 is the open work item).
+ *    Enabling tx_pause here therefore configures the CMAC correctly but NO PAUSE
+ *    FRAME WILL EVER BE EMITTED -- `ethtool -S | grep tx_pause` stays at 0 until
+ *    that RTL lands.  This op is deliberately not made to look like it works.
+ *
+ *  - rx_pause (pause REACTION) is enabled in the CMAC, and the CMAC does raise
+ *    stat_rx_pause_req[8:0], but no shell logic reads it (§13.3.1) and the CMAC
+ *    USplus does not self-throttle TX on received pause.  So a peer that pauses
+ *    us is currently ignored.  Reporting rx_pause "on" reflects the CMAC's
+ *    configuration, which is all a driver can observe or control.
+ * #####################################################################
+ */
+#define CMAC_FC_GLOBAL_PAUSE	BIT(8)	/* ctl_{tx,rx}_pause_enable[8] */
+
+static void onic_get_pauseparam(struct net_device *netdev,
+				struct ethtool_pauseparam *pause)
+{
+	struct onic_private *priv = netdev_priv(netdev);
+	struct onic_hardware *hw = &priv->hw;
+	u8 cmac_idx = priv->cmac_id;
+	u32 tx_ctrl, rx_ctrl;
+
+	/* Always report actual hardware state -- no cached software copy.  The
+	 * CSRs are the only place this configuration lives. */
+	tx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_TX_FC_CTRL_1(cmac_idx));
+	rx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_RX_FC_CTRL_1(cmac_idx));
+
+	pause->autoneg  = AUTONEG_DISABLE;
+	pause->rx_pause = !!(rx_ctrl & CMAC_FC_GLOBAL_PAUSE);
+	pause->tx_pause = !!(tx_ctrl & CMAC_FC_GLOBAL_PAUSE);
+}
+
+static int onic_set_pauseparam(struct net_device *netdev,
+			       struct ethtool_pauseparam *pause)
+{
+	struct onic_private *priv = netdev_priv(netdev);
+	struct onic_hardware *hw = &priv->hw;
+	u8 cmac_idx = priv->cmac_id;
+	u32 tx_ctrl, rx_ctrl;
+
+	/* No flow-control autonegotiation in this datapath. */
+	if (pause->autoneg != AUTONEG_DISABLE)
+		return -EINVAL;
+
+	tx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_TX_FC_CTRL_1(cmac_idx));
+	rx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_RX_FC_CTRL_1(cmac_idx));
+
+	if (pause->rx_pause)
+		rx_ctrl |= CMAC_FC_GLOBAL_PAUSE;
+	else
+		rx_ctrl &= ~CMAC_FC_GLOBAL_PAUSE;
+
+	if (pause->tx_pause)
+		tx_ctrl |= CMAC_FC_GLOBAL_PAUSE;
+	else
+		tx_ctrl &= ~CMAC_FC_GLOBAL_PAUSE;
+
+	onic_write_reg(hw, CMAC_OFFSET_CONF_RX_FC_CTRL_1(cmac_idx), rx_ctrl);
+	onic_write_reg(hw, CMAC_OFFSET_CONF_TX_FC_CTRL_1(cmac_idx), tx_ctrl);
+
+	/* Read back so the log records what the CMAC actually holds, not what was
+	 * asked for. */
+	tx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_TX_FC_CTRL_1(cmac_idx));
+	rx_ctrl = onic_read_reg(hw, CMAC_OFFSET_CONF_RX_FC_CTRL_1(cmac_idx));
+
+	netdev_info(netdev,
+		    "pause: cmac%u rx %s tx %s (autoneg off) [RX_FC_CTRL_1=0x%08x TX_FC_CTRL_1=0x%08x]\n",
+		    cmac_idx,
+		    (rx_ctrl & CMAC_FC_GLOBAL_PAUSE) ? "on" : "off",
+		    (tx_ctrl & CMAC_FC_GLOBAL_PAUSE) ? "on" : "off",
+		    rx_ctrl, tx_ctrl);
+
+	/* Be explicit rather than let an operator believe pause is now working. */
+	if (tx_ctrl & CMAC_FC_GLOBAL_PAUSE)
+		netdev_warn(netdev,
+			    "pause: tx_pause enabled in the CMAC, but the shell ties ctl_tx_pause_req to 0 -- no pause frame will be emitted until the RX-fill -> pause-request RTL lands (shell docs Ch. 13 §13.4)\n");
+	if (rx_ctrl & CMAC_FC_GLOBAL_PAUSE)
+		netdev_warn(netdev,
+			    "pause: rx_pause enabled in the CMAC, but no shell logic consumes stat_rx_pause_req -- received pause frames are counted, not acted on (shell docs Ch. 13 §13.3.1)\n");
+
+	return 0;
+}
+
 static const struct ethtool_ops onic_ethtool_ops = {
     .supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
 				 ETHTOOL_COALESCE_RX_MAX_FRAMES,
@@ -799,6 +913,8 @@ static const struct ethtool_ops onic_ethtool_ops = {
     .get_link_ksettings  = onic_get_link_ksettings,
     .get_fecparam        = onic_get_fecparam,
     .set_fecparam        = onic_set_fecparam,
+    .get_pauseparam      = onic_get_pauseparam,
+    .set_pauseparam      = onic_set_pauseparam,
     .get_ethtool_stats   = onic_get_ethtool_stats,
     .get_strings         = onic_get_strings,
     .get_sset_count      = onic_get_sset_count,
