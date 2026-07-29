@@ -64,15 +64,65 @@
  * latency tradeoff can be measured without a rebuild; 0/0 reproduces the
  * historical behaviour.  Applies at queue init, so set before bringing links up.
  */
-static int cmpl_cnt_idx;
+/* Defaults chosen from measurement (shell docs Ch. 8 §8.8, Ch. 12 §12.1):
+ * index 7 = 64 completion entries, index 9 = 30 ticks = 3.0 us at 100 ns/tick.
+ * Single-port RX 34.4 -> 98.8 Gbit/s versus the historical 0/0 (2 entries,
+ * 1 tick), with average ping latency unchanged (0.099 -> 0.100 ms) because the
+ * timer bounds how long a lone packet waits.  Override per-device at runtime
+ * with `ethtool -C`. */
+#define ONIC_CMPL_CNT_IDX_DEFAULT 7
+#define ONIC_CMPL_TMR_IDX_DEFAULT 9
+
+static int cmpl_cnt_idx = ONIC_CMPL_CNT_IDX_DEFAULT;
 module_param(cmpl_cnt_idx, int, 0644);
 MODULE_PARM_DESC(cmpl_cnt_idx,
-	"C2H completion counter-threshold pool index 0-15 (default 0 = 2 packets)");
+	"C2H completion counter-threshold pool index 0-15 (default 7 = 64 entries)");
 
-static int cmpl_tmr_idx;
+static int cmpl_tmr_idx = ONIC_CMPL_TMR_IDX_DEFAULT;
 module_param(cmpl_tmr_idx, int, 0644);
 MODULE_PARM_DESC(cmpl_tmr_idx,
-	"C2H completion timer pool index 0-15 (default 0 = 1 tick)");
+	"C2H completion timer pool index 0-15 (default 9 = 30 ticks = 3.0 us)");
+
+/*
+ * QDMA completion-context "full update" bit.
+ *
+ * With full_upd=0 (the historical setting) a CMPT CIDX write updates only the
+ * consumer index; the counter_idx / timer_idx / trig_mode fields it carries are
+ * ignored, so coalescing can only be changed by rewriting the context — i.e. by
+ * re-initialising the queue.  With full_upd=1 those fields are applied from every
+ * CIDX update, which is the in-place path adaptive moderation needs
+ * (shell docs Ch. 12 Step 1).
+ */
+static bool cmpl_full_upd;   /* default false: full_upd=1 was measured to buy nothing */
+module_param(cmpl_full_upd, bool, 0444);
+MODULE_PARM_DESC(cmpl_full_upd,
+	"set the QDMA completion-context full-update bit (default false; measured to NOT enable in-place coalescing changes -- see shell docs Ch. 12 §12.4)");
+
+/* RX descriptor / completion ring depth, as pool indices (rngcnt_pool above:
+ * index 0 = 2049, index 15 = 16385).  Exposed because coalescing changes how
+ * often NAPI refills the descriptor ring, so the depth that suffices at
+ * 2-entry coalescing may not suffice at 64. */
+static int desc_rngcnt_idx;
+module_param(desc_rngcnt_idx, int, 0444);
+MODULE_PARM_DESC(desc_rngcnt_idx,
+	"RX descriptor ring size pool index 0-15 (default 0 = 2049 entries)");
+
+static int cmpl_rngcnt_idx;
+module_param(cmpl_rngcnt_idx, int, 0444);
+MODULE_PARM_DESC(cmpl_rngcnt_idx,
+	"RX completion ring size pool index 0-15 (default 0 = 2049 entries)");
+
+u8 onic_desc_rngcnt_idx(void)
+{
+	return (desc_rngcnt_idx >= 0 && desc_rngcnt_idx < QDMA_NUM_DESC_RNGCNT)
+		? (u8)desc_rngcnt_idx : 0;
+}
+
+u8 onic_cmpl_rngcnt_idx(void)
+{
+	return (cmpl_rngcnt_idx >= 0 && cmpl_rngcnt_idx < QDMA_NUM_DESC_RNGCNT)
+		? (u8)cmpl_rngcnt_idx : 0;
+}
 
 static inline u8 onic_cmpl_cnt_idx(void)
 {
@@ -655,7 +705,7 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	cmpl_ctxt.baddr = param->cmpl_dma_addr;
 	cmpl_ctxt.desc_sz = param->cmpl_desc_sz;
 	cmpl_ctxt.valid = 1;
-	cmpl_ctxt.full_upd = 0;
+	cmpl_ctxt.full_upd = cmpl_full_upd ? 1 : 0;
 	cmpl_ctxt.ovf_chk_dis = 0;
 	cmpl_ctxt.vec = param->vid;
 	cmpl_ctxt.intr_aggr = 0;

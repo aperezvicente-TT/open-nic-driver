@@ -669,6 +669,24 @@ static int onic_get_ts_info(struct net_device *dev,
 }
 
 /*
+ * Whether set_coalesce re-initialises the queues to apply a change.
+ *
+ * Needed today because the governing thresholds live in the per-queue completion
+ * context (see onic_set_coalesce).  Adaptive moderation (DIM, shell docs Ch. 12)
+ * changes profiles every few milliseconds and cannot bounce queues, so it needs a
+ * path that applies a change in place.  Setting this to 0 exercises exactly that
+ * path -- the counter/timer fields carried by each CMPT CIDX update, with no
+ * re-init -- which is how Ch. 12 Step 1 determines whether such a path exists.
+ *
+ * Leave at 1 for correct behaviour; 0 is a measurement aid.
+ */
+static bool coalesce_bounce = true;
+module_param(coalesce_bounce, bool, 0644);
+MODULE_PARM_DESC(coalesce_bounce,
+	"re-init queues on ethtool -C so the change actually applies (default true; "
+	"0 = CIDX-only path, for measuring whether in-place application works)");
+
+/*
  * C2H completion coalescing.  RX only -- the H2C side has no equivalent
  * completion-interrupt moderation in this design.
  *
@@ -714,7 +732,7 @@ static int onic_set_coalesce(struct net_device *netdev,
 	 * 98.5 Gbit/s.  So bounce the queues, as other drivers do for coalesce
 	 * and ring changes.  Costs a brief link flap.
 	 */
-	if (netif_running(netdev)) {
+	if (netif_running(netdev) && coalesce_bounce) {
 		rv = onic_stop_netdev(netdev);
 		if (rv < 0)
 			netdev_warn(netdev, "coalesce: stop failed (%d)\n", rv);

@@ -831,8 +831,8 @@ err_free_pp:
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 {
-	const u8 desc_rngcnt_idx = 0;
-	const u8 cmpl_rngcnt_idx = 0;
+	const u8 desc_rngcnt_idx = onic_desc_rngcnt_idx();
+	const u8 cmpl_rngcnt_idx = onic_cmpl_rngcnt_idx();
 	/*
 	 * Pick QDMA C2H buffer size and page order based on MTU.
 	 * c2h_bufsz_pool: {4096,256,512,1024,2048,3968,4096,4096,
