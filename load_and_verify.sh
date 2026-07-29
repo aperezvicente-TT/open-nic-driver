@@ -10,12 +10,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 KO=./onic.ko
 
-echo "== 1. dependency: ib_core (onic links OFED ib_* symbols) =="
-if ! lsmod | grep -q '^ib_core'; then
-  echo "   ib_core not loaded — attempting modprobe ib_core"
-  sudo modprobe ib_core || { echo "   ERROR: ib_core unavailable; onic insmod will fail"; exit 1; }
+echo "== 1. dependencies =="
+# The RDMA sources are excluded from the build (Makefile BUILD_RDMA=0), so onic
+# no longer links OFED ib_* symbols and ib_core is not required.  Only check it
+# when the module actually declares a dependency.
+if [[ -n "$(modinfo -F depends "$KO" 2>/dev/null)" ]]; then
+  echo "   onic.ko depends on: $(modinfo -F depends "$KO")"
+  for m in $(modinfo -F depends "$KO" | tr ',' ' '); do
+    lsmod | grep -q "^${m}\b" || sudo modprobe "$m" || {
+      echo "   ERROR: cannot load dependency $m"; exit 1; }
+  done
+else
+  echo "   none (pure-Ethernet build: no OFED/ib_core dependency)"
 fi
-echo "   ib_core: $(lsmod | awk '/^ib_core/{print "loaded ("$2" bytes)"}')"
 
 echo "== 2. remove any stale onic =="
 if lsmod | grep -q '^onic'; then sudo rmmod onic && echo "   removed stale onic"; else echo "   none loaded"; fi
@@ -43,5 +50,19 @@ else
   done
   [[ ${#ND[@]} -eq 2 ]] && echo "   => 2 netdevs on one PF: PASS" \
                         || echo "   => got ${#ND[@]} (want 2): check dmesg / num_cmacs / bitstream"
+fi
+
+echo "== 6. build stamp (which bitstream is live) =="
+BDF=$(lspci -D -d 10ee: | awk '{print $1; exit}')
+# Prefer the root-owned helper installed by tools/install-bringup-sudoers.sh so
+# this step does not need a password; fall back to the in-repo script.
+READER=""
+[[ -x /usr/local/sbin/onic-bar-read ]] && READER=/usr/local/sbin/onic-bar-read
+[[ -z "$READER" && -x tools/bar_read.py ]] && READER=./tools/bar_read.py
+if [[ -n "$BDF" && -n "$READER" ]]; then
+  sudo "$READER" "$BDF" 0x0 || true
+  echo "   (compare against -build_timestamp in the shell build's DESIGN_PARAMETERS)"
+else
+  echo "   skipped: no 10ee device or tools/bar_read.py missing"
 fi
 echo "== done =="

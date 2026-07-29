@@ -16,6 +16,7 @@
  */
 #include <linux/delay.h>
 #include <linux/pci.h>
+#include <linux/moduleparam.h>
 
 #include "onic_hardware.h"
 #include "onic_register.h"
@@ -55,6 +56,36 @@
  * tables here are the QDMA5 values libqdma programs, so the queue-context
  * indices the ST datapath uses now address the correct hardware sizes.
  */
+/* C2H completion coalescing.  These select entries in the threshold pools that
+ * libqdma programs (see the tables above): cnt_th[] packets and tmr_cnt[] timer
+ * ticks.  Both were hardcoded to index 0 -- cnt_th=2 packets, tmr_cnt=1 -- i.e.
+ * an interrupt every couple of packets, which measures as ~3 pkt/irq and
+ * 156k irq/s at 14 RSS queues.  Exposed as parameters so the coalescing vs
+ * latency tradeoff can be measured without a rebuild; 0/0 reproduces the
+ * historical behaviour.  Applies at queue init, so set before bringing links up.
+ */
+static int cmpl_cnt_idx;
+module_param(cmpl_cnt_idx, int, 0644);
+MODULE_PARM_DESC(cmpl_cnt_idx,
+	"C2H completion counter-threshold pool index 0-15 (default 0 = 2 packets)");
+
+static int cmpl_tmr_idx;
+module_param(cmpl_tmr_idx, int, 0644);
+MODULE_PARM_DESC(cmpl_tmr_idx,
+	"C2H completion timer pool index 0-15 (default 0 = 1 tick)");
+
+static inline u8 onic_cmpl_cnt_idx(void)
+{
+	return (cmpl_cnt_idx >= 0 && cmpl_cnt_idx < QDMA_NUM_C2H_COUNTERS)
+		? (u8)cmpl_cnt_idx : 0;
+}
+
+static inline u8 onic_cmpl_tmr_idx(void)
+{
+	return (cmpl_tmr_idx >= 0 && cmpl_tmr_idx < QDMA_NUM_C2H_TIMERS)
+		? (u8)cmpl_tmr_idx : 0;
+}
+
 static const u16 rngcnt_pool[QDMA_NUM_DESC_RNGCNT] = {
 	2049, 65, 129, 193, 257, 385, 513, 769,
 	1025, 1537, 3073, 4097, 6145, 8193, 12289, 16385
@@ -598,8 +629,8 @@ int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 	cmpl_ctxt.intr_en = 1;
 	cmpl_ctxt.trig_mode = 0x5;
 	cmpl_ctxt.func_id = qdev->func_id;
-	cmpl_ctxt.counter_idx = 0;
-	cmpl_ctxt.timer_idx = 0;
+	cmpl_ctxt.counter_idx = onic_cmpl_cnt_idx();
+	cmpl_ctxt.timer_idx = onic_cmpl_tmr_idx();
 	cmpl_ctxt.color = 1;
 	cmpl_ctxt.rngsz_idx = param->cmpl_rngcnt_idx;
 	cmpl_ctxt.baddr = param->cmpl_dma_addr;
@@ -787,7 +818,8 @@ void onic_set_completion_tail(unsigned long qdma, u16 qid, u16 tail, u8 irq_arm)
 	onic_dev_dbg(ONIC_DBG_DATA, &qdev->pdev->dev,
 		     "set_completion_tail qid:%u tail:%u irq_arm:%u",
 		     qid, tail, irq_arm);
-	onic_qdma_set_cmpl_cidx(qdma, qid, tail, 0, 0, trig_mode, stat_en, irq_arm);
+	onic_qdma_set_cmpl_cidx(qdma, qid, tail, onic_cmpl_cnt_idx(),
+				onic_cmpl_tmr_idx(), trig_mode, stat_en, irq_arm);
 
 	if (irq_arm) {
 		offset = QDMA_OFFSET_DMAP_SEL_CMPL_CIDX + ((qdev->q_base + qid) * 16);

@@ -33,6 +33,20 @@ SRC_FOLDERS = . qdma_legacy hwmon \
 
 onic-objs := $(foreach D,$(SRC_FOLDERS),$(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/$(D)/*.c)))
 
+# Dead RDMA/ERNIC sources.  This branch is pure Ethernet: the call sites were
+# stripped (dda0ea7) but the files are still on disk, and the wildcard above
+# would compile them -- which (a) drags in MLNX_OFED because they reference
+# ib_* symbols, and (b) fails outright, since onic_ib.c includes onic_debugfs.h
+# which has never existed in this tree.  Kept on disk for reference only.
+#
+# Set BUILD_RDMA=1 to build them again (requires onic_debugfs.h and OFED).
+BUILD_RDMA ?= 0
+RDMA_SRCS := onic_ib.c onic_ernic_irq.c onic_ddr_alloc.c
+ifneq ($(BUILD_RDMA),1)
+  RDMA_OBJS := $(RDMA_SRCS:.c=.o)
+  onic-objs := $(filter-out $(RDMA_OBJS) $(addprefix ./,$(RDMA_OBJS)),$(onic-objs))
+endif
+
 ccflags-y = -O3 -Wall -I$(srcdir)/qdma_legacy -I$(srcdir)/hwmon -I$(srcdir) \
             $(foreach D,$(SRC_FOLDERS),-I$(srcdir)/$(D))
 ccflags-y += -DMBOX_INTERRUPT_DISABLE
@@ -55,6 +69,7 @@ ifeq ($(wildcard $(OFA_DIR)/Module.symvers),)
   endif
 endif
 
+ifeq ($(BUILD_RDMA),1)
 ifneq ($(wildcard $(OFA_DIR)/Module.symvers),)
   KBUILD_EXTRA_SYMBOLS := $(OFA_DIR)/Module.symvers
   export KBUILD_EXTRA_SYMBOLS
@@ -70,6 +85,9 @@ ifneq ($(wildcard $(OFA_DIR)/Module.symvers),)
   ifneq ($(shell grep -c 'struct ib_dmah \*dmah' $(OFA_DIR)/include/rdma/ib_verbs.h 2>/dev/null),0)
     ccflags-y += -DOFED_HAVE_IB_DMAH
   endif
+endif
+else
+  $(info Pure-Ethernet build: RDMA sources excluded, no MLNX_OFED dependency)
 endif
 
 KDIR ?= /lib/modules/$(KERNEL_VERS)/build
