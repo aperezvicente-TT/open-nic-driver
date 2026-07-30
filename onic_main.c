@@ -36,6 +36,7 @@
 #include "onic_netdev.h"
 #include "onic_ptp.h"
 #include "onic_sysdma.h"
+#include "onic_sysfs.h"
 #include "qdma_legacy/qdma_device.h"
 #include "qdma_legacy/qdma_context.h"
 
@@ -239,6 +240,10 @@ static struct onic_private *onic_alloc_netdev(struct pci_dev *pdev, u8 cmac_id)
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 	netdev->netdev_ops = &onic_netdev_ops;
 	onic_set_ethtool_ops(netdev);
+	/* Per-netdev sysfs attributes (flow-control tuning).  Must happen before
+	 * register_netdev(), which is what copies sysfs_groups[] into the
+	 * device's ->groups; teardown comes free with unregister_netdev(). */
+	onic_sysfs_attach_groups(netdev);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
 	xdp_set_features_flag(netdev, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT);
 #endif

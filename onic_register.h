@@ -275,6 +275,55 @@ static inline void onic_write_reg(struct onic_hardware *hw, u32 offset, u32 val)
 #define CMAC_ADPT_OFFSET_RX_PKT_DROP(i)			(CMAC_ADPT_OFFSET(i) + 0x30)
 #define CMAC_ADPT_OFFSET_RX_PKT_ERROR(i)		(CMAC_ADPT_OFFSET(i) + 0x40)
 
+/* ---------------------------------------------------------------------------
+ * Runtime flow-control tuning CSRs -- shell docs Ch. 13 §13.4 / §13.12 item 5.
+ *
+ * Per CMAC, inside the packet adapter's existing 4 KB register window
+ * (CMAC_ADPT_OFFSET(i)).  0x000-0x04C is the pre-existing 64-bit counter block;
+ * this block starts at 0x080 and is the agreed driver<->gateware contract for
+ * making the XOFF/XON watermarks tunable without an FPGA rebuild.
+ *
+ * Measured motivation: pause generation works (140 frames emitted, 140 received
+ * by the peer CX-7) but total pause time was 34.5 us in 12 s -- a 0.0003 % duty
+ * cycle, so drops did not improve.  The watermarks need sweeping, and each
+ * compile-time change costs a 78-minute rebuild.
+ *
+ * ##### THESE ARE AHEAD OF THE GATEWARE #####
+ * The bitstream loaded when this was written (build stamp 0x07291754) does NOT
+ * decode these addresses.  packet_adapter_register.v answers its case default,
+ *
+ *     default: reg_dout <= 32'hDEADBEEF;   (packet_adapter_register.v:238)
+ *
+ * for every unimplemented offset in this window, which is what makes the
+ * "gateware does not implement this" case detectable rather than silent -- see
+ * ONIC_FC_ABSENT_MAGIC and onic_fc_probe() in onic_sysfs.c.  Writes to an
+ * undecoded offset are accepted on the bus and discarded.
+ * ---------------------------------------------------------------------------
+ */
+#define CMAC_ADPT_OFFSET_FC_CTRL(i)			(CMAC_ADPT_OFFSET(i) + 0x80)
+#define     CMAC_ADPT_FC_CTRL_GEN_EN			BIT(0)	/* pause generation */
+#define     CMAC_ADPT_FC_CTRL_REACT_EN			BIT(1)	/* pause reaction */
+#define     CMAC_ADPT_FC_CTRL_MASK			GENMASK(1, 0)
+
+#define CMAC_ADPT_OFFSET_FC_XOFF_WM(i)			(CMAC_ADPT_OFFSET(i) + 0x84)
+#define CMAC_ADPT_OFFSET_FC_XON_WM(i)			(CMAC_ADPT_OFFSET(i) + 0x88)
+#define CMAC_ADPT_OFFSET_FC_MIN_XOFF(i)			(CMAC_ADPT_OFFSET(i) + 0x8C)
+
+#define CMAC_ADPT_OFFSET_FC_STATUS(i)			(CMAC_ADPT_OFFSET(i) + 0x90)
+#define     CMAC_ADPT_FC_STATUS_XOFF_ACTIVE		BIT(0)
+#define     CMAC_ADPT_FC_STATUS_TX_PAUSE_GATE		BIT(1)
+#define     CMAC_ADPT_FC_STATUS_OCCUPANCY		GENMASK(31, 16)
+#define     CMAC_ADPT_FC_STATUS_OCCUPANCY_SHIFT		16
+
+#define CMAC_ADPT_OFFSET_FC_XOFF_EVENTS(i)		(CMAC_ADPT_OFFSET(i) + 0x94)
+#define CMAC_ADPT_OFFSET_FC_XOFF_CYCLES(i)		(CMAC_ADPT_OFFSET(i) + 0x98)
+
+/* Sentinels for "this bitstream has no flow-control CSRs".  0xDEADBEEF is the
+ * shell's own undecoded-address answer in this window (definitive); all-ones is
+ * the generic no-decode / dead-bus reply. */
+#define ONIC_FC_ABSENT_MAGIC				0xDEADBEEFu
+#define ONIC_FC_ABSENT_ONES				0xFFFFFFFFu
+
 /* INDIRECTION TABLE*/
 #define INDIRECTION_TABLE_BASE_ADDR			  QDMA_FUNC_OFFSET_INDIR_TABLE(0,0)
 #define INDIRECTION_TABLE_SIZE            0x80

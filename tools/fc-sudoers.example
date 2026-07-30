@@ -1,0 +1,33 @@
+# onic flow-control tuning -- example sudoers drop-in.
+#
+# Install (once, by a human with the sudo password, ON THE HOST THAT OWNS THE FPGA):
+#
+#   sudo install -o root -g root -m 0755 \
+#       tools/onic-fc-write /usr/local/sbin/onic-fc-write
+#   sudo install -o root -g root -m 0440 \
+#       tools/fc-sudoers.example /etc/sudoers.d/onic-fc
+#   sudo visudo -cf /etc/sudoers.d/onic-fc          # syntax-check before trusting it
+#
+# Replace `alex` below if the account differs.
+#
+# WHY A HELPER AND NOT `sudo tee`:
+#   /sys/class/net/<dev>/fc_* are root-writable only. `sudo sh -c`, `sudo tee` and
+#   `sudo dd` are all unrestricted root and are deliberately absent from this
+#   bench's NOPASSWD set (see tools/install-bringup-sudoers.sh). onic-fc-write can
+#   only write four fixed attribute names, only on a netdev bound to the onic
+#   driver, and only a decimal value; the driver validates the value on top of
+#   that.
+#
+# WHY THE PATH MATTERS:
+#   Point this rule at /usr/local/sbin, never at the copy inside the repo. The
+#   repo is on a user-writable NFS share, so a sudoers rule naming that path would
+#   let the user replace the helper with anything and is equivalent to full root.
+#
+# WHAT THIS GRANTS:
+#   The ability to turn link-level pause generation/reaction on and off for this
+#   host's FPGA ports and to set the XOFF/XON watermarks. A bad watermark pair can
+#   stall a link (the driver refuses the obviously broken ones). Test bench only.
+
+Cmnd_Alias ONIC_FC = /usr/local/sbin/onic-fc-write, /usr/local/sbin/onic-fc-write *
+
+alex ALL=(root) NOPASSWD: ONIC_FC

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# onic-fc-write -- minimal, auditable root helper for the onic flow-control
+# sysfs attributes.
+#
+# THIS FILE IS MEANT TO BE INSTALLED ROOT-OWNED IN A ROOT-ONLY DIRECTORY and then
+# whitelisted in sudoers. Do NOT whitelist it at its path inside the repo: the
+# repo lives on a user-writable NFS share, so a sudoers rule pointing there would
+# be equivalent to handing out unrestricted root.
+#
+#   sudo install -o root -g root -m 0755 onic-fc-write /usr/local/sbin/
+#   sudo install -o root -g root -m 0440 fc-sudoers.example /etc/sudoers.d/onic-fc
+#   sudo visudo -cf /etc/sudoers.d/onic-fc
+#
+# Why this exists: /sys/class/net/<dev>/fc_* are root-writable only, and the
+# general-purpose workarounds (sudo sh -c, sudo tee, sudo dd) are all equivalent
+# to full root and are correctly absent from this bench's NOPASSWD set --- see
+# tools/install-bringup-sudoers.sh. This helper is the narrow alternative:
+# it can write exactly four attribute names, on a netdev bound to the onic
+# driver, with a decimal value inside the range the driver would accept anyway.
+#
+# Usage:
+#   onic-fc-write DEV ATTR VALUE
+#
+# Deliberate limits:
+#   * DEV is matched against a strict ifname regex, so it cannot contain '/' or
+#     '..' and cannot escape /sys/class/net.
+#   * DEV must be bound to the `onic` driver.
+#   * ATTR is an explicit four-item whitelist. No globbing, no path components.
+#   * VALUE must be decimal digits only, <= 10 characters.
+#   * It execs nothing.
+#   * Worst case for anyone allowed to run it: they can enable/disable link-level
+#     pause on this host's FPGA ports and pick bad watermarks. That is the whole
+#     point of the tuning sweep; grant it on a test bench only.
+#
+set -euo pipefail
+
+PROG=${0##*/}
+
+die() { printf '%s: FATAL: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+Usage: onic-fc-write DEV ATTR VALUE
+
+DEV   : a netdev bound to the onic driver, e.g. enp194s0
+ATTR  : fc_enable | fc_xoff_watermark | fc_xon_watermark | fc_min_xoff_cycles
+VALUE : decimal, no sign, no units
+
+Read-only attributes (fc_status, fc_xoff_events, fc_xoff_cycles) are
+world-readable and need no helper: just cat them.
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+[ $# -eq 3 ] || { usage >&2; exit 2; }
+
+DEV=$1
+ATTR=$2
+VALUE=$3
+
+if ! [[ $DEV =~ ^[A-Za-z0-9._-]{1,15}$ ]]; then
+    die "refusing DEV '$DEV': not a plausible interface name"
+fi
+[ -d "/sys/class/net/$DEV" ] || die "no such netdev: $DEV"
+
+# Only onic ports. The attribute names below exist nowhere else, but check the
+# driver anyway so this helper cannot be aimed at an unrelated interface.
+DRV=""
+if [ -e "/sys/class/net/$DEV/device/driver" ]; then
+    DRV=$(basename "$(readlink -f "/sys/class/net/$DEV/device/driver")")
+fi
+[ "$DRV" = onic ] || die "$DEV is bound to driver '${DRV:-none}', not onic"
+
+case "$ATTR" in
+    fc_enable|fc_xoff_watermark|fc_xon_watermark|fc_min_xoff_cycles) : ;;
+    *) die "refusing ATTR '$ATTR': not one of the four writable flow-control attributes" ;;
+esac
+
+if ! [[ $VALUE =~ ^[0-9]{1,10}$ ]]; then
+    die "refusing VALUE '$VALUE': decimal digits only"
+fi
+
+TARGET=/sys/class/net/$DEV/$ATTR
+if [ ! -e "$TARGET" ]; then
+    die "$TARGET does not exist -- the loaded onic driver has no flow-control
+       sysfs attributes. They were added alongside the gateware CSRs; rebuild
+       and reload the driver (see onic_sysfs.c)."
+fi
+
+# The driver validates the value itself and returns a specific errno with an
+# explanation in dmesg; surface both rather than swallowing them.
+if ! printf '%s\n' "$VALUE" > "$TARGET" 2>/tmp/onic-fc-write.$$; then
+    err=$(cat "/tmp/onic-fc-write.$$" 2>/dev/null || true)
+    rm -f "/tmp/onic-fc-write.$$"
+    die "the driver rejected $ATTR=$VALUE on $DEV: ${err:-write failed}
+       (the reason is logged by the driver -- check 'dmesg | tail')"
+fi
+rm -f "/tmp/onic-fc-write.$$"
+exit 0
