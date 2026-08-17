@@ -28,13 +28,15 @@ void qdma_pack_h2c_st_desc(u8 *data, struct qdma_h2c_st_desc *desc)
 	dw0 = (u64 *)data;
 	dw1 = (u64 *)data + 1;
 
-	/* Every netdev TX frame is a single descriptor, so SOP|EOP is
-	 * unconditional. EQDMA5 Soft IP requires these bits at bytes
-	 * 6-7 of the descriptor or it silently drops the frame between
-	 * QDMA and CMAC (stat_tx_total_pkts stays 0). Matches libqdma's
+	/* SOP/EOP are taken verbatim from desc->flags so a single packet can
+	 * span multiple descriptors (scatter-gather TX): SOP on the first, EOP
+	 * on the last, neither on the body. EQDMA5 Soft IP requires these bits
+	 * at bytes 6-7 or it silently drops the frame between QDMA and CMAC
+	 * (stat_tx_total_pkts stays 0), so every caller MUST set desc->flags
+	 * (a single-descriptor frame sets SOP|EOP). Matches libqdma's
 	 * S_H2C_DESC_F_SOP / S_H2C_DESC_F_EOP convention.
 	 */
-	flags = desc->flags | QDMA_H2C_ST_DESC_F_SOP | QDMA_H2C_ST_DESC_F_EOP;
+	flags = desc->flags;
 
 	*dw0 = 0;
 	*dw0 = (FIELD_SET(QDMA_H2C_ST_DESC_DW0_METADATA_MASK, desc->metadata) |
