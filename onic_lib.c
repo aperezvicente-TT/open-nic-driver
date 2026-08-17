@@ -16,6 +16,7 @@
  */
 #include <linux/pci.h>
 #include <linux/netdevice.h>
+#include <linux/moduleparam.h>
 
 #include "onic_lib.h"
 #include "onic_register.h"
@@ -23,6 +24,29 @@
 #include "onic.h"
 
 #define ONIC_MAX_IRQ_NAME 32
+
+/* How many CMACs to divide the PF's MSI-X queue-vector budget between.
+ *
+ * The master PF cannot know hw.num_cmacs at MSI-X allocation time: the CMAC
+ * core-version probe needs libqdma's BAR2 mapping, and qdma_device_open must
+ * run AFTER pci_alloc_irq_vectors.  So onic_acquire_msix_vectors has always
+ * assumed 2 and reserved half the budget for a possible secondary CMAC.
+ *
+ * On a 1-CMAC bitstream that throws away half the queues for nothing, which
+ * matters on MSI-X-starved builds: the au50 shell advertises only 10 vectors
+ * (PF0_MSIX_CAP_TABLE_SIZE_qdma {009} in qdma_no_sriov_au50.tcl), leaving
+ * 10 - 4 non-queue = 6, halved to 3 queues -- and queue count is what caps
+ * throughput.  Set num_cmacs_hint=1 on such builds to use all 6.
+ *
+ * 0 keeps the legacy divide-by-2 so existing setups are unaffected.  Setting
+ * this LOWER than the real CMAC count on a multi-CMAC card would overlap the
+ * secondary netdev's vec_base window -- don't.
+ */
+static int num_cmacs_hint;
+module_param(num_cmacs_hint, int, 0444);
+MODULE_PARM_DESC(num_cmacs_hint,
+	"CMACs to split the master PF's MSI-X queue vectors between "
+	"(0 = legacy, reserve half for a 2nd CMAC; 1 = single-CMAC build, use all)");
 
 extern int onic_poll(struct napi_struct *napi, int budget);
 
@@ -415,11 +439,18 @@ static int onic_acquire_msix_vectors(struct onic_private *priv)
 	/* For dual-CMAC master PF, reserve half for secondary (vec_base split).
 	 * If hardware advertises enough (2*q_per_cmac + non_q) each CMAC gets
 	 * q_per_cmac; if not (e.g. MSIX_CAP=32), they share equally. */
-	/* Master PF always splits half for secondary (hw.num_cmacs not yet set
-	 * here — onic_init_hardware runs after onic_init_capacity). */
+	/* Master PF splits the budget between CMACs (hw.num_cmacs not yet set
+	 * here — onic_init_hardware runs after onic_init_capacity), so the
+	 * divisor comes from num_cmacs_hint; 0 keeps the legacy halving. */
 	if (test_bit(ONIC_FLAG_MASTER_PF, priv->flags)) {
 		int avail = vectors - non_q_vectors;
-		priv->num_q_vectors = min_t(u16, avail / 2, (u16)q_per_cmac);
+		int split = (num_cmacs_hint > 0) ? num_cmacs_hint : 2;
+
+		priv->num_q_vectors = min_t(u16, avail / split, (u16)q_per_cmac);
+		dev_info(&priv->pdev->dev,
+			 "MSI-X split: %d avail / %d CMAC(s)%s\n",
+			 avail, split,
+			 num_cmacs_hint > 0 ? " (num_cmacs_hint)" : " (legacy default)");
 	} else {
 		priv->num_q_vectors = min_t(u16, vectors - non_q_vectors, (u16)q_per_cmac);
 	}
